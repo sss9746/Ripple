@@ -148,13 +148,18 @@ git-clone and DB-insert side effects out of the unit-testable logic.
 ```python
 import argparse
 import re
+import sys
 from pathlib import Path
 
 import git
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from ripple import db
 
-REPOS_DIR = Path(__file__).resolve().parent.parent / ".repos"
+REPOS_DIR = PROJECT_ROOT / ".repos"
 
 _GIT_URL_RE = re.compile(r"^(https?://|git@|ssh://)")
 
@@ -170,39 +175,46 @@ def derive_name(source: str, is_url: bool) -> str:
     return stem
 
 
-def resolve_repo_source(source: str, repos_dir: Path = REPOS_DIR) -> tuple[Path, str | None, str]:
-    """Resolve `source` to (local_path, source_url, default_name).
+def resolve_repo_source(
+    source: str, name: str | None = None, repos_dir: Path = REPOS_DIR
+) -> tuple[Path, str | None, str]:
+    """Resolve `source` to (local_path, source_url, resolved_name).
 
-    If `source` looks like a git URL, clone it into `repos_dir/<name>`.
+    `name`, if given, overrides the name derived from `source` — for a git URL this
+    also changes the clone target directory (`repos_dir/<name>`), so passing a
+    different `--name` is a real way to avoid a clone-target collision, not just a
+    cosmetic rename.
+
+    If `source` looks like a git URL, clone it into `repos_dir/<resolved_name>`.
     Otherwise treat it as a local path and validate it exists and is a directory.
     """
     is_url = is_git_url(source)
-    name = derive_name(source, is_url)
+    resolved_name = name or derive_name(source, is_url)
 
     if is_url:
-        target = repos_dir / name
+        target = repos_dir / resolved_name
         if target.exists():
             raise FileExistsError(
-                f"Clone target {target} already exists; remove it or pass --name"
+                f"Clone target {target} already exists; remove it or choose a "
+                "different --name"
             )
         target.parent.mkdir(parents=True, exist_ok=True)
         git.Repo.clone_from(source, target)
-        return target, source, name
+        return target, source, resolved_name
 
     local_path = Path(source).expanduser().resolve()
     if not local_path.is_dir():
         raise FileNotFoundError(f"Local path does not exist or is not a directory: {local_path}")
-    return local_path, None, name
+    return local_path, None, resolved_name
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Register a Terraform repo for indexing")
     parser.add_argument("source", help="Local directory path or git URL")
-    parser.add_argument("--name", help="Override the derived repo name")
+    parser.add_argument("--name", help="Override the derived repo name (and clone directory, for git URLs)")
     args = parser.parse_args(argv)
 
-    local_path, source_url, default_name = resolve_repo_source(args.source)
-    name = args.name or default_name
+    local_path, source_url, name = resolve_repo_source(args.source, name=args.name)
 
     repo_id = db.insert_repo(name=name, source_url=source_url, local_path=str(local_path))
     print(f"Registered repo id={repo_id} name={name} local_path={local_path}")
@@ -213,6 +225,16 @@ if __name__ == "__main__":
 ```
 
 Implementation notes:
+- **Import path**: this script lives in `scripts/`, a sibling of the `ripple/` package,
+  and the project has no `pyproject.toml`/`setup.py` (no editable install exists to put
+  `ripple` on `sys.path`). Invoking it the documented way, `python
+  scripts/index_repo.py <source>`, sets `sys.path[0]` to `scripts/`, not the project
+  root, so a bare `from ripple import db` fails with `ModuleNotFoundError` regardless of
+  the caller's cwd. The snippet above inserts `PROJECT_ROOT` (computed from `__file__`,
+  so it is correct no matter what cwd the script is invoked from) at the front of
+  `sys.path` *before* importing `ripple`. This keeps the documented invocation working
+  with no packaging changes and no reliance on `PYTHONPATH`. Do not drop this shim or
+  reorder the import above it.
 - `git.Repo.clone_from` comes from `GitPython` (already in `requirements.txt`).
 - This script only registers the repo row. It must not attempt to parse `.tf` files,
   compute embeddings, or write `resources`/`edges` rows — that is Day 2 and Day 3 work.
@@ -241,15 +263,27 @@ cloned Terraform repos.
   the caller unchanged; do not swallow or wrap it.
 - `index_repo.is_git_url(source: str) -> bool` — pure, no I/O.
 - `index_repo.derive_name(source: str, is_url: bool) -> str` — pure, no I/O.
-- `index_repo.resolve_repo_source(source, repos_dir=REPOS_DIR) -> tuple[Path, str | None, str]`
-  — raises `FileNotFoundError` if a local path does not exist or is not a directory;
-  raises `FileExistsError` if a clone target directory already exists; propagates
+- `index_repo.resolve_repo_source(source, name=None, repos_dir=REPOS_DIR) -> tuple[Path, str | None, str]`
+  — `name`, when given, overrides the derived name and (for a git URL) the clone target
+  directory (`repos_dir/<name>`). Raises `FileNotFoundError` if a local path does not
+  exist or is not a directory; raises `FileExistsError` if the clone target directory
+  already exists (the message tells the caller to remove it or pass a different
+  `--name`, which is now actually true since `name` changes the target); propagates
   `git.exc.GitCommandError` on clone failure unchanged.
-- `index_repo.main(argv=None) -> None` — parses args, resolves the source, inserts the
-  repo row, prints one confirmation line to stdout in the exact format
-  `Registered repo id={id} name={name} local_path={path}`. On any exception raised by
-  `resolve_repo_source` or `db.insert_repo`, let it propagate (argparse/Python will
-  print the traceback and exit non-zero) — no bespoke error swallowing in this skeleton.
+- `index_repo.main(argv=None) -> None` — parses args, calls
+  `resolve_repo_source(args.source, name=args.name)`, inserts the repo row using the
+  name `resolve_repo_source` returns, prints one confirmation line to stdout in the
+  exact format `Registered repo id={id} name={name} local_path={path}`. On any exception
+  raised by `resolve_repo_source` or `db.insert_repo`, let it propagate (argparse/Python
+  will print the traceback and exit non-zero) — no bespoke error swallowing in this
+  skeleton.
+- **Import path**: `scripts/index_repo.py` inserts the project root onto `sys.path`
+  before `from ripple import db` (see 5.3) so the documented invocation
+  (`python scripts/index_repo.py <source>`) works from any cwd without a packaging
+  step. `tests/test_index_repo.py` does not need this shim itself — running the test
+  suite via `python -m pytest` from the project root already puts the project root on
+  `sys.path`, making both `ripple` and `scripts` (as an implicit namespace package, no
+  `__init__.py` required) importable directly.
 
 ## 7. Required tests
 
@@ -283,11 +317,19 @@ cloned Terraform repos.
 - `resolve_repo_source` with a git URL whose target directory already exists
   (`tmp_path`-created): raises `FileExistsError`, and `git.Repo.clone_from` is not
   called (monkeypatch it to raise `AssertionError` if invoked).
+- `resolve_repo_source` with a git URL, an existing target directory for the derived
+  name, but a *different* explicit `name=` passed in: monkeypatch `git.Repo.clone_from`
+  to a recording stub; assert it clones into `repos_dir / <the passed name>` (not the
+  colliding derived-name directory) and succeeds — this is the regression test proving
+  the `FileExistsError` message's "pass a different --name" advice actually works.
 - `main()`: monkeypatch `db.insert_repo` to a stub returning a fixed id and record its
   call args; monkeypatch `resolve_repo_source` (or use a real local `tmp_path`) so no
   network/DB I/O occurs; run `main([str(tmp_path)])`; assert the stub was called with
   the expected `name`/`source_url`/`local_path` and that the printed line matches the
   documented format (use `capsys`).
+- `main()` with `--name`: run `main([str(tmp_path), "--name", "custom"])` and assert
+  `db.insert_repo` was called with `name="custom"` — confirming `main()` uses the name
+  `resolve_repo_source` returns rather than re-deriving it.
 
 Run `python -m pytest` after implementation; all tests must pass (DB-dependent test
 skips cleanly if Postgres isn't running).
