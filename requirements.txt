@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+psycopg[binary]
+pgvector
+pinecone
+python-hcl2
+rank_bm25
+sentence-transformers
+openai
+python-dotenv
+GitPython
+pytest
