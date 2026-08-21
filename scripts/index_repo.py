@@ -11,6 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from ripple import db
+from ripple.ingest import indexer
 
 REPOS_DIR = PROJECT_ROOT / ".repos"
 
@@ -82,7 +83,14 @@ def main(argv: list[str] | None = None) -> None:
         source_url=source_url,
         local_path=str(local_path),
     )
+
+    resource_count = indexer.index_repo(
+        repo_id,
+        str(local_path),
+    )
+
     print(f"Registered repo id={repo_id} name={name} local_path={local_path}")
+    print(f"Indexed {resource_count} resource blocks")
 
 
 if __name__ == "__main__":

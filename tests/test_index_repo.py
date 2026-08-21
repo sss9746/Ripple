@@ -116,6 +116,7 @@ def test_main_registers_local_repo(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     insert_calls: list[dict[str, str | None]] = []
+    index_calls: list[tuple[int, str]] = []
 
     def record_insert(
         name: str,
@@ -131,7 +132,12 @@ def test_main_registers_local_repo(
         )
         return 42
 
+    def record_index(repo_id: int, local_path: str) -> int:
+        index_calls.append((repo_id, local_path))
+        return 6
+
     monkeypatch.setattr(index_repo.db, "insert_repo", record_insert)
+    monkeypatch.setattr(index_repo.indexer, "index_repo", record_index)
 
     index_repo.main([str(tmp_path)])
 
@@ -142,8 +148,10 @@ def test_main_registers_local_repo(
             "local_path": str(tmp_path),
         }
     ]
+    assert index_calls == [(42, str(tmp_path))]
     assert capsys.readouterr().out == (
         f"Registered repo id=42 name={tmp_path.name} local_path={tmp_path}\n"
+        "Indexed 6 resource blocks\n"
     )
 
 
@@ -152,6 +160,7 @@ def test_main_uses_explicit_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     insert_calls: list[dict[str, str | None]] = []
+    index_calls: list[tuple[int, str]] = []
 
     def record_insert(
         name: str,
@@ -167,7 +176,12 @@ def test_main_uses_explicit_name(
         )
         return 43
 
+    def record_index(repo_id: int, local_path: str) -> int:
+        index_calls.append((repo_id, local_path))
+        return 7
+
     monkeypatch.setattr(index_repo.db, "insert_repo", record_insert)
+    monkeypatch.setattr(index_repo.indexer, "index_repo", record_index)
 
     index_repo.main([str(tmp_path), "--name", "custom"])
 
@@ -178,3 +192,4 @@ def test_main_uses_explicit_name(
             "local_path": str(tmp_path),
         }
     ]
+    assert index_calls == [(43, str(tmp_path))]

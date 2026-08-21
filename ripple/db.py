@@ -1,4 +1,5 @@
 import os
+from typing import Protocol
 
 import psycopg
 from dotenv import load_dotenv
@@ -32,3 +33,48 @@ def insert_repo(name: str, source_url: str | None, local_path: str) -> int:
         connection.commit()
 
     return repo_id
+
+
+class ResourceRowLike(Protocol):
+    block_kind: str
+    resource_type: str | None
+    resource_name: str | None
+    address: str
+    file_path: str
+    start_line: int
+    end_line: int
+    body: str
+    embed_text: str
+
+
+def replace_resources(repo_id: int, rows: list[ResourceRowLike]) -> None:
+    """Atomically replace all resource rows belonging to one repository."""
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM resources WHERE repo_id = %s", (repo_id,))
+
+            if rows:
+                cursor.executemany(
+                    """
+                    INSERT INTO resources
+                        (repo_id, block_kind, resource_type, resource_name,
+                         address, file_path, start_line, end_line, body,
+                         embed_text)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    [
+                        (
+                            repo_id,
+                            row.block_kind,
+                            row.resource_type,
+                            row.resource_name,
+                            row.address,
+                            row.file_path,
+                            row.start_line,
+                            row.end_line,
+                            row.body,
+                            row.embed_text,
+                        )
+                        for row in rows
+                    ],
+                )
