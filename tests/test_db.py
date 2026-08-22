@@ -17,6 +17,7 @@ class _ResourceRow:
     end_line: int
     body: str
     embed_text: str
+    embedding: list[float]
 
 
 def test_get_connection_requires_database_url(
@@ -91,6 +92,7 @@ def test_replace_resources_rolls_back_on_insert_failure() -> None:
         end_line=3,
         body='resource "aws_instance" "a" {}',
         embed_text="aws_instance.a",
+        embedding=[0.0] * 1536,
     )
     row_b = _ResourceRow(
         block_kind="resource",
@@ -102,6 +104,7 @@ def test_replace_resources_rolls_back_on_insert_failure() -> None:
         end_line=7,
         body='resource "aws_instance" "b" {}',
         embed_text="aws_instance.b",
+        embedding=[0.0] * 1536,
     )
     duplicate_row = _ResourceRow(
         block_kind="resource",
@@ -113,6 +116,7 @@ def test_replace_resources_rolls_back_on_insert_failure() -> None:
         end_line=11,
         body='resource "aws_instance" "duplicate" {}',
         embed_text="aws_instance.duplicate",
+        embedding=[0.0] * 1536,
     )
 
     try:

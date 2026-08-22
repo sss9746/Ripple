@@ -4,7 +4,7 @@ import psycopg
 import pytest
 
 from ripple import db
-from ripple.ingest import parser, scanner
+from ripple.ingest import indexer, parser, scanner
 from ripple.ingest.indexer import (
     MAX_EMBED_BODY_CHARS,
     build_embed_text,
@@ -14,6 +14,11 @@ from ripple.ingest.parser import ParsedBlock
 
 
 FIXTURE_ROOT = (Path(__file__).parent / "fixtures" / "sample_repo").resolve()
+
+
+class _FakeEmbeddingProvider:
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return [[0.0] * 1536 for _ in texts]
 
 
 def _block(
@@ -103,7 +108,11 @@ def test_index_repo_round_trip_and_reindex() -> None:
         pytest.skip("database not reachable")
 
     try:
-        resource_count = index_repo(repo_id, str(FIXTURE_ROOT))
+        resource_count = index_repo(
+            repo_id,
+            str(FIXTURE_ROOT),
+            embedder=_FakeEmbeddingProvider(),
+        )
 
         assert resource_count == len(expected_blocks) == 6
 
@@ -147,9 +156,13 @@ def test_index_repo_round_trip_and_reindex() -> None:
             assert end_line == expected.end_line
             assert body == expected.body
             assert embed_text
-            assert embedding is None
+            assert embedding.to_list() == [0.0] * 1536
 
-        second_count = index_repo(repo_id, str(FIXTURE_ROOT))
+        second_count = index_repo(
+            repo_id,
+            str(FIXTURE_ROOT),
+            embedder=_FakeEmbeddingProvider(),
+        )
         assert second_count == 6
 
         with db.get_connection() as connection:
@@ -163,3 +176,21 @@ def test_index_repo_round_trip_and_reindex() -> None:
         with db.get_connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute("DELETE FROM repos WHERE id = %s", (repo_id,))
+
+
+def test_index_repo_empty_repository_never_requires_embedder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    calls: list[tuple[int, list[object]]] = []
+
+    def record_replace(repo_id: int, rows: list[object]) -> None:
+        calls.append((repo_id, rows))
+
+    monkeypatch.setattr(indexer.db, "replace_resources", record_replace)
+
+    result = indexer.index_repo(123, str(tmp_path))
+
+    assert result == 0
+    assert calls == [(123, [])]

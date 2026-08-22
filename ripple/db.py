@@ -3,6 +3,8 @@ from typing import Protocol
 
 import psycopg
 from dotenv import load_dotenv
+from pgvector import Vector
+from pgvector.psycopg import register_vector
 
 
 load_dotenv()
@@ -14,7 +16,9 @@ def get_connection() -> psycopg.Connection:
     if not database_url:
         raise RuntimeError("DATABASE_URL environment variable is not set")
 
-    return psycopg.connect(database_url)
+    connection = psycopg.connect(database_url)
+    register_vector(connection)
+    return connection
 
 
 def insert_repo(name: str, source_url: str | None, local_path: str) -> int:
@@ -45,6 +49,7 @@ class ResourceRowLike(Protocol):
     end_line: int
     body: str
     embed_text: str
+    embedding: list[float]
 
 
 def replace_resources(repo_id: int, rows: list[ResourceRowLike]) -> None:
@@ -59,8 +64,8 @@ def replace_resources(repo_id: int, rows: list[ResourceRowLike]) -> None:
                     INSERT INTO resources
                         (repo_id, block_kind, resource_type, resource_name,
                          address, file_path, start_line, end_line, body,
-                         embed_text)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         embed_text, embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     [
                         (
@@ -74,6 +79,7 @@ def replace_resources(repo_id: int, rows: list[ResourceRowLike]) -> None:
                             row.end_line,
                             row.body,
                             row.embed_text,
+                            Vector(row.embedding),
                         )
                         for row in rows
                     ],

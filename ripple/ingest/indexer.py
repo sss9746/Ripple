@@ -3,6 +3,7 @@ from pathlib import Path
 
 from ripple import db
 from ripple.ingest import parser, scanner
+from ripple.llm.embeddings import EmbeddingProvider, OpenAIEmbeddingProvider
 
 
 MAX_EMBED_BODY_CHARS = 6000
@@ -19,6 +20,7 @@ class ResourceRow:
     end_line: int
     body: str
     embed_text: str
+    embedding: list[float]
 
 
 def build_embed_text(block: parser.ParsedBlock) -> str:
@@ -43,7 +45,11 @@ def build_embed_text(block: parser.ParsedBlock) -> str:
     return header + body
 
 
-def index_repo(repo_id: int, local_path: str) -> int:
+def index_repo(
+    repo_id: int,
+    local_path: str,
+    embedder: EmbeddingProvider | None = None,
+) -> int:
     """Parse a repository and atomically replace its saved resources."""
     root = Path(local_path)
 
@@ -52,6 +58,15 @@ def index_repo(repo_id: int, local_path: str) -> int:
         for file_path in scanner.find_tf_files(root)
         for block in parser.parse_file(file_path, root)
     ]
+
+    embed_texts = [build_embed_text(block) for block in blocks]
+
+    if not embed_texts:
+        db.replace_resources(repo_id, [])
+        return 0
+
+    embedder = embedder or OpenAIEmbeddingProvider()
+    embeddings = embedder.embed(embed_texts)
 
     rows = [
         ResourceRow(
@@ -63,9 +78,10 @@ def index_repo(repo_id: int, local_path: str) -> int:
             start_line=block.start_line,
             end_line=block.end_line,
             body=block.body,
-            embed_text=build_embed_text(block),
+            embed_text=embed_texts[index],
+            embedding=embeddings[index],
         )
-        for block in blocks
+        for index, block in enumerate(blocks)
     ]
 
     db.replace_resources(repo_id, rows)
