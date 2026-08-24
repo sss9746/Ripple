@@ -1,711 +1,497 @@
-# Implementation Plan — Day 4: Reference Extraction
+# Implementation Plan — Day 5: BM25 Lexical Search
+
+## 0. Process note for this cycle
+
+Per explicit instruction: **`SPEC.md` is read-only for this cycle.** Nothing below
+proposes editing it. Where SPEC.md's text is ambiguous or has a non-obvious side
+effect, this plan flags it in section 10 for review rather than silently
+"correcting" it in the plan or the code.
+
+This cycle is also structured for **collaborative, step-by-step implementation** —
+section 5 is broken into six small, independently-completable steps. Decide per step
+whether you or Codex implements it; each step has a clear, small deliverable and can
+be reviewed/tested on its own before moving to the next.
 
 ## 1. Objective
 
-Extract the Terraform reference graph: for every `resources` row, find its outgoing
-references (`aws_vpc.main.id`-style identifiers in its body), resolve each against the
-same repo's address table, and write the resolvable ones to `edges`. Add
-`dependents()`/`dependencies()` graph queries so "what references this block" and
-"what does this block reference" are both answerable. This is the data blast-radius
-questions run on; nothing consumes it yet (that's Day 8/13).
+Add lexical (keyword) search alongside Day 3's vector search: a Terraform-aware
+tokenizer that makes exact identifiers like `aws_security_group.worker` findable both
+as a whole and by their parts, and an in-memory `rank_bm25.BM25Okapi` index built from
+`resources.embed_text`, scoped to one repo at a time. This is a second, independent
+retrieval signal — nothing fuses it with vector search yet (that's Day 6).
 
-This is SPEC.md's Day 4 milestone, sitting on top of Day 1–3
-(`ripple/config.py`, `ripple/db.py`, `scripts/index_repo.py`, `ripple/ingest/`,
-`ripple/llm/`, `ripple/retrieval/`), all already implemented and verified.
+This is SPEC.md's Day 5 milestone, sitting on top of Day 1–4
+(`ripple/config.py`, `ripple/db.py`, `ripple/ingest/`, `ripple/llm/`,
+`ripple/retrieval/vector_store.py` + `pgvector_store.py`, `scripts/index_repo.py`,
+`scripts/ask.py`), all already implemented and verified (63 passing tests as of Day 4,
+commit `a53cad6`).
 
 ## 2. Relevant SPEC.md requirements
 
-- Section 11, Day 4: "`references.py` per section 9.2. Second indexing pass populating
-  `edges`. `graph.py` with `dependents()` and `dependencies()` queries. Sanity check:
-  pick a subnet, confirm its edge to the VPC exists and points the right way.
-  **Done when:** you can list everything referencing a given block, and the counts
-  look plausible against a manual read of the file."
-- Section 9.2 (Reference extraction), quoted in full since every clause matters:
+- Section 11, Day 5: "`bm25.py` with the tokenizer from section 9.5. Corpus built from
+  `embed_text` at startup. **Done when:** querying an exact address like
+  `aws_nat_gateway.this` returns that block at rank 1."
+- Section 9.5 (BM25), quoted verbatim:
+  > `rank_bm25.BM25Okapi` over an in-memory corpus, rebuilt at process start.
+  >
+  > **Tokenization is the whole game here.** The default whitespace split makes
+  > `aws_security_group.worker` a single unmatched token. Instead, emit both the full
+  > token and its parts:
   ```python
-  REF_RE = re.compile(
-      r'\b(?:data\.)?([a-z][a-z0-9_]*)\.([a-z_][a-z0-9_-]*)'
-      r'(?:\.[a-z_][a-z0-9_*-]*|\[[a-z0-9_.*-]+\])*'
-  )
+  def tokenize(text: str) -> list[str]:
+      raw = re.findall(r'[A-Za-z0-9_.\-]+', text.lower())
+      out = []
+      for tok in raw:
+          out.append(tok)
+          parts = re.split(r'[._\-]', tok)
+          out.extend(p for p in parts if len(p) > 1)
+      return out
   ```
-  Rules:
-  - Resolve each `(type, name)` pair against the `resources` table for the same repo.
-    If it resolves, write an edge. If not, discard silently — most non-matches are
-    attribute accesses on locals or variables.
-  - **Exclude self-references.** Skip any edge where `source_id == target_id`.
-  - Skip references inside comments.
-  - `data.aws_ami.ubuntu` and `aws_ami.ubuntu` are different blocks. Include the
-    `data.` prefix in the address when the block kind is `data`.
-  - Deduplicate: one edge per `(source, target)` pair, keeping the first `ref_text`.
-  - "Reference extraction runs as a second pass **after** all resources are inserted,
-    because resolution needs the full address table."
-- Section 7 (schema): `edges` — `id`, `repo_id`, `source_id` (block containing the
-  reference), `target_id` (block being referenced), `ref_text` (`NOT NULL`). Indexed on
-  `source_id` and `target_id`. **No uniqueness constraint** on `(repo_id, source_id,
-  target_id)` — deduplication is an application-level responsibility (this plan's
-  `seen` set in 5.3), not something Postgres enforces.
-- Section 9.8 (Graph expansion — base queries only; the *pipeline wiring* with depth
-  limits, `graph_max_added`, and "referenced by X" prompt annotations is Day 8/13, not
-  this cycle):
-  ```sql
-  -- dependents: what references this block (blast radius)
-  SELECT r.* FROM edges e JOIN resources r ON r.id = e.source_id
-  WHERE e.target_id = $1;
-
-  -- dependencies: what this block references
-  SELECT r.* FROM edges e JOIN resources r ON r.id = e.target_id
-  WHERE e.source_id = $1;
-  ```
-- Section 8 (repository layout) — **note the correct paths**: `references.py` lives
-  under `ripple/ingest/` (`references.py` — "body text -> outgoing references"), but
-  `graph.py` lives under `ripple/retrieval/` ("neighbor expansion"), *not*
-  `ripple/ingest/`. `indexer.py` is described as orchestrating "parse, embed, write
-  rows **and edges**" — the second indexing pass belongs there, using `references.py`'s
-  pure functions.
+  > So `aws_security_group.worker` yields the full string plus `aws`, `security`,
+  > `group`, `worker`. A query for either the exact address or a loose phrase now hits.
+  >
+  > Index over `embed_text`. Default limit 30 per rewritten query.
+- Section 8 (repository layout): `retrieval/bm25.py` — "lexical search." One file, not
+  split across modules — the tokenizer, the corpus builder, and the index all belong
+  here.
+- Section 9.11 (`RetrievalConfig`, already implemented in `ripple/config.py`):
+  `use_bm25: bool = True`, `bm25_k: int = 30`. **Not wired to anything yet** — no code
+  currently reads `RetrievalConfig` at all. This cycle does not change that (see
+  section 9, non-goals) — `bm25_k` is not consulted; callers (tests, and later
+  `pipeline.py`) pass `k` explicitly.
+- Section 5 (Corpus): the target repo is `terraform-aws-vpc`. `examples/complete` (used
+  for every prior day's manual corpus check) is the flat, concrete-reference example
+  root. The **module root** (the repo's top-level `main.tf` etc.) is described as a
+  harder, more heavily parameterized corpus to add "once the pipeline works on
+  `examples/`" — see section 8's acceptance-criterion note below for why this matters
+  for Day 5 specifically.
 
 ## 3. Current implementation gaps
 
-- `ripple/ingest/references.py` does not exist — nothing extracts references from a
-  block's body.
-- `edges` has never been written to. The table and its indexes exist (Day 1 schema)
-  but every repo indexed so far (Days 1–3) has zero rows there.
-- `ripple/retrieval/graph.py` does not exist — no `dependents()`/`dependencies()`.
-- `ripple/db.py` has no way to bulk-write edges or to re-fetch a repo's resource
-  bodies for the second pass.
-- `scripts/index_repo.py` only registers a repo, parses it, and embeds it — it never
-  extracts edges, so its output is silent about the graph entirely.
+- `ripple/retrieval/bm25.py` does not exist — no tokenizer, no lexical index.
+- `ripple/db.py` has no read function that returns `embed_text` alongside the other
+  fields needed to build a `RetrievedBlock` (id, address, file_path, start_line,
+  end_line, body) — `fetch_resource_bodies` (Day 4) only returns `(id, address,
+  body)`, not enough to construct a full result or to tokenize `embed_text`
+  specifically (as opposed to `body`).
+- **Dependency check (done as part of this planning pass, not left as an open
+  question):** `rank_bm25` is already listed in `requirements.txt` (added Day 1,
+  unused until now) and is already installed in this environment
+  (`rank-bm25==0.2.2`, confirmed via `pip show rank_bm25`). **No `requirements.txt`
+  change is needed or proposed.** If Codex's own environment doesn't have it
+  installed, that's a `pip install -r requirements.txt` step (same as Day 3's `openai`/
+  `pgvector` gap), not a file change.
 
-## 4. Exact files Codex should create or modify
+## 4. Exact files Codex (or you) should create or modify
 
 Create:
-- `ripple/ingest/references.py`
-- `ripple/retrieval/graph.py`
-- `tests/fixtures/reference_repo/main.tf`
-- `tests/fixtures/reference_repo/variables.tf`
-- `tests/test_references.py`
-- `tests/test_graph.py`
+- `ripple/retrieval/bm25.py`
+- `tests/test_bm25.py`
 
 Modify:
-- `ripple/db.py` — add `replace_edges`, `fetch_resource_bodies`, `EdgeRowLike`.
-- `ripple/ingest/indexer.py` — add `EdgeRow` and `index_edges(repo_id)`.
-- `scripts/index_repo.py` — call `indexer.index_edges(repo_id)` after indexing
-  resources; print a third output line.
-- `tests/test_index_repo.py` — both `main()` tests must also monkeypatch
-  `index_repo.indexer.index_edges`, and `test_main_registers_local_repo`'s exact
-  `capsys` assertion must include the new third line (same class of change as Day 2's
-  print-line addition — do not leave this for a later review pass).
-- `tests/test_indexer.py` — add `index_edges` coverage using the new
-  `tests/fixtures/reference_repo/` fixture (the existing `tests/fixtures/sample_repo/`
-  fixture has zero cross-references between its blocks, so it can't exercise this
-  logic — see 5.4/7 for why a new fixture was created instead of extending the old
-  one).
-- `tests/test_db.py` — add a `replace_edges` atomicity test (see 7): `edges` has no
-  unique constraint the way `resources` does, so the test instead uses an
-  impossible-by-construction `target_id = -1` to trigger a foreign-key violation and
-  prove the rollback.
+- `ripple/db.py` — add one new read function, `fetch_bm25_documents(repo_id)`.
 
 Do not modify: `sql/schema.sql`, `docker-compose.yml`, `.env.example`,
-`requirements.txt`, `ripple/config.py`, `ripple/ingest/scanner.py`,
-`ripple/ingest/parser.py`, `ripple/llm/*`, `ripple/retrieval/vector_store.py`,
-`ripple/retrieval/pgvector_store.py`, `scripts/ask.py`,
-`tests/fixtures/sample_repo/*` (Day 2's original fixture — leave it exactly as is),
-`AGENTS.md`, `CLAUDE.md`, `README.md`, `tests/test_config.py`, `tests/test_scanner.py`,
-`tests/test_parser.py`, `tests/test_embeddings.py`, `tests/test_generate.py`,
-`tests/test_prompts.py`, `tests/test_pgvector_store.py`, `tests/test_ask.py`.
+`requirements.txt`, `ripple/config.py`, `ripple/ingest/*`, `ripple/llm/*`,
+`ripple/retrieval/vector_store.py`, `ripple/retrieval/pgvector_store.py`,
+`ripple/retrieval/graph.py`, `scripts/index_repo.py`, `scripts/ask.py`, `SPEC.md`,
+`AGENTS.md`, `CLAUDE.md`, `README.md`, and every existing test file (`test_config.py`,
+`test_db.py` — aside from confirming it still passes unmodified —, `test_scanner.py`,
+`test_parser.py`, `test_references.py`, `test_indexer.py`, `test_graph.py`,
+`test_embeddings.py`, `test_generate.py`, `test_prompts.py`, `test_pgvector_store.py`,
+`test_index_repo.py`, `test_ask.py`).
 
-## 5. Step-by-step implementation instructions
+**`scripts/ask.py` is deliberately not touched this cycle** — see section 9.
 
-### 5.1 `ripple/ingest/references.py`
+## 5. Step-by-step implementation order (collaborative — assign each step as you go)
+
+### Step 1 — `tokenize()` (pure function, no DB, no dependencies)
+
+In `ripple/retrieval/bm25.py`:
 
 ```python
 import re
 
-from ripple.ingest.parser import HEREDOC_START_RE
-
-REF_RE = re.compile(
-    r'\b(?:data\.)?([a-z][a-z0-9_]*)\.([a-z_][a-z0-9_-]*)'
-    r'(?:\.[a-z_][a-z0-9_*-]*|\[[a-z0-9_.*-]+\])*'
-)
+TOKEN_RE = re.compile(r'[A-Za-z0-9_.\-]+')
+SPLIT_RE = re.compile(r'[._\-]')
 
 
-def _mask_comments(text: str) -> str:
-    """Blank out '#'/'//' line comments and '/* */' block comments with
-    spaces. Strings and heredocs are skipped over — their contents are left
-    completely untouched, since Terraform references commonly appear inside
-    string interpolations and heredoc bodies (e.g. an IAM policy heredoc
-    referencing another resource's ARN) — purely so that a '#' or '//'
-    appearing inside one of them is never mistaken for the start of a real
-    comment.
+def tokenize(text: str) -> list[str]:
+    """SPEC.md 9.5's tokenizer, verbatim: emit each raw token plus its
+    underscore/period/hyphen-delimited parts (parts of length > 1 only), so
+    an exact address and a loose keyword phrase both hit the same document.
     """
-    result = list(text)
-    i = 0
-    n = len(text)
-
-    while i < n:
-        ch = text[i]
-
-        if ch == '"':
-            i += 1
-            while i < n and text[i] != '"':
-                i += 2 if text[i] == "\\" else 1
-            i += 1
-            continue
-
-        heredoc_match = HEREDOC_START_RE.match(text, i)
-        if heredoc_match:
-            marker = heredoc_match.group("marker")
-            terminator_re = re.compile(
-                rf"^[ \t]*{re.escape(marker)}\s*$", re.MULTILINE
-            )
-            terminator = terminator_re.search(text, heredoc_match.end())
-            i = terminator.end() if terminator else n
-            continue
-
-        if ch == "#" or text[i : i + 2] == "//":
-            newline = text.find("\n", i)
-            end = newline if newline != -1 else n
-            for j in range(i, end):
-                result[j] = " "
-            i = end
-            continue
-
-        if text[i : i + 2] == "/*":
-            comment_end = text.find("*/", i + 2)
-            end = comment_end + 2 if comment_end != -1 else n
-            for j in range(i, end):
-                if text[j] != "\n":
-                    result[j] = " "
-            i = end
-            continue
-
-        i += 1
-
-    return "".join(result)
-
-
-def extract_references(body: str) -> list[str]:
-    """Return every outgoing reference's raw ref_text found in body, in
-    order of appearance, including duplicates. Deduplication happens at
-    resolution time (indexer.index_edges), not here — only *resolvable*
-    duplicates should collapse to one edge.
-    """
-    masked = _mask_comments(body)
-    return [match.group(0) for match in REF_RE.finditer(masked)]
-
-
-def _resolve_reference_address(ref_text: str) -> str:
-    """Given a raw ref_text (e.g. 'aws_vpc.main.id' or
-    'data.aws_ami.ubuntu.id'), return the resources.address it would refer
-    to ('aws_vpc.main' or 'data.aws_ami.ubuntu') if a block with that
-    address exists. Does not touch the database — resolution against the
-    real address table happens in indexer.index_edges.
-
-    Private: the only caller is indexer.index_edges, which only ever passes
-    ref_text values that came from extract_references and are therefore
-    guaranteed to match REF_RE. Not exposed as a public, arbitrary-input-safe
-    API — same convention as parser.py's _find_block_end/_address_for.
-    """
-    match = REF_RE.match(ref_text)
-    resource_type, resource_name = match.group(1), match.group(2)
-    if ref_text.startswith("data."):
-        return f"data.{resource_type}.{resource_name}"
-    return f"{resource_type}.{resource_name}"
+    raw = TOKEN_RE.findall(text.lower())
+    out = []
+    for tok in raw:
+        out.append(tok)
+        parts = SPLIT_RE.split(tok)
+        out.extend(p for p in parts if len(p) > 1)
+    return out
 ```
 
-`HEREDOC_START_RE` is imported from `ripple.ingest.parser` rather than redefined here
-— same pattern, single source of truth, and `parser.py` has no reverse dependency on
-`references.py` so this doesn't create a cycle.
+This is section 9.5's function reproduced exactly (compiled patterns instead of
+inline `re.findall`/`re.split` calls — same behavior, avoids recompiling the regex on
+every call, harmless deviation in form only). A good first step to do by hand — it's
+self-contained, has no dependencies, and the test cases in Step 5 pin down every edge
+case explicitly, so it's easy to verify in isolation.
 
-`_mask_comments` and `_resolve_reference_address` are both private helpers, following
-this codebase's existing convention (`parser.py`'s `_find_block_end`/`_address_for`).
-`_mask_comments`'s effect is tested indirectly through `extract_references`'s public
-behavior (comment-skipping); `_resolve_reference_address` is simple enough, and
-self-contained enough, that it's fine to test directly by importing it from the module
-(see 7) — Python doesn't enforce privacy, and there's real value in pinning its
-address-derivation rules with direct examples.
+**Read this before writing it:** casing is normalized once, via `.lower()`, applied to
+the *whole* input text before tokenizing. This means **`tokenize()` must be applied to
+the query string too, not just corpus documents** — if a caller tokenizes the corpus
+but naively `.split()`s the query, case and punctuation handling will silently diverge
+and matches will be missed. This isn't stated explicitly in SPEC.md's snippet; it's a
+requirement this plan is adding because it's necessary for the tokenizer to do its job
+at query time, not just index time (see Step 4).
 
-### 5.2 `ripple/retrieval/graph.py`
+### Step 2 — `db.fetch_bm25_documents(repo_id)`
+
+In `ripple/db.py`, alongside `fetch_resource_bodies`:
+
+```python
+def fetch_bm25_documents(
+    repo_id: int,
+) -> list[tuple[int, str, str, int, int, str, str]]:
+    """Return (id, address, file_path, start_line, end_line, body, embed_text)
+    for every resource in repo_id — everything bm25.build_index needs to both
+    tokenize (embed_text) and construct a RetrievedBlock (everything else).
+    """
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, address, file_path, start_line, end_line, body, embed_text
+                FROM resources
+                WHERE repo_id = %s
+                ORDER BY id
+                """,
+                (repo_id,),
+            )
+            return cursor.fetchall()
+```
+
+`ORDER BY id` is added purely for hygiene/determinism (matching Day 4's
+`ORDER BY r.address` lesson in `graph.py`) — the final result ordering from
+`BM25Index.query()` doesn't actually depend on fetch order (see Step 4's tie-break
+rule), but there's no reason to leave it unspecified when it's free to add.
+
+This is mechanical and pattern-matches `fetch_resource_bodies` exactly — a good step
+to hand to Codex, or a quick one to do yourself if you want the rest of the day for
+the more interesting parts.
+
+### Step 3 — `BM25Document` and `build_index(repo_id)`
+
+Still in `ripple/retrieval/bm25.py`:
 
 ```python
 from dataclasses import dataclass
+
+from rank_bm25 import BM25Okapi
 
 from ripple import db
 
 
 @dataclass
-class GraphNeighbor:
+class BM25Document:
     id: int
     address: str
     file_path: str
     start_line: int
     end_line: int
     body: str
-    ref_text: str
 
 
-def dependents(resource_id: int) -> list[GraphNeighbor]:
-    """Blast radius: every block that references resource_id."""
-    with db.get_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT r.id, r.address, r.file_path, r.start_line, r.end_line,
-                       r.body, e.ref_text
-                FROM edges e
-                JOIN resources r ON r.id = e.source_id
-                WHERE e.target_id = %s
-                ORDER BY r.address
-                """,
-                (resource_id,),
-            )
-            rows = cursor.fetchall()
-    return [GraphNeighbor(*row) for row in rows]
-
-
-def dependencies(resource_id: int) -> list[GraphNeighbor]:
-    """Everything resource_id itself references."""
-    with db.get_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT r.id, r.address, r.file_path, r.start_line, r.end_line,
-                       r.body, e.ref_text
-                FROM edges e
-                JOIN resources r ON r.id = e.target_id
-                WHERE e.source_id = %s
-                ORDER BY r.address
-                """,
-                (resource_id,),
-            )
-            rows = cursor.fetchall()
-    return [GraphNeighbor(*row) for row in rows]
-```
-
-`ORDER BY r.address` makes results deterministic — without it, row order for a given
-`resource_id` is unspecified and could vary between runs, making both the tests in
-section 7 and any future caller's output flaky/non-reproducible. `resource_id` alone
-is otherwise sufficient — `resources.id`/`edges.id` are globally unique
-(`SERIAL PRIMARY KEY`), so no `repo_id` filter is needed, matching section 9.8's SQL
-exactly (`WHERE e.target_id = $1`, no repo scoping). `ref_text` is included in
-`GraphNeighbor` even though section 9.8's minimal SQL (`r.*`) doesn't ask for it — it's
-free from the same `JOIN` and makes the Day 4 "sanity check" (confirming an edge
-"points the right way") much easier to verify by eye. This is *not* the "referenced by
-X" prompt annotation from section 9.8 — that's a Day 8/13 pipeline concern; this is
-just the raw query layer.
-
-### 5.3 `ripple/ingest/indexer.py` additions
-
-```python
-from ripple.ingest import references
-
-@dataclass
-class EdgeRow:
-    source_id: int
-    target_id: int
-    ref_text: str
-
-
-def index_edges(repo_id: int) -> int:
-    """Second indexing pass: extract reference edges between resources
-    already written for repo_id. Must run after that repo's resources have
-    been written (index_repo, or anything else that calls
-    db.replace_resources) — resolution needs the full address table
-    (SPEC.md 9.2).
+class BM25Index:
+    """An in-memory BM25 index over one repo's resources, built from
+    embed_text. Rebuilt fresh on every build_index() call — there is no
+    cross-call caching yet (see section 9/10 for why that's fine for now).
     """
-    resource_rows = db.fetch_resource_bodies(repo_id)
-    address_to_id = {
-        address: resource_id for resource_id, address, _ in resource_rows
-    }
 
-    seen: set[tuple[int, int]] = set()
-    edges: list[EdgeRow] = []
+    def __init__(self, documents: list[BM25Document], model: BM25Okapi | None):
+        self._documents = documents
+        self._model = model
 
-    for source_id, _address, body in resource_rows:
-        for ref_text in references.extract_references(body):
-            target_address = references._resolve_reference_address(ref_text)
-            target_id = address_to_id.get(target_address)
+    # query() defined in Step 4
 
-            if target_id is None or target_id == source_id:
-                continue
 
-            key = (source_id, target_id)
-            if key in seen:
-                continue
-            seen.add(key)
+def build_index(repo_id: int) -> BM25Index:
+    rows = db.fetch_bm25_documents(repo_id)
 
-            edges.append(
-                EdgeRow(source_id=source_id, target_id=target_id, ref_text=ref_text)
-            )
+    documents = [
+        BM25Document(
+            id=row[0],
+            address=row[1],
+            file_path=row[2],
+            start_line=row[3],
+            end_line=row[4],
+            body=row[5],
+        )
+        for row in rows
+    ]
 
-    db.replace_edges(repo_id, edges)
-    return len(edges)
+    if not documents:
+        return BM25Index(documents=[], model=None)
+
+    tokenized_corpus = [tokenize(row[6]) for row in rows]  # row[6] = embed_text
+    model = BM25Okapi(tokenized_corpus)
+    return BM25Index(documents, model)
 ```
 
-Deliberately a **separate, independently-callable function**, not folded into
-`index_repo()` itself, even though section 8 describes `indexer.py` as orchestrating
-"parse, embed, write rows and edges" as one conceptual responsibility. Keeping it
-separate means: `index_repo()`'s existing return type (`int`, resource count) and every
-test that already asserts against it (Day 2/3's `test_index_repo_round_trip_and_reindex`,
-the empty-repository test) needs **zero changes**. `scripts/index_repo.py` calls both
-functions in sequence (5.5), matching the two-separate-steps pattern it already
-established for `db.insert_repo` + `indexer.index_repo` in Day 1/3.
+**The empty-corpus short-circuit is deliberate, not incidental.** `BM25Okapi([])`'s
+behavior on an empty corpus (division-by-zero in its average-document-length
+calculation, or some other internal failure) is a `rank_bm25` implementation detail
+this plan doesn't want to depend on either way — `build_index` never constructs a
+`BM25Okapi` at all when there are zero documents, and `BM25Index.query()` (Step 4)
+checks `self._model is None` first and returns `[]` immediately in that case.
 
-`target_id is None` covers every "discard silently" case from section 9.2 in one
-check: an unresolvable `(type, name)` (attribute access on a local/variable that
-doesn't map to a real block — see section 10 for exactly which cases resolve and
-which don't), or a resolvable-looking address that simply isn't in *this* repo.
-`target_id == source_id` is the self-reference exclusion (a security group referencing
-its own ID in an ingress rule is common, real Terraform — this is not a hypothetical
-edge case). The `seen` set is the deduplication rule, keeping the first `ref_text` for
-a given `(source, target)` pair since `extract_references` can return the same
-resolvable reference more than once in one body.
-
-Calling `index_edges` for a `repo_id` with zero resources (e.g. right after Day 3's
-empty-repository short-circuit) is safe and returns `0` — `fetch_resource_bodies`
-returns `[]`, the loop never runs, `db.replace_edges(repo_id, [])` just clears any
-stale edges.
-
-### 5.4 New fixture: `tests/fixtures/reference_repo/`
-
-A **new, separate** fixture — not an extension of Day 2's `tests/fixtures/sample_repo/`
-— because that fixture's blocks have zero cross-references between them (nothing in
-its `main.tf`/`variables.tf` refers to anything else in the same file), and every
-existing test in `test_parser.py`/`test_scanner.py`/`test_indexer.py` has hardcoded
-assertions keyed to that fixture's exact block count and address set. Adding
-references to it risks silently breaking those Day 2/3 tests instead of just adding
-Day 4 coverage.
-
-`tests/fixtures/reference_repo/main.tf`:
-```hcl
-resource "aws_vpc" "main" {
-  cidr_block = var.cidr
-}
-
-resource "aws_subnet" "public" {
-  vpc_id     = aws_vpc.main.id
-  cidr_block = "10.0.1.0/24"
-}
-
-resource "aws_security_group" "worker" {
-  vpc_id = aws_vpc.main.id
-
-  ingress {
-    security_groups = [aws_security_group.worker.id]
-  }
-}
-
-data "aws_ami" "ubuntu" {
-  most_recent = true
-}
-
-resource "aws_instance" "node" {
-  ami       = data.aws_ami.ubuntu.id
-  subnet_id = aws_subnet.public.id
-  iam_role  = aws_iam_role.missing.name
-
-  tags = {
-    Name = local.prefix
-  }
-}
-```
-
-`tests/fixtures/reference_repo/variables.tf`:
-```hcl
-variable "cidr" {
-  type    = string
-  default = "10.0.0.0/16"
-}
-
-locals {
-  prefix = "demo"
-}
-```
-
-This fixture exercises every rule in section 9.2 with a clean, predictable expected
-edge count:
-
-| Reference (in body) | Resolves to | Edge written? |
-|---|---|---|
-| `var.cidr` (in `aws_vpc.main`) | `variable "cidr"` block | **Yes** — `aws_vpc.main -> var.cidr` |
-| `aws_vpc.main.id` (in `aws_subnet.public`) | `aws_vpc.main` | **Yes** |
-| `aws_vpc.main.id` (in `aws_security_group.worker`) | `aws_vpc.main` | **Yes** |
-| `aws_security_group.worker.id` (in its own `ingress` block) | itself | **No** — self-reference, excluded |
-| `data.aws_ami.ubuntu.id` (in `aws_instance.node`) | `data.aws_ami.ubuntu` | **Yes** |
-| `aws_subnet.public.id` (in `aws_instance.node`) | `aws_subnet.public` | **Yes** |
-| `aws_iam_role.missing.name` (in `aws_instance.node`) | nothing (no such block) | **No** — discarded silently |
-| `local.prefix` (in `aws_instance.node`) | nothing (see section 10 — `local.X` can never resolve under this parser's `locals` addressing scheme) | **No** — discarded silently |
-
-**Expected total: 5 edges.**
-
-### 5.5 `ripple/db.py` additions
+### Step 4 — `BM25Index.query()`
 
 ```python
-class EdgeRowLike(Protocol):
-    source_id: int
-    target_id: int
-    ref_text: str
+    def query(self, question: str, k: int) -> list[RetrievedBlock]:
+        if self._model is None:
+            return []
 
+        query_tokens = tokenize(question)
+        scores = self._model.get_scores(query_tokens)
 
-def replace_edges(repo_id: int, rows: list[EdgeRowLike]) -> None:
-    """Atomically replace all edges belonging to one repository."""
-    with get_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("DELETE FROM edges WHERE repo_id = %s", (repo_id,))
-            if rows:
-                cursor.executemany(
-                    """
-                    INSERT INTO edges (repo_id, source_id, target_id, ref_text)
-                    VALUES (%s, %s, %s, %s)
-                    """,
-                    [
-                        (repo_id, row.source_id, row.target_id, row.ref_text)
-                        for row in rows
-                    ],
-                )
+        ranked_indexes = sorted(
+            range(len(self._documents)),
+            key=lambda i: (-scores[i], self._documents[i].address),
+        )
 
-
-def fetch_resource_bodies(repo_id: int) -> list[tuple[int, str, str]]:
-    """Return (id, address, body) for every resource row of repo_id — the
-    'full address table' section 9.2 says resolution needs.
-    """
-    with get_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT id, address, body FROM resources WHERE repo_id = %s",
-                (repo_id,),
+        return [
+            RetrievedBlock(
+                id=self._documents[i].id,
+                address=self._documents[i].address,
+                file_path=self._documents[i].file_path,
+                start_line=self._documents[i].start_line,
+                end_line=self._documents[i].end_line,
+                body=self._documents[i].body,
+                score=float(scores[i]),
             )
-            return cursor.fetchall()
+            for i in ranked_indexes[:k]
+        ]
 ```
 
-`replace_edges` follows the exact same pattern Day 3's review established for
-`replace_resources`: no explicit `commit()`/`rollback()`, relying on `psycopg`'s
-connection context manager to commit on clean exit or roll back automatically if an
-exception propagates. Note `edges.source_id`/`edges.target_id` have `ON DELETE
-CASCADE` foreign keys to `resources.id` — so `replace_resources`'s own `DELETE FROM
-resources` (Day 2/3) *already* wipes any edges pointing at the deleted rows as a side
-effect. `replace_edges`'s own `DELETE FROM edges WHERE repo_id = %s` is technically
-redundant immediately after a fresh `index_repo()` call, but it's kept anyway so
-`index_edges()` is correct and idempotent on its own, regardless of what a future
-caller does or doesn't do first (see section 10).
+(Add `from ripple.retrieval.vector_store import RetrievedBlock` to the imports at the
+top of the file.)
 
-### 5.6 `scripts/index_repo.py` — wire in edge extraction
+Two design decisions worth understanding, not just copying:
+- **The query itself goes through the same `tokenize()`** used for the corpus (Step
+  1's warning). Using a different tokenization scheme for queries vs. documents is the
+  single most common way to silently break a BM25 setup.
+- **Deterministic tie-breaking**: sort key is `(-score, address)`, so equal-scoring
+  documents (all-zero scores from an empty-token query, or genuine score ties) always
+  come out in the same order — alphabetical by address — rather than whatever
+  incidental order `rank_bm25`/Python happen to produce. This is what "stable result
+  ordering" (your requirement 2) means concretely, and it's what Step 5's determinism
+  test checks.
 
-`indexer` is already imported (`from ripple.ingest import indexer`, added Day 3) — no
-new import is needed. Add two lines in `main()`, after the existing
-`indexer.index_repo(...)` call:
+`BM25Index` deliberately does **not** implement the `VectorStore` Protocol
+(`upsert`/`delete_namespace`) — it has no persistent storage to upsert into or delete;
+it's rebuilt from the database every time `build_index()` is called. Reusing
+`RetrievedBlock` as the return type is intentional forward-compatibility with Day 6:
+when `fusion.py` combines ranked lists from vector and BM25 search, both sides
+returning the same shape means the fusion logic doesn't need to branch on source.
 
-```python
-resource_count = indexer.index_repo(repo_id, str(local_path))
-edge_count = indexer.index_edges(repo_id)
+### Step 5 — Tests (`tests/test_bm25.py`)
 
-print(f"Registered repo id={repo_id} name={name} local_path={local_path}")
-print(f"Indexed {resource_count} resource blocks")
-print(f"Extracted {edge_count} reference edges")
-```
+See section 7 for the full required list. Suggested split if dividing this step
+further: tokenizer tests first (pure, instant, no setup), then the DB-dependent
+`BM25Index` tests (need a reachable Postgres, same skip-if-unreachable convention as
+every prior day).
 
-This changes `main()`'s stdout again — same class of change as Day 2's second print
-line. **Both existing `tests/test_index_repo.py` `main()` tests must be updated in
-this same change**, not left for later (4, 7).
+### Step 6 — Manual acceptance check against the real corpus
+
+See section 8. **Read this before running it** — the literal SPEC.md example address
+(`aws_nat_gateway.this`) is not in the corpus every prior day's manual check has used.
 
 ## 6. Interfaces, data structures, and error behavior
 
-- `references.extract_references(body) -> list[str]` — pure, no I/O, never raises.
-  Returns raw `ref_text` strings in order of appearance, duplicates included.
-- `references._resolve_reference_address(ref_text) -> str` — pure, private. Assumes
-  `ref_text` was produced by `REF_RE` (every real call site — `indexer.index_edges` —
-  only ever passes values that came from `extract_references`, which guarantees this).
-  Not designed to validate arbitrary external input; it isn't part of the module's
-  public contract.
-- `indexer.index_edges(repo_id) -> int` — returns the number of edges written for
-  `repo_id`. Must be called after that repo's resources exist (typically right after
-  `index_repo()`); calling it for a repo with no resources is safe and returns `0`.
-  Does not raise for a repo with zero resolvable references. Propagates whatever
-  `db.replace_edges` raises (e.g. a foreign-key violation from a malformed row — should
-  not happen given `address_to_id` is built from the same table `target_id` values
-  come from, but not defended against beyond that).
-- `db.replace_edges(repo_id, rows)` — same atomicity contract as
-  `db.replace_resources`: delete-then-insert in one transaction, no explicit
-  commit/rollback, relying on the connection context manager. An empty `rows` list is
-  valid and simply clears the repo's edges.
-- `db.fetch_resource_bodies(repo_id) -> list[tuple[int, str, str]]` — `(id, address,
-  body)` tuples, in whatever order Postgres returns them (no `ORDER BY` — order
-  doesn't matter for building `address_to_id` or iterating sources).
-- `graph.dependents(resource_id) -> list[GraphNeighbor]` / `graph.dependencies(...)` —
-  return `[]` for a resource with no edges in that direction, or for a nonexistent
-  `resource_id` (not an error case, just an empty join result). Never raise for an
-  unknown id.
+- `tokenize(text: str) -> list[str]` — pure, never raises, `""` in → `[]` out.
+- `BM25Document` — plain dataclass mirroring the fields `RetrievedBlock` needs, minus
+  `score` (which only exists at query time) and `embed_text` (needed only transiently,
+  for tokenizing at build time — not retained on the document, since nothing after
+  indexing needs the raw embed_text again).
+- `build_index(repo_id: int) -> BM25Index` — never raises for a repo with zero
+  resources; returns a `BM25Index` whose `query()` always returns `[]`. Raises
+  whatever `db.fetch_bm25_documents`/`rank_bm25.BM25Okapi` raise, uncaught, for any
+  other failure (consistent with every prior day's "let real failures propagate"
+  posture).
+- `BM25Index.query(question: str, k: int) -> list[RetrievedBlock]` — returns at most
+  `k` results, fewer if the corpus has fewer documents than `k`. Returns `[]` for an
+  empty corpus (`self._model is None`) or `k <= 0`. An empty-token query (e.g.
+  `question` is only punctuation) still runs — `get_scores([])` scores every document
+  identically (typically `0.0`), and the `(-score, address)` tie-break still produces
+  a deterministic (if not meaningful) ranking rather than an error.
+- `db.fetch_bm25_documents(repo_id) -> list[tuple[int, str, str, int, int, str, str]]`
+  — `(id, address, file_path, start_line, end_line, body, embed_text)`, ordered by
+  `id`. Empty list for a repo with no resources; never raises for an unknown `repo_id`.
 
 ## 7. Required tests
 
-`tests/test_references.py` (pure, no DB, no fixture files — inline body strings):
-- Plain reference with a trailing attribute (`vpc_id = aws_vpc.main.id`) extracts
-  `"aws_vpc.main.id"`.
-- Data-prefixed reference (`ami = data.aws_ami.ubuntu.id`) extracts
-  `"data.aws_ami.ubuntu.id"`.
-- A reference used as the final item in a list
-  (`security_groups = [aws_security_group.worker.id]`) extracts only
-  `"aws_security_group.worker.id"`, without consuming the list's closing bracket.
-- A balanced traversal index (`module.vpc.private_subnets[0]`) is preserved in full.
-- A reference inside a `#` comment, a `//` comment, and a `/* */` block comment: none
-  of them appear in the result.
-- A reference inside a double-quoted string interpolation (e.g.
-  `name = "${aws_vpc.main.id}-sg"`): **is** extracted — strings are not comments.
-- A reference inside a heredoc body (an IAM-policy-shaped `<<-EOF ... EOF` containing
-  `aws_iam_role.example.arn`): **is** extracted, and a `#` character appearing
-  elsewhere inside that same heredoc does not swallow real content after it (the exact
-  bug class section 9.1 warned about for the parser, now checked for the reference
-  extractor too).
-- Multiple distinct references in one body are all returned, in order, with
-  duplicates preserved (dedup is `index_edges`'s job, not `extract_references`'s).
-- `_resolve_reference_address`: `"aws_vpc.main.id"` → `"aws_vpc.main"`;
-  `"data.aws_ami.ubuntu.id"` → `"data.aws_ami.ubuntu"`; `"aws_vpc.main"` (no trailing
-  attribute at all) → `"aws_vpc.main"` (the third capture group is optional).
-- **Underscored names extract and resolve in full** — both the type group
-  (`[a-z][a-z0-9_]*`) and the name group (`[a-z_][a-z0-9_-]*`) allow underscores in
-  `REF_RE`, so a reference whose target name contains an underscore is not truncated:
-  ```python
-  def test_extract_and_resolve_reference_with_underscored_name() -> None:
-      body = "policy = data.aws_iam_policy_document.dynamodb_endpoint_policy.json"
+`tests/test_bm25.py`, tokenizer section (pure, no DB, instant):
+- `tokenize("aws_security_group.worker")` — the exact worked example from SPEC.md
+  9.5: `== ["aws_security_group.worker", "aws", "security", "group", "worker"]`.
+- Casing: `tokenize("AWS_Security_Group.Worker")` produces the identical output to the
+  lowercase version above.
+- Hyphens: a token like `t3-micro` (a real Terraform instance-type string) splits into
+  `t3-micro`, `t3`(len 2, kept), `micro`.
+- Short parts filtered: a token like `a.b` (both parts length 1) contributes only the
+  raw token `a.b` itself — neither `a` nor `b` is added.
+- Consecutive delimiters: a token like `aws..vpc` — `re.split` produces an empty
+  string between the two dots, which the `len(p) > 1` filter naturally excludes, so
+  the result is `["aws..vpc", "aws", "vpc"]` with no empty-string entries.
+- Non-token characters (spaces, braces, quotes, `=`) act as separators between raw
+  tokens — `tokenize('name = "worker-sg"')` produces multiple independent raw tokens,
+  not one giant blob.
+- **Duplicate-token behavior for delimiter-free words — pin this explicitly, it's
+  non-obvious (see section 10):** `tokenize("worker")` (no `.`/`_`/`-` at all) is
+  `["worker", "worker"]`, not `["worker"]`. `re.split` on a string with no delimiter
+  returns the whole string as a single-element list, so the "parts" extension re-adds
+  the same token the raw loop already appended. This is SPEC.md's literal code,
+  reproduced exactly — this test documents the behavior rather than treating it as a
+  bug to fix.
+- Multiple distinct real Terraform tokens in one string (e.g. an `embed_text` header
+  line `"aws_vpc.main\nFile: main.tf\nType: aws_vpc\n\n..."`) — spot-check that both
+  `"aws_vpc.main"` (the full address) and `"main"` (a part) appear in the output.
 
-      extracted = references.extract_references(body)
-      assert extracted == [
-          "data.aws_iam_policy_document.dynamodb_endpoint_policy.json"
-      ]
-      assert references._resolve_reference_address(extracted[0]) == (
-          "data.aws_iam_policy_document.dynamodb_endpoint_policy"
-      )
-  ```
-
-`tests/test_indexer.py` additions (DB-dependent, skip-if-unreachable, using the new
-`tests/fixtures/reference_repo/`):
-- Index the fixture (`index_repo(repo_id, str(REFERENCE_FIXTURE_ROOT),
-  embedder=_FakeEmbeddingProvider())`), then call `indexer.index_edges(repo_id)`;
-  assert it returns `5` (per the table in 5.4).
-- Query `edges` (or use `graph.dependents`/`dependencies`, once that module exists) and
-  assert: `aws_subnet.public -> aws_vpc.main` exists with `ref_text ==
-  "aws_vpc.main.id"`; `aws_security_group.worker -> aws_vpc.main` exists; **no** edge
-  has `source_id == target_id` for this repo (the self-reference in `ingress` never
-  became an edge); `aws_instance.node -> data.aws_ami.ubuntu` exists (proving the
-  `data.` prefix round-trips correctly through resolution); nothing resolved for
-  `aws_iam_role.missing` or `local.prefix`.
-- Call `index_edges(repo_id)` a second time; assert the count and edge set are
-  unchanged (idempotent replace, same convention as `replace_resources`).
-- `test_index_edges_empty_repository` — call `indexer.index_edges` for a `repo_id`
-  with zero resources (reuse Day 3's empty-repo pattern or a fresh throwaway repo with
-  no resources indexed); assert it returns `0` without error.
-
-`tests/test_graph.py` (DB-dependent, skip-if-unreachable; reuse the indexed
-`reference_repo` fixture, or a small hand-inserted resources+edges set if that's
-simpler to isolate):
-- `dependencies(subnet_id)` returns exactly `[aws_vpc.main]` as a `GraphNeighbor`, with
-  the correct `ref_text`.
-- `dependents(vpc_id)` returns both `aws_security_group.worker` and `aws_subnet.public`
-  (both reference the VPC), **in that exact order** — `ORDER BY r.address` sorts
-  `"aws_security_group.worker"` before `"aws_subnet.public"` alphabetically, so this
-  test asserts the full ordered list, not a set — this is the literal Day 4 "sanity
-  check" from section 11, automated: a subnet's edge to the VPC exists (via
-  `dependencies`) and points the right way (the VPC lists the subnet as a dependent,
-  via `dependents`), not just one direction.
-- `dependents`/`dependencies` for a resource with no edges in that direction (e.g.
-  `data.aws_ami.ubuntu` has dependents but no dependencies) returns `[]`.
-- Results are deterministic across repeated calls (call `dependents(vpc_id)` twice,
-  assert identical ordered output) — the regression test for `ORDER BY r.address`
-  actually mattering.
-
-`tests/test_index_repo.py` — **update both existing `main()` tests**:
-- `test_main_registers_local_repo`: add a `record_index_edges` stub (returning e.g.
-  `3`), `monkeypatch.setattr(index_repo.indexer, "index_edges", record_index_edges)`,
-  and update the `capsys` assertion to the full three-line output:
-  ```
-  Registered repo id=42 name=... local_path=...
-  Indexed 6 resource blocks
-  Extracted 3 reference edges
-  ```
-- `test_main_uses_explicit_name`: same `index_edges` monkeypatch (doesn't check
-  `capsys`, but would otherwise hit a real, unmocked database).
-
-`tests/test_db.py` — **required** addition, `test_replace_edges_rolls_back_on_insert_failure`:
-`edges` has no unique constraint to violate (unlike `resources`), so the natural
-failure mode to test instead is a **foreign-key violation** — use `target_id = -1` (a
-value structurally guaranteed to never exist, since `resources.id` is a `SERIAL` and
-can never be negative — preferred over an arbitrary large positive number, which is
-merely improbable rather than impossible) and confirm `db.replace_edges` raises
-(`psycopg.errors.ForeignKeyViolation`) while leaving any previously-committed edges for
-that `repo_id` untouched, mirroring
-`test_replace_resources_rolls_back_on_insert_failure`'s structure exactly.
+`tests/test_bm25.py`, `BM25Index` section (DB-dependent, skip-if-unreachable — same
+convention as every prior day; reuse `tests/fixtures/reference_repo/` via
+`indexer.index_repo(..., embedder=_FakeEmbeddingProvider())`, no new fixture needed):
+- **Exact-address retrieval (the Day 5 acceptance criterion, formalized)**: index
+  `reference_repo`, build a `BM25Index` for that `repo_id`, query for
+  `"aws_vpc.main"`; assert the top result (`results[0]`) has `address ==
+  "aws_vpc.main"`.
+- **Repository isolation**: index `reference_repo` under one throwaway repo and
+  `tests/fixtures/sample_repo/` (Day 2's fixture) under a second throwaway repo;
+  build a `BM25Index` for each. **Note before writing this test:**
+  `aws_security_group.worker` and `data.aws_ami.ubuntu` exist in *both* fixtures
+  (same address text, different rows/ids) — good evidence that isolation must be
+  checked by row `id`, not by address text alone, but *not* usable as a
+  "unique to one repo" example. Addresses actually unique to `reference_repo`:
+  `aws_vpc.main`, `aws_subnet.public`, `aws_instance.node`, `var.cidr`. Addresses
+  actually unique to `sample_repo`: `module.vpc`, `var.region`, `var.environment`.
+  Query `reference_repo`'s index for `"module.vpc"` (a `sample_repo`-only address);
+  assert no result's `id` belongs to `reference_repo`'s known id set. Then, using the
+  address that exists in *both* fixtures (`aws_security_group.worker`), query each
+  repo's index and assert the returned `id` matches that specific repo's own row for
+  that address, not the other repo's row — this is the real isolation guarantee:
+  same address text, different repos, never cross-contaminating.
+- **Deterministic ordering**: call `.query()` twice with the same arguments against
+  the same built index; assert identical results, in identical order.
+- **Empty corpus**: `build_index` for a `repo_id` with zero resources (an
+  unregistered/nonexistent id, or a real repo with `index_repo` run against an empty
+  directory) returns a `BM25Index` whose `.query("anything", k=5)` is `[]`, without
+  raising — this is the direct regression test for the `BM25Okapi([])` avoidance in
+  Step 3.
+- **Empty query**: query a non-empty index with a question that tokenizes to nothing
+  (e.g. `"???"`); assert it returns up to `k` results (not an error, not necessarily
+  meaningful) in the deterministic tie-break order (alphabetical by address).
+- **`k` truncation**: a corpus with more documents than `k` returns exactly `k`
+  results; a corpus with fewer than `k` documents returns all of them.
+- **Regression check, not a new test**: `tests/test_pgvector_store.py` must continue
+  to pass completely unmodified — nothing in this cycle touches `vector_store.py` or
+  `pgvector_store.py`. Run the full suite, not just the new file, before calling this
+  cycle done.
 
 Run `python -m pytest` after implementation; all tests must pass. DB-dependent tests
-skip cleanly if Postgres isn't reachable, same convention as every prior day.
+skip cleanly if Postgres isn't reachable, same convention as every prior day. Nothing
+in this cycle needs `OPENAI_API_KEY` except indirectly, through the *existing*
+`_FakeEmbeddingProvider` pattern used to index fixtures without a real API call —
+same as every prior day since Day 3.
 
 ## 8. Acceptance criteria
 
-- `python -m pytest` passes with no failures.
-- `tests/fixtures/sample_repo/`-based tests (Day 2/3) are completely unaffected —
-  their block counts, addresses, and embedding assertions are unchanged.
-- Indexing `tests/fixtures/reference_repo/` produces exactly 5 edges, matching the
-  table in 5.4, with the self-reference and both unresolvable references correctly
-  excluded.
-- `python scripts/index_repo.py <path> --name ...` now prints three lines, the third
-  being `Extracted N reference edges`.
-- **Manual sanity check against the real corpus** (SPEC.md's own Day 4 "Done when"
-  wording), using a real, already-verified relationship from
-  `.repos/terraform-aws-vpc/examples/complete/main.tf`: `aws_security_group.rds`
-  contains `vpc_id = module.vpc.vpc_id` (confirmed present at that file's line 214
-  during Day 2 verification). After re-indexing that repo:
-  - `graph.dependencies(<aws_security_group.rds's id>)` must include `module.vpc`.
-  - `graph.dependents(<module.vpc's id>)` must include `aws_security_group.rds` (and
-    likely other resources in that file referencing `module.vpc.*` outputs).
-  - This is a real edge pointing the right way, verifiable by reading the file
-    directly — exactly SPEC.md's own acceptance bar.
+- `python -m pytest` passes with no failures, including the full existing suite (not
+  just `test_bm25.py`).
+- The fixture-based exact-address test (section 7) passes: querying `"aws_vpc.main"`
+  against `reference_repo`'s `BM25Index` returns that block at rank 1.
+- **Manual acceptance check against the real corpus, reproducing SPEC.md's literal
+  example — read the caveat first:**
+  - `aws_nat_gateway.this` (SPEC.md's own named example, and section 10.1's
+    benchmark.json example) is **not present in `examples/complete`**, the corpus
+    every prior day's manual check has used. It exists only in the **module root**:
+    confirmed via direct file inspection at `.repos/terraform-aws-vpc/main.tf:1228`
+    (`resource "aws_nat_gateway" "this" { ... }`). Section 5 describes the module root
+    as the harder, more heavily parameterized corpus meant to be added "once the
+    pipeline works on `examples/`" — this is the first day where reproducing SPEC's
+    own named example requires that second corpus.
+  - To actually run this check: register the module root as a second `repos` entry
+    (e.g. `python scripts/index_repo.py .repos/terraform-aws-vpc --name
+    vpc-module-root`), then `bm25.build_index(that_repo_id).query("aws_nat_gateway
+    this", k=5)` (or via a quick throwaway script/REPL — no new CLI is being built
+    this cycle, see section 9) and confirm `results[0].address ==
+    "aws_nat_gateway.this"`.
+  - **This will cost real, if small, OpenAI usage** (indexing the module root means
+    embedding every block in it) — same category of manual, non-automated,
+    real-API-cost step as Day 3's acceptance check. Confirm before running it, same as
+    before.
+  - If this is skipped for time/cost, the fixture-based automated test above is the
+    fallback evidence that exact-address retrieval works — it exercises the identical
+    code path against a smaller, free, deterministic corpus.
 
 ## 9. Explicit non-goals
 
-- Wiring graph expansion into the retrieval pipeline or prompt (the actual "add
-  dependents/dependencies of the top-N reranked results to the context, marked with
-  their relationship" behavior from section 9.8) — that's Day 8 (first pipeline
-  wiring) and Day 13 (the dedicated graph-expansion day) with real depth/count limits
-  (`graph_seed_n`, `graph_max_added` from `RetrievalConfig`). This cycle only builds
-  the query layer those days will call.
-- Depth-2+ traversal. `dependents`/`dependencies` are depth-1 only, matching section
-  9.8's explicit warning against blind depth-2 expansion (unrelated to *when* it's
-  wired in — the functions themselves simply don't support a depth parameter yet).
-- "Referenced by: X" annotations on retrieved blocks — a prompt-formatting concern for
-  whichever day actually calls `graph.py`, not this cycle.
-- Making `local.X` references resolve against `locals` blocks. Day 2's parser stores
-  one address per `locals { ... }` *block* (`locals:<file>:<line>`, since the block
-  itself has no header label), not one address per named local value defined inside
-  it. Resolving `local.name_prefix` to the *specific* named entry would require
-  parsing inside `locals` blocks at the individual-assignment level — a parser change,
-  not a references.py change, and out of scope here. `local.X` references are expected
-  to always fall into the "discard silently" bucket.
-- `PineconeStore`, BM25, RRF, reranking, query rewriting, `pipeline.py`,
-  `RetrievalConfig`-driven toggling, the FastAPI app — all still not built, unchanged
-  from Day 3's non-goals.
+- **`scripts/ask.py` is not touched.** It remains vector-only this cycle.
+  `RetrievalConfig.use_bm25`/`use_vector` are not consulted by anything yet — wiring
+  BM25 as a second path (and reading `RetrievalConfig` at all) is `pipeline.py`'s job,
+  Day 6. Adding BM25 into `ask.py` directly now would just be replaced/refactored away
+  next cycle for no benefit.
+- RRF or any fusion logic (`fusion.py`) — Day 6, explicitly.
+- Graph expansion wiring into anything — unrelated to this cycle; `graph.py` (Day 4)
+  is untouched.
+- Cross-encoder reranking, query rewriting — Days 12 and 15 respectively.
+- **Caching a `BM25Index` across multiple calls within a long-running process.**
+  SPEC.md 9.5 says "rebuilt at process start" — for every consumer that exists today
+  (a one-shot test, or eventually a one-shot CLI invocation), "at process start" and
+  "rebuilt every call" are the same thing, since each invocation *is* a fresh process.
+  This distinction only becomes real once Day 17's FastAPI app exists as a
+  long-running server handling multiple requests per process — that's when
+  build-once-reuse-across-requests caching would actually matter, and it's out of
+  scope here.
+- `PineconeStore`, the `RetrievalConfig`-driven pipeline itself, the FastAPI app — all
+  still not built, unchanged from prior days' non-goals.
+- Modifying `SPEC.md`. Any apparent issue in its text is flagged in section 10, not
+  corrected.
 
-## 10. Risks or ambiguities
+## 10. Risks, ambiguities, and things flagged for your review
 
-- **`var.X` and `module.X.Y` references can resolve to real edges; `local.X` never
-  can.** This is a natural, unplanned consequence of Day 2's addressing scheme: a
-  `variable "region" {}` block got address `var.region` and a `module "vpc" {}` block
-  got address `module.vpc` — both of which happen to exactly match Terraform's own
-  reference syntax for those kinds, so `var.region` and `module.vpc.vpc_id` genuinely
-  resolve and produce real, meaningful edges (not just resource-to-resource edges).
-  `locals { ... }` blocks, by contrast, got address `locals:<file>:<line>` (no natural
-  per-value address exists, since a single `locals` block defines many named values)
-  — which can never match `local.<name>`'s reference syntax. Both outcomes are
-  spec-compliant (section 9.2 explicitly allows silent non-matches), but worth
-  understanding rather than assuming all non-resource references behave the same way.
-- **`replace_edges`'s `DELETE` is redundant most of the time.** `resources`'s own
-  cascade already wipes old edges when `replace_resources` deletes old resource rows.
-  `replace_edges` still does its own `DELETE FROM edges WHERE repo_id = %s` for
-  defensive correctness/idempotency if ever called independently of a fresh
-  `index_repo()` — harmless, just worth knowing it's usually a no-op in the normal
-  `index_repo` → `index_edges` sequence.
-- **No unique constraint on `edges`.** Unlike `resources`'s `UNIQUE (repo_id,
-  address)`, nothing in the schema stops duplicate `(source_id, target_id)` rows from
-  being inserted — deduplication is entirely the `seen` set in `index_edges`. If a
-  future change calls `db.replace_edges` directly with pre-duplicated rows (bypassing
-  `index_edges`), nothing at the database layer will catch it.
-- **New fixture directory, not an extension of Day 2's.** Deliberate, to avoid any
-  risk of breaking Day 2/3's hardcoded block-count and address-set assertions — see
-  5.4. Costs a bit of duplication (two small fixture repos instead of one) in exchange
-  for zero cross-cycle breakage risk.
+- **Flagged for review, not fixed: SPEC.md's `tokenize()` double-counts delimiter-free
+  words.** For any raw token with no `.`/`_`/`-` in it (a plain single word — very
+  common, e.g. `"true"`, `"worker"` as a standalone word in a description string),
+  `re.split` on a string with no delimiter returns `[the_whole_string]`, and the
+  `len(p) > 1` extension re-adds that same string a second time. Net effect: every
+  delimiter-free word of length > 1 gets **double term frequency** relative to how a
+  reader skimming the function might expect ("parts" implies something in addition
+  to, not a repeat of, the raw token). This is implemented exactly as SPEC.md
+  specifies (per this cycle's read-only policy) and pinned by an explicit test (section
+  7), but it's worth you knowing about since it does mean single-word terms are
+  systematically weighted about 2x relative to genuinely-multi-part identifiers in
+  BM25's term-frequency component. If this is unwanted, the fix would be
+  `parts = [p for p in parts if len(p) > 1 and p != tok]` or similar — not applied
+  here, since that would be silently changing spec-specified behavior rather than
+  flagging it.
+- **BM25 scores are unnormalized and not comparable to vector cosine scores.** This is
+  expected and is exactly why Day 6 uses RRF instead of a weighted score sum (SPEC.md
+  9.6 says so explicitly) — noted here only so it's not mistaken for an oversight in
+  this cycle's `RetrievedBlock.score` field.
+- **`BM25Okapi([])`'s actual behavior was not empirically verified against the
+  installed `rank-bm25==0.2.2`** — this plan avoids the question entirely by never
+  constructing a `BM25Okapi` for an empty corpus (Step 3), rather than relying on
+  (and needing to test) whatever that edge case actually does in the library. If a
+  future change needs to know that behavior for some other reason, it should be
+  checked directly rather than assumed from this plan.
+- **The `reference_repo` fixture is reused, not rebuilt.** Both fixtures already used
+  by Day 2/4 tests (`sample_repo`, `reference_repo`) are reused for repo-isolation
+  testing rather than creating a third fixture — there's no cross-references or line-
+  range concern for BM25 the way there was for Day 4's edge extraction, so reuse
+  carries no risk of breaking those fixtures' existing hardcoded assertions (this plan
+  never modifies fixture files, only reads already-indexed data from them).
+- **`get_scores()` vs `get_top_n()`**: `rank_bm25.BM25Okapi` offers a `get_top_n()`
+  convenience method, but it returns *documents*, not indices or scores, which isn't
+  enough to build `RetrievedBlock`s (need `score`) or to apply the deterministic
+  tie-break (need to compare against other documents' addresses). This plan uses
+  `get_scores()` directly and does ranking/tie-breaking itself — a deliberate choice,
+  not an oversight, worth knowing if you see `get_top_n()` mentioned in `rank_bm25`'s
+  own docs and wonder why it isn't used here.
