@@ -117,6 +117,7 @@ def test_main_registers_local_repo(
 ) -> None:
     insert_calls: list[dict[str, str | None]] = []
     index_calls: list[tuple[int, str]] = []
+    workflow_calls: list[tuple[str, int]] = []
 
     def record_insert(
         name: str,
@@ -134,10 +135,16 @@ def test_main_registers_local_repo(
 
     def record_index(repo_id: int, local_path: str) -> int:
         index_calls.append((repo_id, local_path))
+        workflow_calls.append(("resources", repo_id))
         return 6
+
+    def record_index_edges(repo_id: int) -> int:
+        workflow_calls.append(("edges", repo_id))
+        return 3
 
     monkeypatch.setattr(index_repo.db, "insert_repo", record_insert)
     monkeypatch.setattr(index_repo.indexer, "index_repo", record_index)
+    monkeypatch.setattr(index_repo.indexer, "index_edges", record_index_edges)
 
     index_repo.main([str(tmp_path)])
 
@@ -149,9 +156,11 @@ def test_main_registers_local_repo(
         }
     ]
     assert index_calls == [(42, str(tmp_path))]
+    assert workflow_calls == [("resources", 42), ("edges", 42)]
     assert capsys.readouterr().out == (
         f"Registered repo id=42 name={tmp_path.name} local_path={tmp_path}\n"
         "Indexed 6 resource blocks\n"
+        "Extracted 3 reference edges\n"
     )
 
 
@@ -161,6 +170,7 @@ def test_main_uses_explicit_name(
 ) -> None:
     insert_calls: list[dict[str, str | None]] = []
     index_calls: list[tuple[int, str]] = []
+    workflow_calls: list[tuple[str, int]] = []
 
     def record_insert(
         name: str,
@@ -178,10 +188,16 @@ def test_main_uses_explicit_name(
 
     def record_index(repo_id: int, local_path: str) -> int:
         index_calls.append((repo_id, local_path))
+        workflow_calls.append(("resources", repo_id))
         return 7
+
+    def record_index_edges(repo_id: int) -> int:
+        workflow_calls.append(("edges", repo_id))
+        return 4
 
     monkeypatch.setattr(index_repo.db, "insert_repo", record_insert)
     monkeypatch.setattr(index_repo.indexer, "index_repo", record_index)
+    monkeypatch.setattr(index_repo.indexer, "index_edges", record_index_edges)
 
     index_repo.main([str(tmp_path), "--name", "custom"])
 
@@ -193,3 +209,4 @@ def test_main_uses_explicit_name(
         }
     ]
     assert index_calls == [(43, str(tmp_path))]
+    assert workflow_calls == [("resources", 43), ("edges", 43)]

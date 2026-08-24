@@ -84,3 +84,54 @@ def replace_resources(repo_id: int, rows: list[ResourceRowLike]) -> None:
                         for row in rows
                     ],
                 )
+
+
+class EdgeRowLike(Protocol):
+    source_id: int
+    target_id: int
+    ref_text: str
+
+
+def replace_edges(repo_id: int, rows: list[EdgeRowLike]) -> None:
+    """Atomically replace all edges belonging to one repository."""
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM edges WHERE repo_id = %s",
+                (repo_id,),
+            )
+
+            if rows:
+                cursor.executemany(
+                    """
+                    INSERT INTO edges
+                        (repo_id, source_id, target_id, ref_text)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    [
+                        (
+                            repo_id,
+                            row.source_id,
+                            row.target_id,
+                            row.ref_text,
+                        )
+                        for row in rows
+                    ],
+                )
+
+
+def fetch_resource_bodies(
+    repo_id: int,
+) -> list[tuple[int, str, str]]:
+    """Return each resource's ID, address, and body for one repository."""
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, address, body
+                FROM resources
+                WHERE repo_id = %s
+                """,
+                (repo_id,),
+            )
+            return cursor.fetchall()

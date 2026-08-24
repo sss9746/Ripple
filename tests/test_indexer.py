@@ -14,6 +14,9 @@ from ripple.ingest.parser import ParsedBlock
 
 
 FIXTURE_ROOT = (Path(__file__).parent / "fixtures" / "sample_repo").resolve()
+REFERENCE_FIXTURE_ROOT = (
+    Path(__file__).parent / "fixtures" / "reference_repo"
+).resolve()
 
 
 class _FakeEmbeddingProvider:
@@ -193,4 +196,100 @@ def test_index_repo_empty_repository_never_requires_embedder(
     result = indexer.index_repo(123, str(tmp_path))
 
     assert result == 0
+    assert calls == [(123, [])]
+
+
+def test_index_edges_round_trip_and_reindex() -> None:
+    try:
+        connection = db.get_connection()
+    except (RuntimeError, psycopg.OperationalError):
+        pytest.skip("database not reachable")
+    else:
+        connection.close()
+
+    try:
+        repo_id = db.insert_repo(
+            name="pytest-day4-edge-indexer",
+            source_url=None,
+            local_path=str(REFERENCE_FIXTURE_ROOT),
+        )
+    except psycopg.OperationalError:
+        pytest.skip("database not reachable")
+
+    def fetch_saved_edges() -> list[tuple[str, str, str]]:
+        with db.get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT source.address, target.address, edges.ref_text
+                    FROM edges
+                    JOIN resources AS source ON source.id = edges.source_id
+                    JOIN resources AS target ON target.id = edges.target_id
+                    WHERE edges.repo_id = %s
+                    ORDER BY source.address, target.address
+                    """,
+                    (repo_id,),
+                )
+                return cursor.fetchall()
+
+    try:
+        resource_count = index_repo(
+            repo_id,
+            str(REFERENCE_FIXTURE_ROOT),
+            embedder=_FakeEmbeddingProvider(),
+        )
+        assert resource_count == 7
+
+        expected_edges = [
+            (
+                "aws_instance.node",
+                "aws_subnet.public",
+                "aws_subnet.public.id",
+            ),
+            (
+                "aws_instance.node",
+                "data.aws_ami.ubuntu",
+                "data.aws_ami.ubuntu.id",
+            ),
+            (
+                "aws_security_group.worker",
+                "aws_vpc.main",
+                "aws_vpc.main.id",
+            ),
+            (
+                "aws_subnet.public",
+                "aws_vpc.main",
+                "aws_vpc.main.id",
+            ),
+            (
+                "aws_vpc.main",
+                "var.cidr",
+                "var.cidr",
+            ),
+        ]
+
+        assert indexer.index_edges(repo_id) == 5
+        assert fetch_saved_edges() == expected_edges
+
+        assert indexer.index_edges(repo_id) == 5
+        assert fetch_saved_edges() == expected_edges
+    finally:
+        with db.get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("DELETE FROM repos WHERE id = %s", (repo_id,))
+
+
+def test_index_edges_empty_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[int, list[object]]] = []
+
+    monkeypatch.setattr(indexer.db, "fetch_resource_bodies", lambda _repo_id: [])
+
+    def record_replace(repo_id: int, rows: list[object]) -> None:
+        calls.append((repo_id, rows))
+
+    monkeypatch.setattr(indexer.db, "replace_edges", record_replace)
+
+    assert indexer.index_edges(123) == 0
     assert calls == [(123, [])]

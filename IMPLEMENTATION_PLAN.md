@@ -24,7 +24,7 @@ This is SPEC.md's Day 4 milestone, sitting on top of Day 1–3
   ```python
   REF_RE = re.compile(
       r'\b(?:data\.)?([a-z][a-z0-9_]*)\.([a-z_][a-z0-9_-]*)'
-      r'(?:\.[a-z_][a-z0-9_\[\].*-]*)?'
+      r'(?:\.[a-z_][a-z0-9_*-]*|\[[a-z0-9_.*-]+\])*'
   )
   ```
   Rules:
@@ -123,7 +123,7 @@ from ripple.ingest.parser import HEREDOC_START_RE
 
 REF_RE = re.compile(
     r'\b(?:data\.)?([a-z][a-z0-9_]*)\.([a-z_][a-z0-9_-]*)'
-    r'(?:\.[a-z_][a-z0-9_\[\].*-]*)?'
+    r'(?:\.[a-z_][a-z0-9_*-]*|\[[a-z0-9_.*-]+\])*'
 )
 
 
@@ -541,6 +541,10 @@ this same change**, not left for later (4, 7).
   `"aws_vpc.main.id"`.
 - Data-prefixed reference (`ami = data.aws_ami.ubuntu.id`) extracts
   `"data.aws_ami.ubuntu.id"`.
+- A reference used as the final item in a list
+  (`security_groups = [aws_security_group.worker.id]`) extracts only
+  `"aws_security_group.worker.id"`, without consuming the list's closing bracket.
+- A balanced traversal index (`module.vpc.private_subnets[0]`) is preserved in full.
 - A reference inside a `#` comment, a `//` comment, and a `/* */` block comment: none
   of them appear in the result.
 - A reference inside a double-quoted string interpolation (e.g.

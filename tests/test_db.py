@@ -20,6 +20,13 @@ class _ResourceRow:
     embedding: list[float]
 
 
+@dataclass
+class _EdgeRow:
+    source_id: int
+    target_id: int
+    ref_text: str
+
+
 def test_get_connection_requires_database_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -139,6 +146,97 @@ def test_replace_resources_rolls_back_on_insert_failure() -> None:
                 assert cursor.fetchall() == [
                     ("aws_instance.a",),
                     ("aws_instance.b",),
+                ]
+    finally:
+        with db.get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("DELETE FROM repos WHERE id = %s", (repo_id,))
+
+
+def test_replace_edges_rolls_back_on_insert_failure() -> None:
+    try:
+        connection = db.get_connection()
+    except (RuntimeError, psycopg.OperationalError):
+        pytest.skip("database not reachable")
+    else:
+        connection.close()
+
+    try:
+        repo_id = db.insert_repo(
+            name="pytest-atomic-edge-replace",
+            source_url=None,
+            local_path="/tmp/pytest-atomic-edge-replace",
+        )
+    except psycopg.OperationalError:
+        pytest.skip("database not reachable")
+
+    def resource_row(name: str) -> _ResourceRow:
+        return _ResourceRow(
+            block_kind="resource",
+            resource_type="aws_instance",
+            resource_name=name,
+            address=f"aws_instance.{name}",
+            file_path="main.tf",
+            start_line=1,
+            end_line=3,
+            body=f'resource "aws_instance" "{name}" {{}}',
+            embed_text=f"aws_instance.{name}",
+            embedding=[0.0] * 1536,
+        )
+
+    try:
+        db.replace_resources(
+            repo_id,
+            [
+                resource_row("source"),
+                resource_row("target"),
+                resource_row("doomed"),
+            ],
+        )
+
+        resource_ids = {
+            address: resource_id
+            for resource_id, address, _body in db.fetch_resource_bodies(repo_id)
+        }
+        source_id = resource_ids["aws_instance.source"]
+        target_id = resource_ids["aws_instance.target"]
+        doomed_id = resource_ids["aws_instance.doomed"]
+
+        original_edge = _EdgeRow(
+            source_id=source_id,
+            target_id=target_id,
+            ref_text="aws_instance.target.id",
+        )
+        db.replace_edges(repo_id, [original_edge])
+
+        with db.get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("DELETE FROM resources WHERE id = %s", (doomed_id,))
+
+        invalid_edge = _EdgeRow(
+            source_id=source_id,
+            target_id=doomed_id,
+            ref_text="aws_instance.doomed.id",
+        )
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            db.replace_edges(repo_id, [invalid_edge])
+
+        with db.get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT source_id, target_id, ref_text
+                    FROM edges
+                    WHERE repo_id = %s
+                    """,
+                    (repo_id,),
+                )
+                assert cursor.fetchall() == [
+                    (
+                        source_id,
+                        target_id,
+                        "aws_instance.target.id",
+                    )
                 ]
     finally:
         with db.get_connection() as connection:

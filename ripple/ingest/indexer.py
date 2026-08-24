@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ripple import db
-from ripple.ingest import parser, scanner
+from ripple.ingest import parser, references, scanner
 from ripple.llm.embeddings import EmbeddingProvider, OpenAIEmbeddingProvider
 
 
@@ -21,6 +21,13 @@ class ResourceRow:
     body: str
     embed_text: str
     embedding: list[float]
+
+
+@dataclass
+class EdgeRow:
+    source_id: int
+    target_id: int
+    ref_text: str
 
 
 def build_embed_text(block: parser.ParsedBlock) -> str:
@@ -87,3 +94,41 @@ def index_repo(
     db.replace_resources(repo_id, rows)
 
     return len(rows)
+
+
+def index_edges(repo_id: int) -> int:
+    """Extract and save reference edges for previously indexed resources."""
+    resource_rows = db.fetch_resource_bodies(repo_id)
+
+    address_to_id = {
+        address: resource_id
+        for resource_id, address, _body in resource_rows
+    }
+
+    seen: set[tuple[int, int]] = set()
+    edges: list[EdgeRow] = []
+
+    for source_id, _source_address, body in resource_rows:
+        for ref_text in references.extract_references(body):
+            target_address = references._resolve_reference_address(ref_text)
+            target_id = address_to_id.get(target_address)
+
+            if target_id is None or target_id == source_id:
+                continue
+
+            edge_key = (source_id, target_id)
+
+            if edge_key in seen:
+                continue
+
+            seen.add(edge_key)
+            edges.append(
+                EdgeRow(
+                    source_id=source_id,
+                    target_id=target_id,
+                    ref_text=ref_text,
+                )
+            )
+
+    db.replace_edges(repo_id, edges)
+    return len(edges)

@@ -313,7 +313,7 @@ For each block body, find outgoing references:
 ```python
 REF_RE = re.compile(
     r'\b(?:data\.)?([a-z][a-z0-9_]*)\.([a-z_][a-z0-9_-]*)'
-    r'(?:\.[a-z_][a-z0-9_\[\].*-]*)?'
+    r'(?:\.[a-z_][a-z0-9_*-]*|\[[a-z0-9_.*-]+\])*'
 )
 ```
 

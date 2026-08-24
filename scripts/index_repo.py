@@ -89,8 +89,11 @@ def main(argv: list[str] | None = None) -> None:
         str(local_path),
     )
 
+    edge_count = indexer.index_edges(repo_id)
+
     print(f"Registered repo id={repo_id} name={name} local_path={local_path}")
     print(f"Indexed {resource_count} resource blocks")
+    print(f"Extracted {edge_count} reference edges")
 
 
 if __name__ == "__main__":
