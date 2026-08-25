@@ -11,42 +11,31 @@ This cycle is also structured for **collaborative, step-by-step implementation**
 section 5 is broken into small, independently-completable steps. Decide per step
 whether you or Codex implements it.
 
-## 0a. BLOCKING DECISION — resolve before Step 1
+## 0a. Tokenizer duplication — resolved (Option B)
 
-SPEC.md 9.5's `tokenize()`, reproduced literally, has a real, testable consequence:
+**Resolved: Option B.** SPEC.md 9.5's `tokenize()` has been revised in a separate,
+explicitly-approved, spec-only commit (`02298a3`, touching only `SPEC.md`) so that a
+delimiter-free word is emitted once, not duplicated. The part-splitting step now only
+fires when the raw token actually contains `.`, `_`, or `-`:
 
-```pycon
->>> tokenize("worker")
-["worker", "worker"]
+```python
+def tokenize(text: str) -> list[str]:
+    raw = re.findall(r'[A-Za-z0-9_.\-]+', text.lower())
+    out = []
+    for tok in raw:
+        out.append(tok)
+        if any(ch in tok for ch in '._-'):
+            parts = re.split(r'[._\-]', tok)
+            out.extend(p for p in parts if len(p) > 1)
+    return out
 ```
 
-Any raw token with **no** `.`/`_`/`-` in it (a plain delimiter-free word — very common:
-`"true"`, `"worker"` as a bare word, etc.) gets counted **twice**: `re.split` on a
-string with no delimiter returns `[the_whole_string]` as its sole element, and the
-`len(p) > 1` extension then re-adds that same string on top of the raw token the loop
-already appended. Net effect: every delimiter-free word of length > 1 gets roughly 2x
-the term frequency of a genuinely multi-part identifier, in BM25's term-frequency
-component.
-
-**This plan does not choose for you. Pick one before Step 1 begins:**
-
-- **(A) Implement SPEC.md literally.** Keep the duplication, keep the characterization
-  test that pins `tokenize("worker") == ["worker", "worker"]` (section 7). No spec
-  change, no code deviation from section 9.5's literal text.
-- **(B) Revise the tokenizer's behavior** so delimiter-free words aren't duplicated
-  (e.g. `parts = [p for p in parts if len(p) > 1 and p != tok]`). This is a
-  **spec-level decision**, not something this plan or Codex applies unilaterally —
-  if you choose (B), it should happen as its own explicitly-approved, spec-only
-  change (updating SPEC.md's section 9.5 deliberately, on the record, separately from
-  this implementation cycle), not as a silent side effect of implementing Day 5.
-  **`SPEC.md` is not edited by this plan or by Step 1 regardless of which option you
-  pick** — if (B), that edit is a separate, explicit action you take (or ask for) on
-  its own.
-
-Step 1 below implements (A) as its working assumption, since that requires no prior
-decision to start from — it's the literal spec. If you choose (B), Step 1's code and
-its characterization test both need a one-line change; nothing else in this plan
-depends on which option is chosen.
+Concretely: `tokenize("worker") == ["worker"]` (not `["worker", "worker"]`), while
+`tokenize("aws_security_group.worker")` is unchanged —
+`["aws_security_group.worker", "aws", "security", "group", "worker"]`, since that
+token contains both `_` and `.` and the part-splitting condition fires. This is now
+SPEC.md's own literal text, not a plan-level deviation — Step 1 implements it
+directly, and no further decision is needed before starting.
 
 ## 1. Objective
 
@@ -79,12 +68,16 @@ commit `a53cad6`).
       out = []
       for tok in raw:
           out.append(tok)
-          parts = re.split(r'[._\-]', tok)
-          out.extend(p for p in parts if len(p) > 1)
+          if any(ch in tok for ch in '._-'):
+              parts = re.split(r'[._\-]', tok)
+              out.extend(p for p in parts if len(p) > 1)
       return out
   ```
   > So `aws_security_group.worker` yields the full string plus `aws`, `security`,
-  > `group`, `worker`. A query for either the exact address or a loose phrase now hits.
+  > `group`, `worker`. A query for either the exact address or a loose phrase now
+  > hits. A delimiter-free word like `worker` on its own is emitted once, not twice —
+  > the part-splitting step only fires when the token actually contains `.`, `_`, or
+  > `-`; splitting a token with none of those would just reproduce the token itself.
   >
   > Index over `embed_text`. Default limit 30 per rewritten query.
 - Section 8 (repository layout): `retrieval/bm25.py` — "lexical search." One file, not
@@ -140,28 +133,29 @@ Do not modify: `sql/schema.sql`, `docker-compose.yml`, `.env.example`,
 
 ### Step 1 — `tokenize()` (pure function, no DB, no dependencies)
 
-**Do not start this step until the section 0a decision is resolved.**
-
-In `ripple/retrieval/bm25.py`, option (A) (literal spec) shown — see 0a for option (B):
+In `ripple/retrieval/bm25.py`:
 
 ```python
 import re
 
 TOKEN_RE = re.compile(r'[A-Za-z0-9_.\-]+')
 SPLIT_RE = re.compile(r'[._\-]')
+DELIMITER_CHARS = '._-'
 
 
 def tokenize(text: str) -> list[str]:
-    """SPEC.md 9.5's tokenizer: emit each raw token plus its
-    underscore/period/hyphen-delimited parts (parts of length > 1 only), so
-    an exact address and a loose keyword phrase both hit the same document.
+    """SPEC.md 9.5's tokenizer: emit each raw token, plus its
+    underscore/period/hyphen-delimited parts (length > 1 only), whenever the
+    token actually contains one of those delimiters. A delimiter-free word
+    is emitted once, not duplicated (section 0a).
     """
     raw = TOKEN_RE.findall(text.lower())
     out = []
     for tok in raw:
         out.append(tok)
-        parts = SPLIT_RE.split(tok)
-        out.extend(p for p in parts if len(p) > 1)
+        if any(ch in tok for ch in DELIMITER_CHARS):
+            parts = SPLIT_RE.split(tok)
+            out.extend(p for p in parts if len(p) > 1)
     return out
 ```
 
@@ -362,8 +356,10 @@ your go-ahead before it runs.
 
 ## 6. Interfaces, data structures, and error behavior
 
-- `tokenize(text: str) -> list[str]` — pure, never raises, `""` in → `[]` out. Exact
-  behavior contingent on the section 0a decision.
+- `tokenize(text: str) -> list[str]` — pure, never raises, `""` in → `[]` out. A
+  delimiter-free word (no `.`/`_`/`-`) is emitted once; a token containing any of
+  those delimiters emits the full token plus its length>1 parts (SPEC.md 9.5, as
+  revised per section 0a).
 - `BM25Document` — mirrors `RetrievedBlock`'s fields (minus `score`), plus `tokens`
   (a `frozenset[str]`, the full tokenized form of that document's `embed_text`), which
   exists solely to support overlap-based candidate filtering at query time. Not part
@@ -400,11 +396,13 @@ your go-ahead before it runs.
   entries (the `len(p) > 1` filter naturally excludes them).
 - Non-token characters (spaces, braces, quotes, `=`) separate raw tokens —
   `tokenize('name = "worker-sg"')` produces multiple independent raw tokens.
-- **Tokenizer duplication — implement per the section 0a decision, whichever is
-  chosen.** If (A): `tokenize("worker") == ["worker", "worker"]`, with a comment
-  explaining why (SPEC.md's literal code, reproduced exactly). If (B): the analogous
-  test asserting `tokenize("worker") == ["worker"]`, since that's the whole point of
-  choosing (B).
+- **No duplication for delimiter-free words** (section 0a, resolved):
+  `tokenize("worker") == ["worker"]`, not `["worker", "worker"]`.
+- **Composite identifiers are unaffected by that fix** — restated explicitly here to
+  make the contrast clear: `tokenize("aws_security_group.worker")` still produces the
+  full worked example, `["aws_security_group.worker", "aws", "security", "group",
+  "worker"]` (already covered by the SPEC.md worked-example test above), since that
+  token contains `_` and `.` and the part-splitting condition fires normally.
 - Multiple distinct Terraform tokens in one `embed_text`-shaped string — spot-check
   that both `"aws_vpc.main"` (full address) and `"main"` (a part) appear.
 
@@ -551,14 +549,13 @@ pattern for indexing fixtures.
   long-running server — out of scope here.
 - `PineconeStore`, the `RetrievalConfig`-driven pipeline itself, the FastAPI app — all
   still not built, unchanged from prior days' non-goals.
-- **Modifying `SPEC.md`.** Any apparent issue in its text (section 0a) is flagged for
-  your decision, never edited directly by this plan or by implementing it.
+- **Modifying `SPEC.md` as a side effect of this plan.** This plan itself never edits
+  `SPEC.md`. The one exception — the tokenizer duplication behavior (section 0a) —
+  was handled correctly: a separate, explicitly-approved, spec-only commit (`02298a3`)
+  before this plan revision, not a change bundled into implementing Day 5.
 
 ## 10. Risks, ambiguities, and things flagged for your review
 
-- **Blocking, not just flagged: the tokenizer duplication decision (section 0a).**
-  Repeated here because it's the one item that must be resolved before Step 1, not
-  just noted for later.
 - **Why score-based filtering was rejected, restated for visibility:** `BM25Okapi`'s
   IDF term can go negative for common terms in small corpora, so "score > 0" is not a
   safe proxy for "this document is relevant" — it would wrongly exclude genuine
