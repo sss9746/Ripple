@@ -418,13 +418,17 @@ def tokenize(text: str) -> list[str]:
     out = []
     for tok in raw:
         out.append(tok)
-        parts = re.split(r'[._\-]', tok)
-        out.extend(p for p in parts if len(p) > 1)
+        if any(ch in tok for ch in '._-'):
+            parts = re.split(r'[._\-]', tok)
+            out.extend(p for p in parts if len(p) > 1)
     return out
 ```
 
 So `aws_security_group.worker` yields the full string plus `aws`, `security`, `group`,
-`worker`. A query for either the exact address or a loose phrase now hits.
+`worker`. A query for either the exact address or a loose phrase now hits. A
+delimiter-free word like `worker` on its own is emitted once, not twice — the
+part-splitting step only fires when the token actually contains `.`, `_`, or `-`;
+splitting a token with none of those would just reproduce the token itself.
 
 Index over `embed_text`. Default limit 30 per rewritten query.
 
