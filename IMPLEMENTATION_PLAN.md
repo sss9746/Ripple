@@ -1,581 +1,663 @@
-# Implementation Plan — Day 5: BM25 Lexical Search
+# Implementation Plan — Day 6: Fusion and Observability
 
 ## 0. Process note for this cycle
 
-Per explicit instruction: **`SPEC.md` is read-only for this cycle.** Nothing below
-proposes editing it. Where SPEC.md's text is ambiguous or has a non-obvious side
-effect, this plan flags it for review rather than silently "correcting" it in the
-plan or the code.
+Same as Day 5: **`SPEC.md` is read-only.** Nothing below proposes editing it. Where
+SPEC.md's text is silent on something this cycle needs to decide (it is, on several
+points — see section 10), this plan states the decision explicitly and flags it for
+your review rather than guessing quietly.
 
-This cycle is also structured for **collaborative, step-by-step implementation** —
-section 5 is broken into small, independently-completable steps. Decide per step
-whether you or Codex implements it.
-
-## 0a. Tokenizer duplication — resolved (Option B)
-
-**Resolved: Option B.** SPEC.md 9.5's `tokenize()` has been revised in a separate,
-explicitly-approved, spec-only commit (`02298a3`, touching only `SPEC.md`) so that a
-delimiter-free word is emitted once, not duplicated. The part-splitting step now only
-fires when the raw token actually contains `.`, `_`, or `-`:
-
-```python
-def tokenize(text: str) -> list[str]:
-    raw = re.findall(r'[A-Za-z0-9_.\-]+', text.lower())
-    out = []
-    for tok in raw:
-        out.append(tok)
-        if any(ch in tok for ch in '._-'):
-            parts = re.split(r'[._\-]', tok)
-            out.extend(p for p in parts if len(p) > 1)
-    return out
-```
-
-Concretely: `tokenize("worker") == ["worker"]` (not `["worker", "worker"]`), while
-`tokenize("aws_security_group.worker")` is unchanged —
-`["aws_security_group.worker", "aws", "security", "group", "worker"]`, since that
-token contains both `_` and `.` and the part-splitting condition fires. This is now
-SPEC.md's own literal text, not a plan-level deviation — Step 1 implements it
-directly, and no further decision is needed before starting.
+**Read section 4 before starting.** This is the first cycle since Day 3 that touches
+`scripts/ask.py`, and it's a near-total rewrite, not an addition — `ask()`'s internal
+implementation changes completely, its CLI flag changes name, and `tests/test_ask.py`
+needs an equally complete rewrite of its mocking strategy. Flagging this up front,
+not discovering it mid-implementation.
 
 ## 1. Objective
 
-Add lexical (keyword) search alongside Day 3's vector search: a Terraform-aware
-tokenizer that makes exact identifiers like `aws_security_group.worker` findable both
-as a whole and by their parts, and an in-memory `rank_bm25.BM25Okapi` index built from
-`resources.embed_text`, scoped to one repo at a time. This is a second, independent
-retrieval signal — nothing fuses it with vector search yet (that's Day 6).
+Combine Day 3's vector search and Day 5's BM25 search into one retrieval signal via
+Reciprocal Rank Fusion, orchestrate both (plus fusion) through a `RetrievalConfig`-
+driven `pipeline.py`, and log every query's stages, scores, and latencies to
+`query_logs` so any answer's provenance can be reconstructed after the fact. Wire this
+into `scripts/ask.py`, replacing its current hardcoded, vector-only flow.
 
-This is SPEC.md's Day 5 milestone, sitting on top of Day 1–4
-(`ripple/config.py`, `ripple/db.py`, `ripple/ingest/`, `ripple/llm/`,
-`ripple/retrieval/vector_store.py` + `pgvector_store.py`, `scripts/index_repo.py`,
-`scripts/ask.py`), all already implemented and verified (63 passing tests as of Day 4,
-commit `a53cad6`).
+This is SPEC.md's Day 6 milestone, sitting on top of Day 1–5 (`ripple/config.py`,
+`ripple/db.py`, `ripple/ingest/`, `ripple/llm/`, `ripple/retrieval/vector_store.py` +
+`pgvector_store.py` + `bm25.py`, `ripple/retrieval/graph.py`, `scripts/index_repo.py`,
+`scripts/ask.py`), all already implemented and verified (84 passing tests as of Day 5).
 
 ## 2. Relevant SPEC.md requirements
 
-- Section 11, Day 5: "`bm25.py` with the tokenizer from section 9.5. Corpus built from
-  `embed_text` at startup. **Done when:** querying an exact address like
-  `aws_nat_gateway.this` returns that block at rank 1."
-- Section 9.5 (BM25), quoted verbatim:
-  > `rank_bm25.BM25Okapi` over an in-memory corpus, rebuilt at process start.
-  >
-  > **Tokenization is the whole game here.** The default whitespace split makes
-  > `aws_security_group.worker` a single unmatched token. Instead, emit both the full
-  > token and its parts:
+- Section 11, Day 6: "`fusion.py` per section 9.6. `pipeline.py` reading
+  `RetrievalConfig`, running vector and BM25, fusing. Write `query_logs` rows with
+  per-stage candidates, scores, and latencies. **Done when:** you can query the log
+  table and reconstruct exactly why any block was returned."
+- Section 9.6 (Reciprocal rank fusion), quoted verbatim:
   ```python
-  def tokenize(text: str) -> list[str]:
-      raw = re.findall(r'[A-Za-z0-9_.\-]+', text.lower())
-      out = []
-      for tok in raw:
-          out.append(tok)
-          if any(ch in tok for ch in '._-'):
-              parts = re.split(r'[._\-]', tok)
-              out.extend(p for p in parts if len(p) > 1)
-      return out
+  def rrf(ranked_lists: list[list[int]], k: int = 60) -> dict[int, float]:
+      scores = defaultdict(float)
+      for lst in ranked_lists:
+          for rank, doc_id in enumerate(lst, start=1):
+              scores[doc_id] += 1.0 / (k + rank)
+      return scores
   ```
-  > So `aws_security_group.worker` yields the full string plus `aws`, `security`,
-  > `group`, `worker`. A query for either the exact address or a loose phrase now
-  > hits. A delimiter-free word like `worker` on its own is emitted once, not twice —
-  > the part-splitting step only fires when the token actually contains `.`, `_`, or
-  > `-`; splitting a token with none of those would just reproduce the token itself.
+  > `k` is configurable and defaults to 60. Every rewritten query's vector list and
+  > BM25 list is a separate input list. Sort descending, take the top 50 into
+  > reranking.
   >
-  > Index over `embed_text`. Default limit 30 per rewritten query.
-- Section 8 (repository layout): `retrieval/bm25.py` — "lexical search." One file, not
-  split across modules.
-- Section 9.11 (`RetrievalConfig`, already implemented): `use_bm25: bool = True`,
-  `bm25_k: int = 30`. **Not wired to anything yet** — no code currently reads
-  `RetrievalConfig`. Unchanged this cycle (section 9).
-- Section 5 (Corpus): `examples/complete` (used for every prior day's manual check) is
-  the flat, concrete-reference root. The module root is a harder, more heavily
-  parameterized corpus meant to be added later — relevant to section 8's acceptance
-  criteria below.
+  > RRF is used rather than a weighted score sum because cosine similarity and BM25
+  > scores are on incomparable scales — normalizing them requires a tuning parameter
+  > that RRF avoids. Be able to say this out loud.
+  - **This cycle has no query rewriting (Day 15) and no reranking (Day 12).** So:
+    exactly one vector list and one BM25 list are fused (not N pairs — see section
+    10), and "take the top 50 into reranking" doesn't apply yet — this cycle
+    truncates the fused list directly to `RetrievalConfig.final_k` (8 by default).
+    Both simplifications are explicit scope decisions, not oversights (section 9).
+- Section 9.11 (`RetrievalConfig`, already implemented, unchanged): `pipeline.py`
+  reads it and skips stages accordingly. **"When `use_rrf` is false but both
+  retrievers are on, concatenate and deduplicate by best rank instead of fusing."**
+  This is the one other piece of fusion logic SPEC.md specifies, alongside `rrf()`
+  itself — `fusion.py` needs both.
+- Section 7 (schema, already exists, unused until now):
+  ```sql
+  CREATE TABLE query_logs (
+      id             SERIAL PRIMARY KEY,
+      repo_id        INTEGER REFERENCES repos(id) ON DELETE CASCADE,
+      question       TEXT NOT NULL,
+      config_json    JSONB NOT NULL,
+      stages_json    JSONB NOT NULL,
+      latency_json   JSONB NOT NULL,
+      answer         TEXT,
+      created_at     TIMESTAMPTZ DEFAULT now()
+  );
+  ```
+  `repo_id` and `answer` are nullable in the schema; this plan always sets `repo_id`
+  (every query is against a specific repo) but `answer` can legitimately be `NULL`
+  (no candidates found, so nothing was ever generated).
+- Section 10.2 (latency fields, for naming consistency): "rewrite, vector_query,
+  hydrate, bm25, fusion, rerank, graph, total." This cycle populates `vector_query`,
+  `bm25`, `fusion`, and `total` only — the rest don't exist yet (see section 9).
+  `hydrate` is Pinecone-only and N/A regardless (this project uses `PgVectorStore`).
 
 ## 3. Current implementation gaps
 
-- `ripple/retrieval/bm25.py` does not exist.
-- `ripple/db.py` has no read function returning `embed_text` alongside the other
-  fields needed for a `RetrievedBlock` — `fetch_resource_bodies` (Day 4) only returns
-  `(id, address, body)`.
-- **Dependency check (resolved, not left open):** `rank_bm25` is already listed in
-  `requirements.txt` (Day 1, unused until now) and already installed in this
-  environment (`rank-bm25==0.2.2`, confirmed via `pip show rank_bm25`; import verified
-  directly: `from rank_bm25 import BM25Okapi` succeeds). **No `requirements.txt`
-  change needed or proposed.**
-- **Already-indexed data available for the manual acceptance check (confirmed by
-  direct query, not assumed):** `repos.id = 13` (`name = "vpc-complete"`,
-  `local_path = .../examples/complete`) already has 114 resources, all with non-`NULL`
-  embeddings, including `aws_security_group.rds` (`resources.id = 328`). This means
-  section 8's acceptance check needs **no new indexing and no OpenAI cost** — see
-  section 8.
+- `ripple/retrieval/fusion.py` does not exist.
+- `ripple/retrieval/pipeline.py` does not exist. Nothing currently reads
+  `RetrievalConfig` at all — Day 1 built the dataclass, nothing has consulted it since.
+- `ripple/db.py` has no `query_logs` write function.
+- `query_logs` has never been written to (table exists since Day 1's schema, zero rows
+  ever inserted).
+- `scripts/ask.py` hardcodes a single-stage, vector-only flow
+  (`OpenAIEmbeddingProvider` → `PgVectorStore.query` → `answer_question`, `--top-k`
+  flag) with no config, no BM25, no fusion, no logging. This is intentional Day 3/5
+  scope, not a bug — but it's what this cycle replaces.
 
 ## 4. Exact files Codex (or you) should create or modify
 
 Create:
-- `ripple/retrieval/bm25.py`
-- `tests/test_bm25.py`
+- `ripple/retrieval/fusion.py`
+- `ripple/retrieval/pipeline.py`
+- `tests/test_fusion.py`
+- `tests/test_pipeline.py`
 
 Modify:
-- `ripple/db.py` — add one new read function, `fetch_bm25_documents(repo_id)`.
+- `ripple/db.py` — add `insert_query_log(...)`.
+- `scripts/ask.py` — **rewrite**, not extend: `ask()`'s body changes completely (calls
+  `pipeline.run_pipeline` instead of directly constructing an embedder/store),
+  `--top-k` is replaced by `--final-k` (see 5, Step 4).
+- `tests/test_ask.py` — **rewrite**, not extend: every existing test monkeypatches
+  `ask_module.OpenAIEmbeddingProvider`/`ask_module.PgVectorStore` directly, neither of
+  which `ask.py` imports anymore. All of them need to change to monkeypatch
+  `ask_module.pipeline`/`ask_module.db`/`ask_module.answer_question` instead (see 7).
 
-Do not modify: `sql/schema.sql`, `docker-compose.yml`, `.env.example`,
-`requirements.txt`, `ripple/config.py`, `ripple/ingest/*`, `ripple/llm/*`,
+Do not modify: `sql/schema.sql` (schema already correct, unused until now),
+`docker-compose.yml`, `.env.example`, `requirements.txt`, `ripple/config.py`
+(`RetrievalConfig` is already complete and correct), `ripple/ingest/*`,
+`ripple/llm/embeddings.py`, `ripple/llm/prompts.py`, `ripple/llm/generate.py`,
 `ripple/retrieval/vector_store.py`, `ripple/retrieval/pgvector_store.py`,
-`ripple/retrieval/graph.py`, `scripts/index_repo.py`, `scripts/ask.py`, `SPEC.md`,
-`AGENTS.md`, `CLAUDE.md`, `README.md`, and every existing test file (`test_config.py`,
-`test_db.py` — aside from confirming it still passes unmodified —, `test_scanner.py`,
-`test_parser.py`, `test_references.py`, `test_indexer.py`, `test_graph.py`,
-`test_embeddings.py`, `test_generate.py`, `test_prompts.py`, `test_pgvector_store.py`,
-`test_index_repo.py`, `test_ask.py`).
+`ripple/retrieval/bm25.py`, `ripple/retrieval/graph.py`, `scripts/index_repo.py`,
+`SPEC.md`, `AGENTS.md`, `CLAUDE.md`, `README.md`, and every other existing test file
+(`test_config.py`, `test_db.py` — aside from confirming it still passes, plus its own
+addition —, `test_scanner.py`, `test_parser.py`, `test_references.py`,
+`test_indexer.py`, `test_graph.py`, `test_embeddings.py`, `test_generate.py`,
+`test_prompts.py`, `test_pgvector_store.py`, `test_index_repo.py`, `test_bm25.py`).
 
-**`scripts/ask.py` is deliberately not touched this cycle** — see section 9.
+## 5. Step-by-step implementation order
 
-## 5. Step-by-step implementation order (collaborative — assign each step as you go)
-
-### Step 1 — `tokenize()` (pure function, no DB, no dependencies)
-
-In `ripple/retrieval/bm25.py`:
+### Step 1 — `ripple/retrieval/fusion.py`
 
 ```python
-import re
+import dataclasses
+from collections import defaultdict
 
-TOKEN_RE = re.compile(r'[A-Za-z0-9_.\-]+')
-SPLIT_RE = re.compile(r'[._\-]')
-DELIMITER_CHARS = '._-'
+from ripple.retrieval.vector_store import RetrievedBlock
 
 
-def tokenize(text: str) -> list[str]:
-    """SPEC.md 9.5's tokenizer: emit each raw token, plus its
-    underscore/period/hyphen-delimited parts (length > 1 only), whenever the
-    token actually contains one of those delimiters. A delimiter-free word
-    is emitted once, not duplicated (section 0a).
+def rrf(ranked_lists: list[list[int]], k: int = 60) -> dict[int, float]:
+    """SPEC.md 9.6, verbatim."""
+    scores: dict[int, float] = defaultdict(float)
+    for lst in ranked_lists:
+        for rank, doc_id in enumerate(lst, start=1):
+            scores[doc_id] += 1.0 / (k + rank)
+    return scores
+
+
+def fuse(ranked_lists: list[list[RetrievedBlock]], k: int = 60) -> list[RetrievedBlock]:
+    """RRF over ranked RetrievedBlock lists, returning one list sorted by
+    fused score descending. Each returned block's .score is overwritten with
+    its fused RRF score — the original cosine/BM25 score is no longer
+    meaningful once blocks from both signals are being compared directly.
     """
-    raw = TOKEN_RE.findall(text.lower())
-    out = []
-    for tok in raw:
-        out.append(tok)
-        if any(ch in tok for ch in DELIMITER_CHARS):
-            parts = SPLIT_RE.split(tok)
-            out.extend(p for p in parts if len(p) > 1)
-    return out
+    id_lists = [[block.id for block in lst] for lst in ranked_lists]
+    scores = rrf(id_lists, k=k)
+
+    best_block: dict[int, RetrievedBlock] = {}
+    for lst in ranked_lists:
+        for block in lst:
+            best_block.setdefault(block.id, block)
+
+    ranked_ids = sorted(
+        scores,
+        key=lambda doc_id: (-scores[doc_id], best_block[doc_id].address),
+    )
+
+    return [
+        dataclasses.replace(best_block[doc_id], score=scores[doc_id])
+        for doc_id in ranked_ids
+    ]
+
+
+def concat_dedup(ranked_lists: list[list[RetrievedBlock]]) -> list[RetrievedBlock]:
+    """SPEC.md 9.11's use_rrf=False fallback: concatenate and deduplicate by
+    best rank. A block appearing in multiple lists keeps its best (lowest)
+    rank and that occurrence's own (unmodified) score — there is no fused
+    score when RRF isn't used.
+    """
+    best_rank: dict[int, int] = {}
+    best_block: dict[int, RetrievedBlock] = {}
+
+    for lst in ranked_lists:
+        for rank, block in enumerate(lst, start=1):
+            if block.id not in best_rank or rank < best_rank[block.id]:
+                best_rank[block.id] = rank
+                best_block[block.id] = block
+
+    ranked_ids = sorted(
+        best_rank,
+        key=lambda doc_id: (best_rank[doc_id], best_block[doc_id].address),
+    )
+    return [best_block[doc_id] for doc_id in ranked_ids]
 ```
 
-(Compiled patterns instead of inline `re.findall`/`re.split` calls — same behavior,
-avoids recompiling on every call, harmless deviation in form only.)
+`rrf()` is reproduced exactly as SPEC.md gives it — plain `dict[int, float]` in, no
+`RetrievedBlock` awareness, no sorting (the docstring says "sort descending" is the
+caller's job, and `fuse()` is that caller). `fuse()`/`concat_dedup()` both tie-break by
+`address` for determinism, matching every prior day's convention (Day 4's `graph.py`,
+Day 5's `bm25.py`).
 
-**Read this before writing it:** casing is normalized once, via `.lower()`, applied to
-the *whole* input text before tokenizing. **`tokenize()` must be applied to the query
-string too, not just corpus documents** — if a caller tokenizes the corpus but
-naively `.split()`s the query, matches will silently be missed. Not stated explicitly
-in SPEC.md's snippet; necessary for the tokenizer to do its job at query time too (see
-Step 4).
-
-### Step 2 — `db.fetch_bm25_documents(repo_id)`
-
-In `ripple/db.py`, alongside `fetch_resource_bodies`:
+### Step 2 — `db.insert_query_log(...)`
 
 ```python
-def fetch_bm25_documents(
+from psycopg.types.json import Jsonb
+
+def insert_query_log(
     repo_id: int,
-) -> list[tuple[int, str, str, int, int, str, str]]:
-    """Return (id, address, file_path, start_line, end_line, body, embed_text)
-    for every resource in repo_id.
-    """
+    question: str,
+    config_json: dict,
+    stages_json: dict,
+    latency_json: dict,
+    answer: str | None,
+) -> int:
     with get_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, address, file_path, start_line, end_line, body, embed_text
-                FROM resources
-                WHERE repo_id = %s
-                ORDER BY id
+                INSERT INTO query_logs
+                    (repo_id, question, config_json, stages_json, latency_json, answer)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id
                 """,
-                (repo_id,),
+                (
+                    repo_id,
+                    question,
+                    Jsonb(config_json),
+                    Jsonb(stages_json),
+                    Jsonb(latency_json),
+                    answer,
+                ),
             )
-            return cursor.fetchall()
+            return cursor.fetchone()[0]
 ```
 
-`ORDER BY id` is added purely for hygiene/determinism (matching Day 4's
-`ORDER BY r.address` lesson in `graph.py`) — mechanical, pattern-matches
-`fetch_resource_bodies` exactly.
+**This is the same lesson as Day 3's `pgvector.Vector` wrapping, applied to JSONB
+instead of `vector`.** A bare Python `dict` does not automatically encode as `jsonb`
+when bound as a query parameter — wrap every JSON-column value with
+`psycopg.types.json.Jsonb(...)` explicitly, the same way `pgvector.Vector(...)`
+wraps embeddings. `config_json`/`stages_json`/`latency_json` are plain, already-JSON-
+safe `dict`s built by `pipeline.py` (see Step 3) — `db.py` stays decoupled from
+`ripple.retrieval`'s types, consistent with `ResourceRowLike`/`EdgeRowLike`'s existing
+Protocol-based decoupling. Reading `jsonb` columns back (section 7's test, and the
+manual acceptance check) does **not** need any special unwrapping — `psycopg` decodes
+`jsonb` into native Python `dict`/`list` automatically; only the write direction needs
+the explicit wrapper. Verify this by testing the actual round trip (Step 5), not by
+assuming it from this description alone — same caution Day 3's `Vector` bug taught.
 
-### Step 3 — `BM25Document`, `BM25Index`, and `build_index(repo_id)`
-
-Still in `ripple/retrieval/bm25.py`:
+### Step 3 — `ripple/retrieval/pipeline.py`
 
 ```python
+import time
 from dataclasses import dataclass
 
-from rank_bm25 import BM25Okapi
-
-from ripple import db
+from ripple.config import RetrievalConfig
+from ripple.llm.embeddings import EmbeddingProvider, OpenAIEmbeddingProvider
+from ripple.retrieval import fusion
+from ripple.retrieval.bm25 import build_index
+from ripple.retrieval.pgvector_store import PgVectorStore
 from ripple.retrieval.vector_store import RetrievedBlock
 
 
 @dataclass
-class BM25Document:
-    id: int
-    address: str
-    file_path: str
-    start_line: int
-    end_line: int
-    body: str
-    tokens: frozenset[str]
-```
-
-`tokens` is new relative to `RetrievedBlock`'s shape — it exists specifically to
-support Step 4's overlap-based filtering (see section 6/10 for why score alone can't
-be used for this). It's the `frozenset` of every token `embed_text` produced, computed
-once at build time so query time never re-tokenizes documents.
-
-```python
-class BM25Index:
-    """An in-memory BM25 index over one repo's resources, built from
-    embed_text. Rebuilt fresh on every build_index() call — there is no
-    cross-call caching yet (see section 9 for why that's fine for now).
-    """
-
-    def __init__(self, documents: list[BM25Document], model: BM25Okapi | None):
-        self._documents = documents
-        self._model = model
-
-    # query() defined in Step 4
+class PipelineResult:
+    blocks: list[RetrievedBlock]
+    stages_json: dict[str, list[dict]]
+    latency_json: dict[str, float]
 
 
-def build_index(repo_id: int) -> BM25Index:
-    rows = db.fetch_bm25_documents(repo_id)
-
-    if not rows:
-        return BM25Index(documents=[], model=None)
-
-    tokenized_corpus = [tokenize(row[6]) for row in rows]  # row[6] = embed_text
-
-    documents = [
-        BM25Document(
-            id=row[0],
-            address=row[1],
-            file_path=row[2],
-            start_line=row[3],
-            end_line=row[4],
-            body=row[5],
-            tokens=frozenset(tokenized_corpus[i]),
-        )
-        for i, row in enumerate(rows)
+def _serialize(blocks: list[RetrievedBlock]) -> list[dict]:
+    return [
+        {"id": block.id, "address": block.address, "score": block.score}
+        for block in blocks
     ]
 
-    model = BM25Okapi(tokenized_corpus)
-    return BM25Index(documents, model)
+
+def run_pipeline(
+    repo_id: int,
+    question: str,
+    config: RetrievalConfig,
+    embedder: EmbeddingProvider | None = None,
+) -> PipelineResult:
+    total_start = time.perf_counter()
+    stages_json: dict[str, list[dict]] = {}
+    latency_json: dict[str, float] = {}
+
+    vector_results: list[RetrievedBlock] = []
+    bm25_results: list[RetrievedBlock] = []
+
+    if config.use_vector:
+        start = time.perf_counter()
+        embedder = embedder or OpenAIEmbeddingProvider()
+        [question_embedding] = embedder.embed([question])
+        vector_results = PgVectorStore().query(
+            repo_id, question_embedding, config.vector_k
+        )
+        latency_json["vector_query_ms"] = (time.perf_counter() - start) * 1000
+        stages_json["vector"] = _serialize(vector_results)
+
+    if config.use_bm25:
+        start = time.perf_counter()
+        bm25_results = build_index(repo_id).query(question, config.bm25_k)
+        latency_json["bm25_ms"] = (time.perf_counter() - start) * 1000
+        stages_json["bm25"] = _serialize(bm25_results)
+
+    if config.use_vector and config.use_bm25:
+        start = time.perf_counter()
+        if config.use_rrf:
+            candidates = fusion.fuse([vector_results, bm25_results], k=config.rrf_k)
+        else:
+            candidates = fusion.concat_dedup([vector_results, bm25_results])
+        latency_json["fusion_ms"] = (time.perf_counter() - start) * 1000
+        stages_json["fusion"] = _serialize(candidates)
+    elif config.use_vector:
+        candidates = vector_results
+    elif config.use_bm25:
+        candidates = bm25_results
+    else:
+        candidates = []
+
+    blocks = candidates[: config.final_k]
+    latency_json["total_ms"] = (time.perf_counter() - total_start) * 1000
+
+    return PipelineResult(
+        blocks=blocks, stages_json=stages_json, latency_json=latency_json
+    )
 ```
 
-**The empty-corpus short-circuit is deliberate, not incidental.** `BM25Okapi([])`'s
-behavior on an empty corpus is a `rank_bm25` implementation detail this plan doesn't
-want to depend on (see section 10) — `build_index` never constructs a `BM25Okapi` at
-all when there are zero rows.
+Key design points:
+- **`embedder` is constructed only when `config.use_vector` is `True`** — same "don't
+  require an API key for a path that doesn't need one" discipline as Day 3's
+  empty-repository fix. `use_vector=False, use_bm25=True` must work with
+  `OPENAI_API_KEY` unset.
+- **`latency_json` only gets keys for stages that actually ran.** No `"fusion_ms"`
+  unless both retrievers ran; no `"vector_query_ms"` if `use_vector=False`. This
+  matters for Day 6's own "Done when": if a stage didn't run, the log shouldn't imply
+  it did by having a `0.0` entry for it — see section 10.
+- **Exactly two ranked lists are ever fused this cycle** (one vector, one BM25) — not
+  N pairs per rewritten query, since there's no query rewriting yet (Day 15).
+  `fusion.fuse`/`concat_dedup` both already accept an arbitrary-length list of ranked
+  lists, so Day 15 extending this to N query variants' worth of vector+BM25 lists is
+  an additive change to `pipeline.py`'s call site, not an interface change to
+  `fusion.py`.
+- **`use_rerank`, `use_graph`, `use_rewrite` (and `rerank_top_n`, `graph_seed_n`,
+  `graph_max_added`) are not read at all this cycle.** Their stages don't exist yet
+  (Days 12/8+13/15). Setting them to anything has no effect on current behavior — see
+  section 9.
+- **Truncation to `final_k` happens directly on the fused/single-stage list.**
+  SPEC.md's "take the top 50 into reranking" describes the *eventual* full pipeline
+  (Day 12 onward); without a reranker, there's nothing between fusion and the final
+  answer, so truncating straight to `final_k` (8, not 50) is correct for this cycle.
 
-### Step 4 — `BM25Index.query()`
+### Step 4 — Rewrite `scripts/ask.py`
 
 ```python
-    def query(self, question: str, k: int) -> list[RetrievedBlock]:
-        if self._model is None or k <= 0:
-            return []
+import argparse
+import dataclasses
+import sys
+from pathlib import Path
 
-        query_tokens = tokenize(question)
-        query_token_set = set(query_tokens)
-        if not query_token_set:
-            return []
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-        candidate_indexes = [
-            i
-            for i, document in enumerate(self._documents)
-            if document.tokens & query_token_set
-        ]
-        if not candidate_indexes:
-            return []
+from ripple import db
+from ripple.config import RetrievalConfig
+from ripple.llm.generate import answer_question
+from ripple.retrieval import pipeline
 
-        scores = self._model.get_scores(query_tokens)
+NO_RESULTS_MESSAGE = (
+    "No indexed resources found for this repo — nothing to answer from."
+)
 
-        ranked_indexes = sorted(
-            candidate_indexes,
-            key=lambda i: (-scores[i], self._documents[i].address),
-        )
 
-        return [
-            RetrievedBlock(
-                id=self._documents[i].id,
-                address=self._documents[i].address,
-                file_path=self._documents[i].file_path,
-                start_line=self._documents[i].start_line,
-                end_line=self._documents[i].end_line,
-                body=self._documents[i].body,
-                score=float(scores[i]),
-            )
-            for i in ranked_indexes[:k]
-        ]
+def ask(repo_id: int, question: str, config: RetrievalConfig | None = None) -> str:
+    config = config or RetrievalConfig()
+
+    result = pipeline.run_pipeline(repo_id, question, config)
+
+    answer = answer_question(question, result.blocks) if result.blocks else None
+
+    db.insert_query_log(
+        repo_id=repo_id,
+        question=question,
+        config_json=dataclasses.asdict(config),
+        stages_json=result.stages_json,
+        latency_json=result.latency_json,
+        answer=answer,
+    )
+
+    return answer if answer is not None else NO_RESULTS_MESSAGE
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Ask a question about an indexed Terraform repo"
+    )
+    parser.add_argument("repo_id", type=int, help="repos.id of the indexed repo to query")
+    parser.add_argument("question", help="Natural-language question")
+    parser.add_argument(
+        "--final-k",
+        type=int,
+        default=None,
+        help="Override RetrievalConfig.final_k (default: RetrievalConfig()'s own default, 8)",
+    )
+    args = parser.parse_args(argv)
+
+    config = (
+        RetrievalConfig(final_k=args.final_k)
+        if args.final_k is not None
+        else RetrievalConfig()
+    )
+
+    print(ask(args.repo_id, args.question, config))
+
+
+if __name__ == "__main__":
+    main()
 ```
 
-**Why this shape, explained (this replaces an earlier, unsafe draft that scored and
-returned every document regardless of relevance):**
+**`--top-k` is renamed to `--final-k`, and `DEFAULT_TOP_K` is removed entirely** —
+`RetrievalConfig()` already carries its own default (`final_k=8`), so there's no
+reason for `ask.py` to maintain a second, parallel default. This is a deliberate,
+visible CLI change, not a silent one — call it out if you're used to the old flag
+name.
 
-- **`k <= 0` is checked up front, alongside `self._model is None`** — both are "there
-  is nothing to return" conditions, handled identically.
-- **An empty query-token set short-circuits to `[]`.** `tokenize("???")` is `[]`;
-  there is no lexical evidence to rank anything by, so nothing is returned. Returning
-  an arbitrary alphabetically-first slice of the corpus here (what an earlier draft of
-  this plan effectively did, by always ranking every document) would hand Day 6's RRF
-  fusion candidates with zero actual relevance, silently polluting the fused result.
-- **Candidates are selected by token *overlap* (`document.tokens & query_token_set`),
-  not by score sign.** This is the important one: `BM25Okapi`'s IDF term,
-  `log((N - n + 0.5) / (n + 0.5))`, goes **negative** whenever a term appears in more
-  than half the documents in the corpus — completely realistic in small corpora
-  (SPEC.md's own benchmark is 40 questions over a few hundred blocks; test fixtures
-  are smaller still). A document that **genuinely shares a query term** can therefore
-  receive a **negative or zero overall score**, while a document with **zero shared
-  terms** always scores exactly `0.0`. Filtering by `score > 0` would incorrectly
-  *exclude* real matches in exactly the corpora this project uses, while filtering by
-  nothing (the earlier draft) would incorrectly *include* complete non-matches.
-  Token-set overlap is the one criterion that correctly separates "has lexical
-  evidence" from "has none," independent of how the IDF math happens to net out.
-  Section 7 includes a constructed test proving a real, overlapping match can still
-  carry a non-positive score and must still be returned.
+**Every call to `ask()` logs, including zero-result queries** (`answer=None` in that
+case) — this is what makes Day 6's "Done when" possible at all: even a query that
+found nothing is diagnostic information (which stages ran, what `k` they used, that
+none of them produced candidates), and section 8's acceptance check depends on the
+log being unconditional, not just written on success.
 
-`BM25Index` deliberately does **not** implement the `VectorStore` Protocol
-(`upsert`/`delete_namespace`) — it has no persistent storage; it's rebuilt from the
-database every time `build_index()` is called. Reusing `RetrievedBlock` as the return
-type is intentional forward-compatibility with Day 6's fusion, which will want both
-vector and BM25 results in the same shape.
+### Step 5 — Tests
 
-### Step 5 — Tests (`tests/test_bm25.py`)
+See section 7 for the full list. Suggested order: `fusion.py`'s pure functions first
+(no DB, no mocking), then `pipeline.py` with `PgVectorStore`/`build_index` mocked at
+the module level (not hitting real vector/BM25 search — see section 7 for why), then
+`db.insert_query_log`'s round trip, then `ask.py`'s full rewrite.
 
-See section 7 for the full required list.
+### Step 6 — Manual acceptance check
 
-### Step 6 — Manual acceptance check (no new indexing, no OpenAI cost)
-
-See section 8 — this now runs entirely against already-indexed data (`repo_id = 13`).
-An *optional*, separate, explicitly-approved secondary check against the module root
-also exists in section 8, clearly marked as costing real OpenAI usage and requiring
-your go-ahead before it runs.
+See section 8. The retrieval-only part costs one small, unavoidable embedding call
+(embedding the question itself — trivial next to Day 3/5's indexing-cost concerns);
+the full `ask()` call additionally costs one generation call and is called out
+separately.
 
 ## 6. Interfaces, data structures, and error behavior
 
-- `tokenize(text: str) -> list[str]` — pure, never raises, `""` in → `[]` out. A
-  delimiter-free word (no `.`/`_`/`-`) is emitted once; a token containing any of
-  those delimiters emits the full token plus its length>1 parts (SPEC.md 9.5, as
-  revised per section 0a).
-- `BM25Document` — mirrors `RetrievedBlock`'s fields (minus `score`), plus `tokens`
-  (a `frozenset[str]`, the full tokenized form of that document's `embed_text`), which
-  exists solely to support overlap-based candidate filtering at query time. Not part
-  of `RetrievedBlock`'s own shape.
-- `build_index(repo_id: int) -> BM25Index` — never raises for a repo with zero
-  resources; returns a `BM25Index` whose `query()` always returns `[]`. Raises
-  whatever `db.fetch_bm25_documents`/`rank_bm25.BM25Okapi` raise, uncaught, for any
-  other failure.
-- `BM25Index.query(question: str, k: int) -> list[RetrievedBlock]`:
-  - Returns `[]` if the index has no documents, or `k <= 0`.
-  - Returns `[]` if `question` tokenizes to no tokens (e.g. pure punctuation).
-  - Returns `[]` if `question`'s tokens share **no** overlap with **any** indexed
-    document's tokens — this is a real "no evidence" result, not an error.
-  - Otherwise, returns up to `k` results, ranked by `(-score, address)`, restricted to
-    documents with at least one overlapping token with the query. A returned
-    document's `score` **may be zero or negative** — a low/negative score is not a
-    reason for exclusion once a document has qualified via token overlap; only the
-    overlap test decides inclusion.
-- `db.fetch_bm25_documents(repo_id) -> list[tuple[int, str, str, int, int, str, str]]`
-  — `(id, address, file_path, start_line, end_line, body, embed_text)`, ordered by
-  `id`. Empty list for a repo with no resources; never raises for an unknown `repo_id`.
+- `fusion.rrf(ranked_lists, k=60) -> dict[int, float]` — pure, SPEC.md 9.6 verbatim.
+  Never raises; an empty `ranked_lists` (or all-empty inner lists) returns `{}`.
+- `fusion.fuse(ranked_lists, k=60) -> list[RetrievedBlock]` — every returned block's
+  `.score` is its fused RRF score, not its original cosine/BM25 score. Sorted
+  descending by score, tie-broken by address. `[]` in, `[]` out for empty input lists.
+- `fusion.concat_dedup(ranked_lists) -> list[RetrievedBlock]` — every returned block
+  keeps its *original* score from whichever list gave it the best (lowest-numbered)
+  rank; there is no fused score to assign when RRF isn't used. Sorted by best rank
+  ascending, tie-broken by address.
+- `pipeline.run_pipeline(repo_id, question, config, embedder=None) -> PipelineResult`
+  — never raises for a config where `use_vector` and `use_bm25` are both `False`
+  (returns an empty `PipelineResult`, no stages run, no error); never constructs an
+  `EmbeddingProvider` unless `use_vector` is `True`. Propagates whatever
+  `PgVectorStore.query`/`build_index`/the embedder raise, uncaught, for any real
+  failure — same "let real failures propagate" posture as every prior day.
+- `db.insert_query_log(...)` — always inserts a row and returns its `id`; `answer` may
+  be `None`. Raises whatever `psycopg` raises for a genuinely invalid `repo_id`
+  (foreign key violation) — not expected in normal use, since `ask()` always operates
+  on a `repo_id` it was given by the caller.
+- `scripts/ask.py`'s `ask(repo_id, question, config=None)` — always writes exactly one
+  `query_logs` row per call, regardless of whether any candidates were found. Returns
+  `NO_RESULTS_MESSAGE` (not an exception) when `result.blocks` is empty.
 
 ## 7. Required tests
 
-`tests/test_bm25.py`, tokenizer section (pure, no DB, instant):
-- `tokenize("aws_security_group.worker")` — the exact worked example from SPEC.md
-  9.5: `== ["aws_security_group.worker", "aws", "security", "group", "worker"]`.
-- Casing: `tokenize("AWS_Security_Group.Worker")` produces the identical output to the
-  lowercase version above.
-- Hyphens: `t3-micro` splits into `t3-micro`, `t3` (len 2, kept), `micro`.
-- Short parts filtered: `a.b` (both parts length 1) contributes only the raw token
-  `a.b` itself.
-- Consecutive delimiters: `aws..vpc` → `["aws..vpc", "aws", "vpc"]`, no empty-string
-  entries (the `len(p) > 1` filter naturally excludes them).
-- Non-token characters (spaces, braces, quotes, `=`) separate raw tokens —
-  `tokenize('name = "worker-sg"')` produces multiple independent raw tokens.
-- **No duplication for delimiter-free words** (section 0a, resolved):
-  `tokenize("worker") == ["worker"]`, not `["worker", "worker"]`.
-- **Composite identifiers are unaffected by that fix** — restated explicitly here to
-  make the contrast clear: `tokenize("aws_security_group.worker")` still produces the
-  full worked example, `["aws_security_group.worker", "aws", "security", "group",
-  "worker"]` (already covered by the SPEC.md worked-example test above), since that
-  token contains `_` and `.` and the part-splitting condition fires normally.
-- Multiple distinct Terraform tokens in one `embed_text`-shaped string — spot-check
-  that both `"aws_vpc.main"` (full address) and `"main"` (a part) appear.
+`tests/test_fusion.py` (pure, no DB, no mocking):
+- `rrf()`: a small, hand-computed example — e.g. `rrf([[1, 2, 3], [2, 1, 4]], k=60)` —
+  verify every score against the formula by hand (doc `2` appears in both lists at
+  ranks 2 and 1, so its score is `1/(60+2) + 1/(60+1)`, etc.).
+- `rrf([], k=60) == {}`; `rrf([[], []], k=60) == {}`.
+- `fuse()`: two small `RetrievedBlock` lists (constructed by hand, distinct `id`s and
+  addresses) — assert the fused order matches RRF's formula, and that every returned
+  block's `.score` equals its computed RRF score (not its original score).
+- `fuse()` tie-break: two blocks landing at identical fused scores (construct this
+  deliberately — e.g. two single-element lists, each containing a different block at
+  rank 1, with the same `k`) sort by address.
+- `concat_dedup()`: a block appearing in both lists at different ranks (e.g. rank 3 in
+  list A, rank 1 in list B) ends up positioned by its *best* rank (1), and its
+  `.score` is the score it had in list B specifically (the list that gave it that
+  best rank), not list A's.
+- `concat_dedup()` with a block appearing in only one list: keeps that list's rank and
+  score unchanged.
+- `concat_dedup()` never overwrites `.score` — a direct contrast test against `fuse()`
+  using the identical input lists, asserting the two functions produce different
+  `.score` values for the same block.
 
-`tests/test_bm25.py`, `BM25Index` section (DB-dependent, skip-if-unreachable — same
-convention as every prior day; reuse `tests/fixtures/reference_repo/` and
-`tests/fixtures/sample_repo/` via `indexer.index_repo(..., embedder=
-_FakeEmbeddingProvider())`, no new fixture needed):
+`tests/test_pipeline.py` — **mock `PgVectorStore` and `build_index` at the module
+level** (`monkeypatch.setattr(pipeline, "PgVectorStore", ...)` /
+`monkeypatch.setattr(pipeline, "build_index", ...)`), feeding canned
+`RetrievedBlock` lists, rather than hitting a real database with real search. This is
+deliberate: `pipeline.py`'s own tests should verify *orchestration* (which stages ran,
+how they combine, what gets logged) — retrieval *quality* is already covered
+thoroughly by Day 3's `test_pgvector_store.py` and Day 5's `test_bm25.py`. Re-testing
+ranking quality here would also require carefully-constructed, distinguishable fake
+embeddings (recall Day 5's fixtures all share one all-zero fake embedding — fine for
+BM25, useless for meaningfully testing vector ranking) — sidestepped entirely by
+mocking at this level.
+- **Vector only** (`use_vector=True, use_bm25=False`): `build_index` is never called
+  (assert via a monkeypatch that raises if invoked); `stages_json` has only a
+  `"vector"` key; `latency_json` has `"vector_query_ms"` and `"total_ms"` only, no
+  `"bm25_ms"`/`"fusion_ms"`.
+- **BM25 only** (`use_vector=False, use_bm25=True`), **with `OPENAI_API_KEY` unset and
+  no `embedder` passed**: succeeds without raising — this is the direct regression
+  test for "never construct an `EmbeddingProvider` unless `use_vector` is `True`."
+  `stages_json` has only a `"bm25"` key.
+- **Both enabled, `use_rrf=True`**: mock both sources with distinguishable canned
+  results (some overlapping `id`s, some not); assert `fusion.fuse` was actually
+  applied — e.g. by checking the returned blocks' `.score` values match hand-computed
+  RRF scores, not either mock's original scores. `stages_json` has `"vector"`,
+  `"bm25"`, and `"fusion"` keys.
+- **Both enabled, `use_rrf=False`**: same setup; assert the `concat_dedup` path was
+  taken instead — returned blocks keep their original mock scores, ordered by best
+  rank.
+- **Both disabled** (`use_vector=False, use_bm25=False`): returns an empty
+  `PipelineResult` (`blocks == []`), no error, no `EmbeddingProvider` constructed,
+  `stages_json == {}`.
+- **`final_k` truncation**: mock results larger than `config.final_k`; assert
+  `result.blocks` is truncated, but `stages_json`'s per-stage lists are *not*
+  truncated (the log should show everything each stage actually returned, not just
+  what survived to the final answer).
+- **`latency_json` always has `"total_ms"`**, even when both retrievers are disabled.
 
-- **Exact-address retrieval (the Day 5 acceptance criterion, formalized)**: index
-  `reference_repo`, build a `BM25Index`, query `"aws_vpc.main"`; assert
-  `results[0].address == "aws_vpc.main"`.
+`tests/test_db.py` addition — `insert_query_log` round trip (DB-dependent,
+skip-if-unreachable, same convention as every prior day):
+- Insert a log row with a representative `config_json`/`stages_json`/`latency_json`
+  (nested dicts/lists, not just flat key-value pairs) and a non-`None` answer; read it
+  back via a raw `SELECT`; assert every field round-trips correctly, **specifically
+  confirming the JSONB columns decode back into native Python `dict`/`list` objects
+  without any extra unwrapping** — this is the direct proof that `Jsonb(...)` wrapping
+  on the write side was necessary and sufficient (Step 2's Day-3-`Vector`-lesson
+  callout).
+- Insert a log row with `answer=None`; confirm it's stored and read back as `None`,
+  not some other falsy value.
+- Clean up the `repos` row afterward (cascades to `query_logs` via `ON DELETE
+  CASCADE`).
 
-- **Repository isolation — corrected logic.** Index `reference_repo` under one
-  throwaway repo and `sample_repo` under a second; build a `BM25Index` for each.
-  Capture each repo's own known resource ids (e.g. via `db.fetch_bm25_documents`).
-  Run the *same* query (anything with plausible overlap in both, e.g. `"aws"`) against
-  both indexes and assert:
-  ```python
-  reference_result_ids = {block.id for block in reference_index.query("aws", k=50)}
-  sample_result_ids = {block.id for block in sample_index.query("aws", k=50)}
-
-  assert reference_result_ids <= reference_repo_ids
-  assert reference_result_ids.isdisjoint(sample_repo_ids)
-
-  assert sample_result_ids <= sample_repo_ids
-  assert sample_result_ids.isdisjoint(reference_repo_ids)
-  ```
-  A `BM25Index` built from `reference_repo` can, by construction, only ever hold
-  `reference_repo`'s own documents — so this subset/disjoint pair is what's actually
-  checkable and meaningful (an earlier draft of this plan asserted the *opposite*,
-  that no result should belong to the repo the index was built from, which is
-  impossible by construction and was wrong — that assertion is removed).
-  Then, using `aws_security_group.worker`, which exists as a **distinct row in both**
-  fixtures (same address text, different `id`s — the real cross-contamination risk):
-  query each index for `"aws_security_group.worker"` and assert `results[0].id`
-  equals *that specific repo's own* row id for that address, never the other repo's
-  id for the same address text.
-
-- **Deterministic ordering**: call `.query()` twice with identical arguments against
-  the same built index; assert identical results, in identical order.
-
-- **Empty corpus**: `build_index` for a `repo_id` with zero resources returns a
-  `BM25Index` whose `.query("anything", k=5)` is `[]`, without raising — the direct
-  regression test for the `BM25Okapi([])` avoidance in Step 3.
-
-- **`k <= 0`**: against a non-empty index, `.query("aws_vpc.main", k=0)` and
-  `.query("aws_vpc.main", k=-1)` both return `[]`, even though the query itself would
-  otherwise clearly match something.
-
-- **Empty/punctuation query returns no evidence, not arbitrary results**:
-  `.query("???", k=5)` against a non-empty index returns `[]`.
-
-- **Unknown textual query returns no evidence**: a query composed entirely of words
-  that appear nowhere in the corpus (e.g. `"zzz_nonexistent_zzz qqq_unmatched_qqq"`)
-  returns `[]`.
-
-- **A genuine match may carry a non-positive score, and must still be returned** —
-  this is a constructed unit test, not DB-dependent, since it needs precise control
-  over corpus content to force negative IDF deterministically:
-  ```python
-  def test_query_returns_overlapping_documents_with_nonpositive_scores() -> None:
-      texts = ["common alpha", "common beta", "common gamma"]
-      tokenized = [tokenize(t) for t in texts]
-      documents = [
-          BM25Document(
-              id=i, address=f"addr.{i}", file_path="f.tf",
-              start_line=1, end_line=1, body=t, tokens=frozenset(toks),
-          )
-          for i, (t, toks) in enumerate(zip(texts, tokenized))
-      ]
-      index = BM25Index(documents, BM25Okapi(tokenized))
-
-      results = index.query("common", k=10)
-
-      # "common" appears in all 3 documents, so BM25Okapi's IDF term for it
-      # is negative (log((3 - 3 + 0.5) / (3 + 0.5)) < 0) -- every score here
-      # is <= 0, yet all three genuinely share the query term and must be
-      # returned, not filtered out.
-      assert {r.address for r in results} == {"addr.0", "addr.1", "addr.2"}
-      assert all(r.score <= 0 for r in results)
-  ```
-
-- **`k` truncation**: a corpus with more matching documents than `k` returns exactly
-  `k`; fewer matching documents than `k` returns all of them (never pads with
-  non-matching documents to reach `k`).
-
-- **Regression check, not a new test**: `tests/test_pgvector_store.py` must continue
-  to pass completely unmodified. Run the full suite, not just the new file.
+`tests/test_ask.py` — **full rewrite**:
+- `ask()`: monkeypatch `ask_module.pipeline.run_pipeline` to return a canned
+  `PipelineResult` with non-empty `blocks`; monkeypatch `ask_module.answer_question`
+  to a stub; monkeypatch `ask_module.db.insert_query_log` to a recording stub. Assert
+  `ask()` returns the stub's answer, and that `insert_query_log` was called with the
+  right `repo_id`/`question`/`config_json` (matches `dataclasses.asdict` of the config
+  actually used)/`stages_json`/`latency_json`/`answer`.
+- `ask()` with an empty-`blocks` canned `PipelineResult`: assert `answer_question` is
+  never called, `insert_query_log` is called with `answer=None`, and `ask()` returns
+  `NO_RESULTS_MESSAGE`.
+- `ask()` with no `config` argument: assert `pipeline.run_pipeline` was called with a
+  `RetrievalConfig()` carrying all-default values.
+- `main()`: monkeypatch `ask_module.ask` to a stub; run `main(["3", "question"])` with
+  no `--final-k`; assert `ask` was called with a plain `RetrievalConfig()`. Run again
+  with `--final-k 5`; assert `ask` was called with a config whose `final_k == 5` and
+  every other field still at its default.
 
 Run `python -m pytest` after implementation; all tests must pass. DB-dependent tests
-skip cleanly if Postgres isn't reachable. Nothing in this cycle needs
-`OPENAI_API_KEY` except indirectly, through the existing `_FakeEmbeddingProvider`
-pattern for indexing fixtures.
+skip cleanly if Postgres isn't reachable. `test_pipeline.py` and the rewritten
+`test_ask.py` need no `OPENAI_API_KEY` and no real database — everything external is
+mocked at the module level.
 
 ## 8. Acceptance criteria
 
 - `python -m pytest` passes with no failures, including the full existing suite.
-- The fixture-based exact-address test (section 7) passes.
-- **Primary manual acceptance check — no new indexing, no OpenAI cost, run this
-  first:** using the already-indexed `repos.id = 13` (`vpc-complete`,
-  `examples/complete`, confirmed present with 114 embedded resources including
-  `aws_security_group.rds` at `resources.id = 328` — see section 3):
+- **Primary manual acceptance check — retrieval only, costs one small embedding call,
+  no generation, using already-indexed `repo_id = 13`** (confirmed present since Day
+  5, 114 embedded resources):
   ```python
-  from ripple.retrieval.bm25 import build_index
-  results = build_index(13).query("aws_security_group.rds", k=5)
-  assert results[0].address == "aws_security_group.rds"
+  from ripple.config import RetrievalConfig
+  from ripple.retrieval.pipeline import run_pipeline
+
+  result = run_pipeline(13, "What creates the RDS security group?", RetrievalConfig())
+  print(result.stages_json)
+  print(result.latency_json)
   ```
-  SPEC.md's Day 5 wording asks for an exact address "like `aws_nat_gateway.this`" —
-  this exercises the identical exact-address behavior, on data that already exists,
-  for zero additional cost.
-- **Optional secondary check — reproduces SPEC's literal named example — requires
-  your explicit go-ahead before running, since it costs real OpenAI usage:**
-  `aws_nat_gateway.this` exists only in the **module root**
-  (`.repos/terraform-aws-vpc/main.tf:1228`), not in `examples/complete`. Running this
-  requires registering the module root as a new repo (`python scripts/index_repo.py
-  .repos/terraform-aws-vpc --name vpc-module-root`), which embeds every block in it —
-  a real, if small, API cost. **Do not run this without confirming first.** If run,
-  query with the **exact dotted address**, not a space-separated phrase:
+  Confirm: `stages_json` has `"vector"`, `"bm25"`, and `"fusion"` keys, each a list of
+  `{id, address, score}` dicts; `latency_json` has `vector_query_ms`, `bm25_ms`,
+  `fusion_ms`, `total_ms`, all positive numbers; `result.blocks` (length ≤ 8) includes
+  `aws_security_group.rds` or a clearly related block.
+- **Full "Done when" reproduction — reconstruct why a block was returned, from the log
+  table alone** — this is the literal Day 6 acceptance bar, and it requires an actual
+  `ask()` call, which costs one generation call in addition to the embedding call
+  above. **Confirm before running.** If approved:
   ```python
-  results = build_index(module_root_repo_id).query("aws_nat_gateway.this", k=5)
-  assert results[0].address == "aws_nat_gateway.this"
+  from scripts.ask import ask
+  answer = ask(13, "What creates the RDS security group?")
   ```
-  (An earlier draft of this plan incorrectly suggested querying with
-  `"aws_nat_gateway this"` — a space, not a dot. That's a different, weaker test:
-  it exercises loose keyword matching, not the exact-address behavior SPEC.md's
-  wording is actually asking about. Fixed here.)
+  then, separately, query the log table directly:
+  ```sql
+  SELECT question, config_json, stages_json, latency_json, answer
+  FROM query_logs
+  ORDER BY id DESC
+  LIMIT 1;
+  ```
+  Confirm you can point at a specific block in the final answer and find it in
+  `stages_json`'s `"fusion"` list (or `"vector"`/`"bm25"` if it came from only one
+  signal), with a score explaining its rank — that reconstruction, from SQL alone, is
+  exactly what "Done when" asks for.
 
 ## 9. Explicit non-goals
 
-- **`scripts/ask.py` is not touched.** It remains vector-only this cycle.
-  `RetrievalConfig.use_bm25`/`use_vector` are not consulted by anything yet — that's
-  `pipeline.py`'s job, Day 6.
-- RRF or any fusion logic (`fusion.py`) — Day 6, explicitly. Nothing in this cycle
-  reads or is read by anything Day 6 will build; `BM25Index.query()`'s "no evidence
-  returns `[]`" contract (section 6) exists specifically so that whenever Day 6's RRF
-  does arrive, it never has to guess whether an empty or low-score BM25 result means
-  "no evidence" or "everything, unfiltered."
-- Graph expansion wiring into anything — `graph.py` (Day 4) is untouched.
-- Cross-encoder reranking, query rewriting — Days 12 and 15 respectively.
-- **Caching a `BM25Index` across multiple calls within a long-running process.**
-  SPEC.md 9.5 says "rebuilt at process start" — for every consumer that exists today
-  (a one-shot test or CLI invocation), "at process start" and "rebuilt every call" are
-  the same thing. This matters only once Day 17's FastAPI app exists as a
-  long-running server — out of scope here.
-- `PineconeStore`, the `RetrievalConfig`-driven pipeline itself, the FastAPI app — all
-  still not built, unchanged from prior days' non-goals.
-- **Modifying `SPEC.md` as a side effect of this plan.** This plan itself never edits
-  `SPEC.md`. The one exception — the tokenizer duplication behavior (section 0a) —
-  was handled correctly: a separate, explicitly-approved, spec-only commit (`02298a3`)
-  before this plan revision, not a change bundled into implementing Day 5.
+- **`use_rerank`, `use_graph`, `use_rewrite` are not read by `pipeline.py` this
+  cycle.** Their stages (`rerank.py`, graph-expansion wiring, `rewrite.py`) don't
+  exist yet (Days 12, 8+13, 15). Setting these flags to `False` has no observable
+  effect on current behavior — there's nothing to skip. This is a real, temporary gap
+  between what `RetrievalConfig` *declares* and what `pipeline.py` *honors*; it closes
+  incrementally as each stage's day arrives.
+- **`rerank_top_n`, `graph_seed_n`, `graph_max_added` are likewise unread.**
+- Query rewriting itself, and the "N vector lists + N BM25 lists, one pair per
+  rewritten query" fusion shape it implies — Day 15. This cycle always fuses exactly
+  one vector list and one BM25 list.
+- Cross-encoder reranking, and the "top 50 into reranking" truncation point SPEC.md
+  describes — Day 12. This cycle truncates directly to `final_k` after fusion.
+- Graph expansion wiring into the pipeline or the prompt — Day 8 (first pipeline
+  wiring of graph context) and Day 13 (the dedicated graph-expansion day with real
+  `graph_seed_n`/`graph_max_added` limits). `graph.py` (Day 4) is untouched.
+- `PineconeStore` — still not built; `hydrate_ms` stays absent from `latency_json`
+  regardless (N/A for `PgVectorStore`, which is the only backend this project runs).
+- The FastAPI app (Day 17) — `scripts/ask.py` remains a CLI.
+- Modifying `SPEC.md` or `sql/schema.sql` — the `query_logs` table is already correct
+  as specified since Day 1; nothing here needs a schema change.
 
 ## 10. Risks, ambiguities, and things flagged for your review
 
-- **Why score-based filtering was rejected, restated for visibility:** `BM25Okapi`'s
-  IDF term can go negative for common terms in small corpora, so "score > 0" is not a
-  safe proxy for "this document is relevant" — it would wrongly exclude genuine
-  matches. Token-set overlap (section 5, Step 4) is the correct, safe criterion, and
-  is what's implemented. See the constructed test in section 7 for a concrete,
-  deterministic demonstration.
-- **BM25 scores are unnormalized and not comparable to vector cosine scores.**
-  Expected, and exactly why Day 6 uses RRF instead of a weighted score sum (SPEC.md
-  9.6 says so explicitly) — noted so it's not mistaken for an oversight here.
-- **`BM25Okapi([])`'s actual behavior was not empirically verified** against the
-  installed `rank-bm25==0.2.2` — sidestepped entirely by never constructing one for an
-  empty corpus (Step 3), rather than relying on an unverified library edge case.
-- **Fixture reuse, not new fixtures.** Both `sample_repo` (Day 2) and `reference_repo`
-  (Day 4) are reused for repo-isolation testing; neither fixture file is modified.
-- **`get_scores()` vs `get_top_n()`**: `BM25Okapi.get_top_n()` returns documents, not
-  indices or scores — not enough to build `RetrievedBlock`s or apply the deterministic
-  tie-break. This plan uses `get_scores()` directly and ranks/tie-breaks itself.
-- **Repo `id = 13`** used in section 8's primary acceptance check is pre-existing
-  state in the shared development database (confirmed present, not created by this
-  plan). If it's ever deleted or re-indexed differently, section 8's primary check
-  should be re-pointed at whatever `repo_id` currently holds `examples/complete`,
-  re-verified the same way (a direct `SELECT` before trusting an address exists), not
-  assumed to still be `13`.
+- **`config_json`/`stages_json`/`latency_json` field-naming and shape are this plan's
+  own design, not SPEC.md's.** SPEC.md says *what* must be logged ("per-stage
+  candidates, scores, and latencies," "which stages were on") but not the exact JSON
+  shape. This plan's choices — `stages_json` keyed by stage name
+  (`"vector"`/`"bm25"`/`"fusion"`) each holding a list of `{id, address, score}`
+  dicts; `latency_json` keyed `"<stage>_ms"`; `config_json` as a flat
+  `dataclasses.asdict(config)` — are reasonable and directly support section 8's
+  "Done when," but they're a plan-level design decision worth your explicit awareness
+  since nothing forces this exact shape. Changing it later is a `pipeline.py`-only
+  change; nothing else depends on the JSON's internal structure.
+- **Only `id`/`address`/`score` are logged per candidate, not full `body`/
+  `file_path`/line numbers.** Deliberate: that data already lives in `resources`,
+  addressable by `id`; duplicating full block bodies into every `query_logs` row would
+  bloat the table for no diagnostic benefit `id` doesn't already provide (join back to
+  `resources` when you need the body). If deeper log rows are wanted later, that's an
+  additive change to `_serialize()`.
+- **Embedding time is folded into `vector_query_ms`, not logged separately.**
+  SPEC.md's field list has no distinct "embed the question" key — reasonable to read
+  this as intentionally bundled into "vector_query" from the pipeline's point of view.
+  Revisit if this granularity ever matters (e.g. to separately track embedding-API
+  latency vs. the Postgres query itself).
+- **`--top-k` → `--final-k` is a breaking CLI rename**, not an additive change. Anyone
+  with a memorized `--top-k` invocation needs to know it changed. Flagged here rather
+  than silently done, per this project's own established pattern for user-visible
+  behavior changes.
+- **`RetrievalConfig`'s declared defaults (`use_rerank=True`, `use_graph=True`,
+  `use_rewrite=True`) are currently meaningless** — `pipeline.py` ignores them
+  entirely this cycle (see section 9). A caller reading only `RetrievalConfig`'s
+  defaults, without reading `pipeline.py`'s source, could reasonably but incorrectly
+  assume reranking/graph/rewriting are active. This resolves itself day by day as each
+  stage is wired in; not something to fix now, just something to be aware isn't fixed
+  yet.
+- **Floating-point score equality for tie-breaks.** `fuse()`'s RRF scores are sums of
+  `1/(k+rank)` terms — exact ties are more likely here than with raw cosine/BM25
+  scores (e.g. two blocks each appearing in exactly one list, both at rank 1, with
+  identical `k`, produce identical fused scores). The `address` tie-break handles this
+  deterministically; called out because Day 4/5 both needed the same fix once
+  reviewed, and it's better to have it right from the first draft this time.
