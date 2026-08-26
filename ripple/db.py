@@ -135,3 +135,28 @@ def fetch_resource_bodies(
                 (repo_id,),
             )
             return cursor.fetchall()
+
+
+def fetch_bm25_documents(
+    repo_id: int,
+) -> list[tuple[int, str, str, int, int, str, str]]:
+    """Return the fields needed to build a repository's BM25 index."""
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    address,
+                    file_path,
+                    start_line,
+                    end_line,
+                    body,
+                    embed_text
+                FROM resources
+                WHERE repo_id = %s
+                ORDER BY id
+                """,
+                (repo_id,),
+            )
+            return cursor.fetchall()
