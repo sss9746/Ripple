@@ -242,3 +242,103 @@ def test_replace_edges_rolls_back_on_insert_failure() -> None:
         with db.get_connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute("DELETE FROM repos WHERE id = %s", (repo_id,))
+
+
+def test_insert_query_log_round_trip() -> None:
+    try:
+        repo_id = db.insert_repo(
+            name="pytest-day6-query-log",
+            source_url=None,
+            local_path="/tmp/pytest-day6-query-log",
+        )
+    except (RuntimeError, psycopg.OperationalError):
+        pytest.skip("database not reachable")
+
+    config_json = {
+        "requested": {
+            "use_vector": True,
+            "use_bm25": True,
+            "use_rrf": True,
+        },
+        "executed": {
+            "vector": True,
+            "bm25": True,
+            "fusion": True,
+            "fusion_method": "rrf",
+        },
+    }
+    stages_json = {
+        "vector": [
+            {"id": 1, "address": "aws_vpc.main", "score": 0.95}
+        ],
+        "bm25": [
+            {"id": 1, "address": "aws_vpc.main", "score": 8.5}
+        ],
+        "fusion": [
+            {"id": 1, "address": "aws_vpc.main", "score": 0.032}
+        ],
+        "final": [
+            {"id": 1, "address": "aws_vpc.main", "score": 0.032}
+        ],
+    }
+    latency_json = {
+        "vector_query_ms": 12.5,
+        "bm25_ms": 3.25,
+        "fusion_ms": 0.5,
+        "total_ms": 16.25,
+    }
+
+    try:
+        answered_log_id = db.insert_query_log(
+            repo_id=repo_id,
+            question="What creates the VPC?",
+            config_json=config_json,
+            stages_json=stages_json,
+            latency_json=latency_json,
+            answer="aws_vpc.main creates the VPC.",
+        )
+        unanswered_log_id = db.insert_query_log(
+            repo_id=repo_id,
+            question="Unknown question",
+            config_json=config_json,
+            stages_json={"final": []},
+            latency_json={"total_ms": 1.0},
+            answer=None,
+        )
+
+        with db.get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, question, config_json, stages_json,
+                           latency_json, answer
+                    FROM query_logs
+                    WHERE repo_id = %s
+                    ORDER BY id
+                    """,
+                    (repo_id,),
+                )
+                rows = cursor.fetchall()
+
+        assert rows == [
+            (
+                answered_log_id,
+                "What creates the VPC?",
+                config_json,
+                stages_json,
+                latency_json,
+                "aws_vpc.main creates the VPC.",
+            ),
+            (
+                unanswered_log_id,
+                "Unknown question",
+                config_json,
+                {"final": []},
+                {"total_ms": 1.0},
+                None,
+            ),
+        ]
+    finally:
+        with db.get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("DELETE FROM repos WHERE id = %s", (repo_id,))

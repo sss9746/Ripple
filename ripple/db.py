@@ -5,6 +5,7 @@ import psycopg
 from dotenv import load_dotenv
 from pgvector import Vector
 from pgvector.psycopg import register_vector
+from psycopg.types.json import Jsonb
 
 
 load_dotenv()
@@ -160,3 +161,40 @@ def fetch_bm25_documents(
                 (repo_id,),
             )
             return cursor.fetchall()
+
+
+def insert_query_log(
+    repo_id: int,
+    question: str,
+    config_json: dict,
+    stages_json: dict,
+    latency_json: dict,
+    answer: str | None,
+) -> int:
+    """Save one completed query and return its generated log ID."""
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO query_logs
+                    (
+                        repo_id,
+                        question,
+                        config_json,
+                        stages_json,
+                        latency_json,
+                        answer
+                    )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    repo_id,
+                    question,
+                    Jsonb(config_json),
+                    Jsonb(stages_json),
+                    Jsonb(latency_json),
+                    answer,
+                ),
+            )
+            return cursor.fetchone()[0]
