@@ -255,11 +255,22 @@ environment variable, so this is both sufficient and safe — no code change nee
 
 This is written as one script, not a loose sequence of copy-pasted commands, for one
 specific reason: **teardown must run on every exit path, success or failure**
-(finding 7). `set -euo pipefail` plus `trap cleanup EXIT` guarantees that — the
-isolated project is torn down, and any normal-project services this run stopped are
-restored, no matter which line the script stops on. `read -p` prompts are the
-confirmation gates; answering anything other than `y` aborts cleanly (the trap still
-fires).
+(finding 7) — but teardown must never do more than the user actually consented to.
+`trap cleanup EXIT` fires on *every* exit, including a declined confirmation, so
+`cleanup()` cannot unconditionally run the isolated project's `down -v` — if it did,
+declining that specific confirmation would still delete the isolated volume via the
+trap, which is exactly backwards. `MANAGE_ISOLATED` tracks whether that consent was
+actually given: it starts `false`, `cleanup()`'s isolated `down -v` is gated on it
+being `true`, and it is only ever set `true` immediately before the confirmed `down
+-v` in step 2 below actually runs. Every early exit before that point — Docker
+unreachable, ports blocked, or the user declining any prompt up to and including
+step 2's own confirmation — leaves `MANAGE_ISOLATED=false`, so `cleanup()` skips the
+isolated teardown entirely in those cases; there is nothing to tear down that this
+run itself created. The normal-service restoration logic is independent of this
+flag and always runs if `STOPPED_NORMAL_SERVICES` is non-empty, regardless of how
+far the script got afterward — stopping those services has its own, separate
+confirmation (step 1), and restoring them is never conditional on what happens to
+the isolated project.
 
 ```bash
 #!/usr/bin/env bash
@@ -269,10 +280,13 @@ PROJECT="ripple-day7-check"
 LOCAL_DATABASE_URL="postgresql://ripple:ripple@localhost:5434/ripple"
 REPO_NAME="day7-docker-check"
 STOPPED_NORMAL_SERVICES=()
+MANAGE_ISOLATED=false
 
 cleanup() {
-  echo "--- Tearing down isolated project ($PROJECT) ---"
-  docker compose -p "$PROJECT" down -v || true
+  if [ "$MANAGE_ISOLATED" = true ]; then
+    echo "--- Tearing down isolated project ($PROJECT) ---"
+    docker compose -p "$PROJECT" down -v || true
+  fi
   if [ "${#STOPPED_NORMAL_SERVICES[@]}" -gt 0 ]; then
     echo "--- Restoring normal ripple service(s) this run stopped: ${STOPPED_NORMAL_SERVICES[*]} ---"
     docker compose start "${STOPPED_NORMAL_SERVICES[@]}" || true
@@ -323,6 +337,9 @@ if [ "$CONFIRM_DOWN" != "y" ]; then
   echo "Aborting before any destructive command ran."
   exit 1
 fi
+# Consent is now given -- only from this point on may cleanup() delete the
+# isolated project's volume on exit (including on a later failure).
+MANAGE_ISOLATED=true
 docker compose -p "$PROJECT" down -v
 
 # 3. Bring up a genuinely fresh, isolated local Postgres + pgvector.
@@ -383,7 +400,16 @@ echo "$INDEX_OUTPUT"
 # Prefer the id index_repo.py actually printed. Repo names are not unique in the
 # schema, so if that parse ever fails, fall back to the most recently created row
 # with this name (ORDER BY id DESC LIMIT 1) rather than an ambiguous bare lookup.
-REPO_ID=$(echo "$INDEX_OUTPUT" | grep -oE 'id=[0-9]+' | head -1 | cut -d= -f2)
+#
+# The `|| true` is required, not decorative: under `set -o pipefail`, if grep
+# finds no match it exits 1, and that non-zero status propagates as the whole
+# pipeline's exit status even though `head`/`cut` themselves exit 0. Without
+# `|| true`, `set -e` would treat that as this assignment "failing" and kill the
+# script right here -- before the fallback query below ever gets a chance to run.
+# `|| true` only affects whether the *script* treats this line as fatal; grep's
+# (empty) stdout is still captured into REPO_ID either way, so the `-z` check
+# below still correctly detects "no match" and proceeds to the fallback.
+REPO_ID=$(echo "$INDEX_OUTPUT" | grep -oE 'id=[0-9]+' | head -1 | cut -d= -f2) || true
 if [ -z "$REPO_ID" ]; then
   echo "Could not parse repo id from index_repo.py output; querying for it instead."
   REPO_ID=$(DATABASE_URL="$LOCAL_DATABASE_URL" python3 -c "
