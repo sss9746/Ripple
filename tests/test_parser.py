@@ -86,6 +86,28 @@ def test_nested_block_braces_do_not_end_parent_early() -> None:
     assert data_source.body.splitlines()[-1] == "}"
 
 
+def test_adjacent_blocks_with_no_blank_line_have_disjoint_ranges(
+    tmp_path: Path,
+) -> None:
+    source = (
+        'resource "aws_vpc" "main" {\n'
+        '  cidr_block = "10.0.0.0/16"\n'
+        '}\n'
+        'resource "aws_subnet" "public" {\n'
+        '  vpc_id = aws_vpc.main.id\n'
+        '}\n'
+    )
+    tf_file = tmp_path / "main.tf"
+    tf_file.write_text(source)
+
+    blocks = parse_file(tf_file, tmp_path)
+
+    assert [(block.address, block.start_line, block.end_line) for block in blocks] == [
+        ("aws_vpc.main", 1, 3),
+        ("aws_subnet.public", 4, 6),
+    ]
+
+
 def test_invalid_hcl_raises_value_error(tmp_path: Path) -> None:
     invalid_file = tmp_path / "invalid.tf"
     invalid_file.write_text(

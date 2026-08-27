@@ -43,6 +43,32 @@ def _row(name: str, embedding: list[float]) -> _ResourceRow:
     )
 
 
+@pytest.mark.parametrize("k", [0, -1])
+def test_query_short_circuits_for_nonpositive_k(
+    monkeypatch: pytest.MonkeyPatch,
+    k: int,
+) -> None:
+    def _unexpected_vector(*args: object, **kwargs: object) -> None:
+        raise AssertionError("Vector(...) must not be constructed for k <= 0")
+
+    def _unexpected_connection(*args: object, **kwargs: object) -> None:
+        raise AssertionError("db.get_connection() must not be called for k <= 0")
+
+    monkeypatch.setattr(
+        "ripple.retrieval.pgvector_store.Vector",
+        _unexpected_vector,
+    )
+    monkeypatch.setattr(db, "get_connection", _unexpected_connection)
+
+    result = PgVectorStore().query(
+        repo_id=1,
+        embedding=[0.0] * EMBEDDING_DIM,
+        k=k,
+    )
+
+    assert result == []
+
+
 def test_pgvector_store_query_limit_null_filter_and_delete() -> None:
     try:
         repo_id = db.insert_repo(

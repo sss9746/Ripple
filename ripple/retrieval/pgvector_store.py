@@ -19,6 +19,9 @@ class PgVectorStore:
         embedding: list[float],
         k: int,
     ) -> list[RetrievedBlock]:
+        if k <= 0:
+            return []
+
         vector_param = Vector(embedding)
 
         with db.get_connection() as connection:

@@ -29,6 +29,14 @@ def test_preserves_balanced_reference_index() -> None:
     ]
 
 
+def test_extracts_reference_with_index_then_attribute() -> None:
+    body = "value = aws_instance.node[0].private_ip"
+
+    assert references.extract_references(body) == [
+        "aws_instance.node[0].private_ip"
+    ]
+
+
 def test_ignores_references_inside_comments() -> None:
     body = """
 # aws_vpc.hash_comment.id
