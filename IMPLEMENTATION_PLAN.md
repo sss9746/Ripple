@@ -153,6 +153,47 @@ already exists. The two guards protect different costs (an API call vs. a malfor
 SQL clause) and both stay exactly as they are — this is an additive fix to close the
 gap for callers that bypass `pipeline.py`, not a refactor of `pipeline.py` itself.
 
+The test for this guard belongs in `tests/test_pgvector_store.py`, and must prove the
+short-circuit happens *before* any real work, not just that the return value happens
+to be `[]`:
+
+```python
+@pytest.mark.parametrize("k", [0, -1])
+def test_query_short_circuits_for_nonpositive_k(
+    monkeypatch: pytest.MonkeyPatch,
+    k: int,
+) -> None:
+    def _unexpected_vector(*args: object, **kwargs: object) -> None:
+        raise AssertionError("Vector(...) must not be constructed for k <= 0")
+
+    def _unexpected_connection(*args: object, **kwargs: object) -> None:
+        raise AssertionError("db.get_connection() must not be called for k <= 0")
+
+    monkeypatch.setattr(
+        "ripple.retrieval.pgvector_store.Vector", _unexpected_vector
+    )
+    monkeypatch.setattr(db, "get_connection", _unexpected_connection)
+
+    result = PgVectorStore().query(
+        repo_id=1, embedding=[0.0] * EMBEDDING_DIM, k=k
+    )
+
+    assert result == []
+```
+
+This is an **offline unit test — no database needed at all**, which is a stronger
+proof than a database-backed version would be: it shows `k <= 0` never reaches
+`Vector(...)` or `db.get_connection()` in the first place, for *any* `repo_id` or
+embedding, not just that a particular real query happened to come back empty. A
+separate database-backed version would only prove a weaker fact this test already
+implies, so none is added — closing this out as a real decision, not left open.
+`Vector` must be patched via its string path (`"ripple.retrieval.pgvector_store.Vector"`)
+since `pgvector_store.py` imports the name directly (`from pgvector import Vector`);
+patching `pgvector.Vector` itself would not affect the already-bound reference in
+`pgvector_store`'s own namespace. `db.get_connection` can be patched directly on the
+already-imported `db` module, since `pgvector_store.py` calls `db.get_connection()`
+by attribute lookup at call time, not a name captured at import time.
+
 ### Step 2 — Two targeted regression tests
 
 `tests/test_parser.py` — adjacent blocks, no blank line between them:
@@ -199,49 +240,144 @@ tests depend on).
 
 ### Step 3 — The actual "clean `docker compose up`" check
 
-**Read this section fully before running anything in it — it involves `docker
-compose down -v`, and the whole point is to never let it touch the real database.**
+**Read this section fully before running anything in it.** It involves
+`docker compose down -v`. The whole point is to never let it touch the real
+database, and to never touch the *normal* local `ripple` Compose project's own
+containers or volume either — this check runs under its own, isolated Compose
+project name, `ripple-day7-check`, specifically so `down -v` only ever deletes data
+this check itself created.
 
-The check must run against the **local** `pgvector/pgvector:pg16` container
-`docker-compose.yml` defines, with `DATABASE_URL` overridden **at the shell level for
-that command only** — never by editing the tracked `.env` file, and never by pointing
-anything at the real Supabase instance. `psycopg`'s `load_dotenv()` (called in
+`DATABASE_URL` is overridden **at the shell level, for individual commands only** —
+never by editing the tracked `.env` file, and never by pointing anything at the real
+Supabase instance. `psycopg`'s `load_dotenv()` (called in
 `db.py`/`embeddings.py`/`generate.py`) does not override an already-set shell
-environment variable, so a shell-level override is both sufficient and safe — no code
-change is needed to support this.
+environment variable, so this is both sufficient and safe — no code change needed.
+
+**Precondition — port conflicts.** `docker-compose.yml` hardcodes host ports `5434`
+and `8080`; they are not parameterized, and this plan does not modify
+`docker-compose.yml` to add an override. An isolated *project name* does not imply
+isolated *ports* — if the normal `ripple` Compose project is already running and
+holding those ports, this check's `up -d` will fail to bind them.
 
 ```bash
-# 1. Confirm before this line specifically — it removes the LOCAL container's
-#    volume. It does not touch .env or the Supabase database in any way, since
-#    docker-compose.yml only ever manages its own `db`/`adminer` containers, which
-#    are entirely separate infrastructure from the DATABASE_URL this project has
-#    actually been using.
-docker compose down -v
-
-# 2. Bring up a genuinely fresh local Postgres + pgvector.
-docker compose up -d
-
-# 3. Confirm the schema applied automatically (all 4 tables, vector extension).
-docker exec -it $(docker compose ps -q db) \
-  psql -U ripple -d ripple -c '\dt'
-
-# 4. Register and index a small, free-to-embed-cheaply repo against the LOCAL
-#    database only, via a one-shot shell-level DATABASE_URL override:
-DATABASE_URL=postgresql://ripple:ripple@localhost:5434/ripple \
-  python scripts/index_repo.py tests/fixtures/reference_repo --name day7-docker-check
-
-# 5. Ask it a question, against the same local database:
-DATABASE_URL=postgresql://ripple:ripple@localhost:5434/ripple \
-  python -c "from scripts.ask import ask; print(ask(1, 'What does aws_vpc.main create?'))"
+# Check first. Do not skip this.
+lsof -i :5434 -i :8080
 ```
 
-Step 4/5 make one small, real OpenAI embedding call and one real generation call —
-the same category of "small, unavoidable cost" as every prior day's manual checks.
-**Confirm before running Step 4 onward**, same convention as Days 3/5/6.
+- If nothing is listening: proceed directly to step 1.
+- If the **normal** `ripple` project's own `db`/`adminer` containers hold the ports:
+  stop them *reversibly* — `docker compose stop` (no `-v`, so their `pgdata` volume
+  is untouched) — before continuing, and restart them (`docker compose start`) after
+  this check's teardown (last step below).
+- If something unrelated holds the ports: resolve that separately. Do not proceed by
+  changing `docker-compose.yml`'s port mappings.
 
-If step 3 shows fewer than 4 tables, or steps 4–5 fail, that is section 4's
-reproducibility claim genuinely not holding — a real finding to report, not a
-process error to paper over.
+```bash
+# 1. Confirm before this line — it deletes the ISOLATED project's own volume only
+#    (created fresh in step 2 below). It cannot touch the normal `ripple` project's
+#    `pgdata` volume or the Supabase database, since -p gives it entirely separate
+#    containers and volumes under the hood.
+docker compose -p ripple-day7-check down -v
+
+# 2. Bring up a genuinely fresh, isolated local Postgres + pgvector.
+docker compose -p ripple-day7-check up -d
+
+# 3. Wait for Postgres to actually accept connections. docker-compose.yml has no
+#    healthcheck, so `up -d` returning does not mean the database is ready yet.
+until docker compose -p ripple-day7-check exec -T db pg_isready -U ripple; do
+  sleep 1
+done
+
+# 4. Verify the schema actually applied: all 4 tables, AND the vector extension
+#    specifically -- `\dt` alone does not prove the extension exists.
+docker compose -p ripple-day7-check exec -T db \
+  psql -U ripple -d ripple -c '\dt'
+docker compose -p ripple-day7-check exec -T db \
+  psql -U ripple -d ripple -c \
+  "SELECT extname FROM pg_extension WHERE extname = 'vector';"
+
+# 5. Register and index a small repo against the LOCAL, isolated database only,
+#    using the real CLI script. Confirm before this line -- it makes one real
+#    OpenAI embedding request (one batched call covering every block parsed from
+#    the fixture).
+DATABASE_URL=postgresql://ripple:ripple@localhost:5434/ripple \
+  python scripts/index_repo.py tests/fixtures/reference_repo --name day7-docker-check
+```
+
+Note the `Registered repo id=<N> ...` line this prints. **Do not assume `<N>` is
+`1`** — a fresh database still auto-increments from whatever `schema.sql`'s `SERIAL`
+sequence starts at, and nothing guarantees this is the very first row ever inserted
+(e.g. if this check is ever re-run after only `stop`/`start`, not `down -v`). If the
+printed id wasn't captured, recover it independently instead of guessing:
+
+```bash
+docker compose -p ripple-day7-check exec -T db psql -U ripple -d ripple -t -c \
+  "SELECT id FROM repos WHERE name = 'day7-docker-check';"
+```
+
+```bash
+# 6. Confirm resources were actually indexed and at least one reference edge was
+#    extracted -- proving Day 2 and Day 4's work reproduces here too, not just that
+#    the repos row exists. Substitute the real id from step 5 for <REPO_ID>.
+DATABASE_URL=postgresql://ripple:ripple@localhost:5434/ripple python3 -c "
+from ripple import db
+repo_id = <REPO_ID>
+with db.get_connection() as conn, conn.cursor() as cur:
+    cur.execute('SELECT count(*) FROM resources WHERE repo_id = %s', (repo_id,))
+    resource_count = cur.fetchone()[0]
+    cur.execute('SELECT count(*) FROM edges WHERE repo_id = %s', (repo_id,))
+    edge_count = cur.fetchone()[0]
+print('resources:', resource_count, '| edges:', edge_count)
+assert resource_count > 0 and edge_count > 0
+"
+
+# 7. Ask a real question through the actual CLI script. Confirm before this line --
+#    it makes a second OpenAI embedding request (the question) plus one generation
+#    request.
+DATABASE_URL=postgresql://ripple:ripple@localhost:5434/ripple \
+  python scripts/ask.py <REPO_ID> "What does aws_vpc.main create?"
+
+# 8. Confirm ask() actually wrote a query_logs row, and that its stages_json shows
+#    the Day 6 pipeline actually ran vector, bm25, fusion, and produced a final list
+#    -- not just that some row exists.
+DATABASE_URL=postgresql://ripple:ripple@localhost:5434/ripple python3 -c "
+from ripple import db
+repo_id = <REPO_ID>
+with db.get_connection() as conn, conn.cursor() as cur:
+    cur.execute(
+        'SELECT stages_json FROM query_logs WHERE repo_id = %s '
+        'ORDER BY id DESC LIMIT 1',
+        (repo_id,),
+    )
+    row = cur.fetchone()
+assert row is not None, 'no query_logs row was written'
+stages = row[0]
+print(sorted(stages.keys()))
+assert {'vector', 'bm25', 'fusion', 'final'} <= set(stages.keys())
+"
+
+# 9. Teardown -- always run this, isolated project only, never the normal one.
+docker compose -p ripple-day7-check down -v
+```
+
+If the precondition check required stopping the normal project's own containers to
+free the ports, restart them now: `docker compose start`.
+
+**Cost, stated precisely (not "one embedding call"):** step 5 (indexing) makes one
+embedding API request (the fixture's few blocks batch into a single call); step 7
+(asking) makes a second embedding request (the question itself) plus one generation
+request. Total: **approximately two embedding API requests and one generation API
+request** — the same small-cost category as every prior day's manual checks, just
+counted correctly this time.
+
+**If any of steps 4, 6, or 8 fail — fewer than 4 tables, the extension missing, zero
+resources or zero edges after indexing, or no query_logs row / missing stage keys
+after asking — that is section 4's reproducibility claim genuinely not holding. Day 7
+cannot be marked complete in that case.** Report the actual failure and decide on a
+fix as a separate, deliberate step. Do not silently patch `schema.sql` or
+`docker-compose.yml` to make the check pass — if the fix turns out to belong there,
+that is a new decision to make explicitly, not something to slip into this
+consolidation cycle's diff.
 
 ## 6. Interfaces, data structures, and error behavior
 
@@ -255,42 +391,54 @@ process error to paper over.
 
 ## 7. Required tests
 
-- `tests/test_pgvector_store.py` — add
-  `test_query_returns_empty_list_for_nonpositive_k`, parametrized over `k=0` and
-  `k=-1`, against a repo with real indexed rows (so a bug that let the query through
-  would visibly return non-empty results, not coincidentally return `[]` because the
-  repo was empty). Assert `PgVectorStore().query(repo_id, embedding, k) == []` for
-  both values, and — for `k=-1` specifically — that no `psycopg` exception is raised
-  (the direct regression test proving the negative-`LIMIT` PostgreSQL error is now
-  avoided, not just coincidentally not hit).
-- `tests/test_parser.py` — the adjacent-blocks test (Step 2), proving no off-by-one
-  bleed between two blocks separated by nothing but a newline.
-- `tests/test_references.py` — the chained-bracket-then-attribute test (Step 2).
+- `tests/test_pgvector_store.py` — add `test_query_short_circuits_for_nonpositive_k`
+  (Step 1's code block), parametrized over `k=0` and `k=-1` — **2 collected test
+  items**. Fully offline: proves via monkeypatches that neither `Vector(...)` nor
+  `db.get_connection()` is ever reached, not just that the return value happens to be
+  `[]`. No database-backed counterpart is added (Step 1 explains why one wouldn't add
+  meaningful separate coverage).
+- `tests/test_parser.py` — the adjacent-blocks test (Step 2) — **1 collected test
+  item** — proving no off-by-one bleed between two blocks separated by nothing but a
+  newline.
+- `tests/test_references.py` — the chained-bracket-then-attribute test (Step 2) —
+  **1 collected test item**.
 - **Full-suite regression check**: `python -m pytest` must still show all
-  pre-existing tests passing (119 before this cycle, 122 after) — this cycle adds
-  tests and fixes one function; it does not change behavior anywhere else, so nothing
-  else should move.
+  pre-existing tests passing, plus these 4 new collected items: **119 before this
+  cycle, 123 after** (119 + 2 parametrized `k` cases + 1 parser test + 1 references
+  test). This cycle adds tests and fixes one function; it does not change behavior
+  anywhere else, so nothing else should move.
 
-Run `python -m pytest` after implementation. All of this cycle's own tests are
-offline (no `OPENAI_API_KEY`, no real network) except
-`test_query_returns_empty_list_for_nonpositive_k`, which needs a reachable Postgres
-(skip-if-unreachable, same convention as every prior day) but no OpenAI access
-(embeddings for its indexed rows use the existing `_FakeEmbeddingProvider` pattern).
+Run `python -m pytest` after implementation. **Every test this cycle adds is fully
+offline** — no `OPENAI_API_KEY`, no real network, and (per the redesign above) no
+database connection either, including the `PgVectorStore` test, which used to need
+one and no longer does.
 
 ## 8. Acceptance criteria
 
-- `python -m pytest` passes with no failures, full suite, 122 tests.
-- `PgVectorStore().query(repo_id, embedding, k=0)` and `k=-1` both return `[]` with no
-  exception, verified against a repo with real rows.
+- `python -m pytest` passes with no failures, full suite, **123 tests** (119 + 2
+  parametrized `PgVectorStore` cases + 1 parser test + 1 references test).
+- `PgVectorStore().query(repo_id, embedding, k=0)` and `k=-1` both return `[]`
+  **without ever calling `Vector(...)` or `db.get_connection()`** — proven by
+  monkeypatches that raise if either is attempted (Step 1), not merely by observing
+  an empty return value.
 - **The literal Day 7 "Done when," run for the first time this project has ever run
-  it — read section 5, Step 3's safety note before attempting:** a fresh
-  `docker compose up` (local `pgvector/pgvector:pg16`, not Supabase) auto-applies
-  `schema.sql` to produce all 4 tables; `scripts/index_repo.py` and then `ask()`,
+  it — read section 5, Step 3 in full before attempting, including its port-conflict
+  precondition:** using an isolated Compose project (`ripple-day7-check`, never the
+  normal `ripple` project's own containers/volume), a fresh `docker compose up`
+  (local `pgvector/pgvector:pg16`, not Supabase) auto-applies `schema.sql` to
+  produce all 4 tables *and* the `vector` extension; `python scripts/index_repo.py`
+  and `python scripts/ask.py` — the actual CLI scripts, not `python -c` shortcuts —
   both pointed at that local database via a shell-level `DATABASE_URL` override,
-  successfully index a repo and answer a question — end to end, from a genuinely
-  empty database, using only `docker compose up` plus the two existing scripts.
-  Report the actual result (pass or fail) rather than assuming it will work because
-  the Supabase path has worked all along — those are different databases running the
+  successfully index a repo (verified: `resources` count > 0 *and* `edges` count >
+  0, proving Day 2 and Day 4's work reproduces here too) and answer a question
+  (verified: a `query_logs` row exists whose `stages_json` contains `vector`,
+  `bm25`, `fusion`, and `final` keys, proving Day 6's pipeline actually ran, not
+  just that some answer text came back) — end to end, from a genuinely empty
+  database, using only `docker compose up` plus the two existing scripts.
+  **Report the actual result. If any part of this fails, Day 7 is not complete** —
+  see Step 3's closing paragraph for what to do instead of silently patching
+  `schema.sql`/`docker-compose.yml` to force a pass. Do not assume success because
+  the Supabase path has worked all along; those are different databases running the
   same `schema.sql`, and this is the first time the local one has been exercised.
 
 ## 9. Explicit non-goals
@@ -325,12 +473,21 @@ offline (no `OPENAI_API_KEY`, no real network) except
 - **If the docker-compose check fails**, the likely causes, roughly in order of
   probability: (a) `schema.sql`'s `CREATE EXTENSION IF NOT EXISTS vector` requires
   the `pgvector/pgvector:pg16` image specifically (already the image
-  `docker-compose.yml` uses, so low risk); (b) port `5434` already bound by something
-  else stale; (c) a real drift between `schema.sql` and whatever the live Supabase
-  schema actually looks like today, if anything was ever changed by hand against
-  Supabase directly rather than through `schema.sql`. (c) would be the most important
-  finding of this entire cycle if it happens, since it would mean the two databases
-  this project can run against have silently diverged.
+  `docker-compose.yml` uses, so low risk); (b) port `5434`/`8080` already bound by
+  the normal `ripple` project or something else — Step 3's precondition check
+  (`lsof`) catches this *before* the isolated project attempts to start, but if it's
+  something other than the normal project holding the port, that still needs
+  separate resolution; (c) a real drift between `schema.sql` and whatever the live
+  Supabase schema actually looks like today, if anything was ever changed by hand
+  against Supabase directly rather than through `schema.sql`. (c) would be the most
+  important finding of this entire cycle if it happens, since it would mean the two
+  databases this project can run against have silently diverged.
+- **The isolated Compose project (`ripple-day7-check`) still shares host ports with
+  the normal `ripple` project**, since `docker-compose.yml`'s port mappings aren't
+  parameterized and this plan doesn't add an override file to change that. Isolation
+  here means separate containers/volumes, not separate ports — Step 3's precondition
+  check and reversible `stop`/`start` around the normal project is how that's
+  handled without modifying `docker-compose.yml`.
 - **The `k <= 0` fix reopens a file every prior day explicitly marked "do not
   modify."** That restriction existed to keep each day's diff scoped; Day 7's whole
   purpose is closing exactly this kind of deliberately-deferred item, so reopening it
