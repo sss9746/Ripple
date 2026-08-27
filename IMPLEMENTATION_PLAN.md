@@ -253,131 +253,232 @@ Supabase instance. `psycopg`'s `load_dotenv()` (called in
 `db.py`/`embeddings.py`/`generate.py`) does not override an already-set shell
 environment variable, so this is both sufficient and safe — no code change needed.
 
-**Precondition — port conflicts.** `docker-compose.yml` hardcodes host ports `5434`
-and `8080`; they are not parameterized, and this plan does not modify
-`docker-compose.yml` to add an override. An isolated *project name* does not imply
-isolated *ports* — if the normal `ripple` Compose project is already running and
-holding those ports, this check's `up -d` will fail to bind them.
+This is written as one script, not a loose sequence of copy-pasted commands, for one
+specific reason: **teardown must run on every exit path, success or failure**
+(finding 7). `set -euo pipefail` plus `trap cleanup EXIT` guarantees that — the
+isolated project is torn down, and any normal-project services this run stopped are
+restored, no matter which line the script stops on. `read -p` prompts are the
+confirmation gates; answering anything other than `y` aborts cleanly (the trap still
+fires).
 
 ```bash
-# Check first. Do not skip this.
-lsof -i :5434 -i :8080
-```
+#!/usr/bin/env bash
+set -euo pipefail
 
-- If nothing is listening: proceed directly to step 1.
-- If the **normal** `ripple` project's own `db`/`adminer` containers hold the ports:
-  stop them *reversibly* — `docker compose stop` (no `-v`, so their `pgdata` volume
-  is untouched) — before continuing, and restart them (`docker compose start`) after
-  this check's teardown (last step below).
-- If something unrelated holds the ports: resolve that separately. Do not proceed by
-  changing `docker-compose.yml`'s port mappings.
+PROJECT="ripple-day7-check"
+LOCAL_DATABASE_URL="postgresql://ripple:ripple@localhost:5434/ripple"
+REPO_NAME="day7-docker-check"
+STOPPED_NORMAL_SERVICES=()
 
-```bash
-# 1. Confirm before this line — it deletes the ISOLATED project's own volume only
-#    (created fresh in step 2 below). It cannot touch the normal `ripple` project's
-#    `pgdata` volume or the Supabase database, since -p gives it entirely separate
-#    containers and volumes under the hood.
-docker compose -p ripple-day7-check down -v
+cleanup() {
+  echo "--- Tearing down isolated project ($PROJECT) ---"
+  docker compose -p "$PROJECT" down -v || true
+  if [ "${#STOPPED_NORMAL_SERVICES[@]}" -gt 0 ]; then
+    echo "--- Restoring normal ripple service(s) this run stopped: ${STOPPED_NORMAL_SERVICES[*]} ---"
+    docker compose start "${STOPPED_NORMAL_SERVICES[@]}" || true
+  fi
+}
+trap cleanup EXIT
 
-# 2. Bring up a genuinely fresh, isolated local Postgres + pgvector.
-docker compose -p ripple-day7-check up -d
+# 0. Docker prerequisite. Start Docker Desktop first if this fails, then re-run.
+if ! docker info >/dev/null 2>&1; then
+  echo "Docker daemon is not reachable. Start Docker Desktop and retry."
+  echo "Day 7 acceptance cannot run until Docker is available."
+  exit 1
+fi
 
-# 3. Wait for Postgres to actually accept connections. docker-compose.yml has no
-#    healthcheck, so `up -d` returning does not mean the database is ready yet.
-until docker compose -p ripple-day7-check exec -T db pg_isready -U ripple; do
+# 1. Port-conflict precondition. docker-compose.yml hardcodes 5434/8080 (not
+#    parameterized; this plan does not add an override), so the isolated project
+#    still needs these two host ports free.
+if lsof -i :5434 -sTCP:LISTEN >/dev/null 2>&1 || lsof -i :8080 -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "Port 5434 and/or 8080 is already in use:"
+  lsof -i :5434 -i :8080 -sTCP:LISTEN
+
+  NORMAL_RUNNING=$(docker compose ps --services --status running 2>/dev/null || true)
+  if [ -n "$NORMAL_RUNNING" ]; then
+    echo
+    echo "The normal (non-isolated) ripple Compose project appears to own these"
+    echo "ports -- currently running: $NORMAL_RUNNING"
+    read -p "Stop these normal ripple services reversibly (no -v) so the isolated check can bind the ports? [y/N] " CONFIRM_STOP
+    if [ "$CONFIRM_STOP" != "y" ]; then
+      echo "Aborting -- ports are not free and stopping was not confirmed."
+      exit 1
+    fi
+    read -r -a STOPPED_NORMAL_SERVICES <<< "$NORMAL_RUNNING"
+    docker compose stop
+  else
+    echo
+    echo "Ports 5434/8080 are held by something other than the normal ripple"
+    echo "project. Stop here and resolve that yourself -- this check will not"
+    echo "try to identify or terminate an unrelated process."
+    exit 1
+  fi
+fi
+
+# 2. Confirm before deleting the ISOLATED project's own volume (created fresh in
+#    step 3 below). This cannot touch the normal ripple project's pgdata volume or
+#    the Supabase database -- `-p` gives it entirely separate containers/volumes.
+read -p "About to run 'docker compose -p $PROJECT down -v' (isolated project only). Continue? [y/N] " CONFIRM_DOWN
+if [ "$CONFIRM_DOWN" != "y" ]; then
+  echo "Aborting before any destructive command ran."
+  exit 1
+fi
+docker compose -p "$PROJECT" down -v
+
+# 3. Bring up a genuinely fresh, isolated local Postgres + pgvector.
+docker compose -p "$PROJECT" up -d
+
+# 4. Bounded readiness wait -- docker-compose.yml has no healthcheck, so `up -d`
+#    returning does not mean the database is ready. 30 attempts, 1 second apart;
+#    never loop forever.
+READY=false
+for attempt in $(seq 1 30); do
+  if docker compose -p "$PROJECT" exec -T db pg_isready -U ripple >/dev/null 2>&1; then
+    READY=true
+    break
+  fi
   sleep 1
 done
+if [ "$READY" != "true" ]; then
+  echo "Postgres did not become ready after 30 attempts. Container logs:"
+  docker compose -p "$PROJECT" logs db
+  echo "Day 7 acceptance FAILED: local database never became ready."
+  exit 1
+fi
 
-# 4. Verify the schema actually applied: all 4 tables, AND the vector extension
-#    specifically -- `\dt` alone does not prove the extension exists.
-docker compose -p ripple-day7-check exec -T db \
-  psql -U ripple -d ripple -c '\dt'
-docker compose -p ripple-day7-check exec -T db \
-  psql -U ripple -d ripple -c \
-  "SELECT extname FROM pg_extension WHERE extname = 'vector';"
+# 5. Deterministic schema verification -- query for the four expected tables and
+#    the vector extension, rather than eyeballing `\dt`.
+DATABASE_URL="$LOCAL_DATABASE_URL" python3 -c "
+from ripple import db
 
-# 5. Register and index a small repo against the LOCAL, isolated database only,
+with db.get_connection() as conn, conn.cursor() as cur:
+    cur.execute(
+        \"SELECT table_name FROM information_schema.tables \"
+        \"WHERE table_schema = 'public'\"
+    )
+    tables = {row[0] for row in cur.fetchall()}
+    cur.execute(\"SELECT extname FROM pg_extension WHERE extname = 'vector'\")
+    has_vector_extension = cur.fetchone() is not None
+
+expected_tables = {'repos', 'resources', 'edges', 'query_logs'}
+missing = expected_tables - tables
+assert not missing, f'missing tables: {missing}'
+assert has_vector_extension, 'vector extension is not installed'
+print('schema OK:', sorted(expected_tables), '| vector extension: OK')
+"
+
+# 6. Register and index a small repo against the LOCAL, isolated database only,
 #    using the real CLI script. Confirm before this line -- it makes one real
 #    OpenAI embedding request (one batched call covering every block parsed from
 #    the fixture).
-DATABASE_URL=postgresql://ripple:ripple@localhost:5434/ripple \
-  python scripts/index_repo.py tests/fixtures/reference_repo --name day7-docker-check
-```
+read -p "Continue with indexing (makes one real OpenAI embedding request)? [y/N] " CONFIRM_INDEX
+if [ "$CONFIRM_INDEX" != "y" ]; then
+  echo "Aborting before any OpenAI call was made."
+  exit 1
+fi
+INDEX_OUTPUT=$(DATABASE_URL="$LOCAL_DATABASE_URL" \
+  python scripts/index_repo.py tests/fixtures/reference_repo --name "$REPO_NAME")
+echo "$INDEX_OUTPUT"
 
-Note the `Registered repo id=<N> ...` line this prints. **Do not assume `<N>` is
-`1`** — a fresh database still auto-increments from whatever `schema.sql`'s `SERIAL`
-sequence starts at, and nothing guarantees this is the very first row ever inserted
-(e.g. if this check is ever re-run after only `stop`/`start`, not `down -v`). If the
-printed id wasn't captured, recover it independently instead of guessing:
-
-```bash
-docker compose -p ripple-day7-check exec -T db psql -U ripple -d ripple -t -c \
-  "SELECT id FROM repos WHERE name = 'day7-docker-check';"
-```
-
-```bash
-# 6. Confirm resources were actually indexed and at least one reference edge was
-#    extracted -- proving Day 2 and Day 4's work reproduces here too, not just that
-#    the repos row exists. Substitute the real id from step 5 for <REPO_ID>.
-DATABASE_URL=postgresql://ripple:ripple@localhost:5434/ripple python3 -c "
+# Prefer the id index_repo.py actually printed. Repo names are not unique in the
+# schema, so if that parse ever fails, fall back to the most recently created row
+# with this name (ORDER BY id DESC LIMIT 1) rather than an ambiguous bare lookup.
+REPO_ID=$(echo "$INDEX_OUTPUT" | grep -oE 'id=[0-9]+' | head -1 | cut -d= -f2)
+if [ -z "$REPO_ID" ]; then
+  echo "Could not parse repo id from index_repo.py output; querying for it instead."
+  REPO_ID=$(DATABASE_URL="$LOCAL_DATABASE_URL" python3 -c "
 from ripple import db
-repo_id = <REPO_ID>
+
+with db.get_connection() as conn, conn.cursor() as cur:
+    cur.execute(
+        \"SELECT id FROM repos WHERE name = '$REPO_NAME' ORDER BY id DESC LIMIT 1\"
+    )
+    row = cur.fetchone()
+    print(row[0] if row else '')
+")
+fi
+if [ -z "$REPO_ID" ]; then
+  echo "Day 7 acceptance FAILED: could not determine repo id after indexing."
+  exit 1
+fi
+echo "Using repo_id=$REPO_ID"
+
+# 7. Confirm resources were actually indexed and at least one reference edge was
+#    extracted -- proving Day 2 and Day 4's work reproduces here too, not just
+#    that the repos row exists.
+DATABASE_URL="$LOCAL_DATABASE_URL" python3 -c "
+from ripple import db
+
+repo_id = $REPO_ID
 with db.get_connection() as conn, conn.cursor() as cur:
     cur.execute('SELECT count(*) FROM resources WHERE repo_id = %s', (repo_id,))
     resource_count = cur.fetchone()[0]
     cur.execute('SELECT count(*) FROM edges WHERE repo_id = %s', (repo_id,))
     edge_count = cur.fetchone()[0]
+
 print('resources:', resource_count, '| edges:', edge_count)
-assert resource_count > 0 and edge_count > 0
+assert resource_count > 0, 'no resources were indexed'
+assert edge_count > 0, 'no reference edges were extracted'
 "
 
-# 7. Ask a real question through the actual CLI script. Confirm before this line --
+# 8. Ask a real question through the actual CLI script. Confirm before this line --
 #    it makes a second OpenAI embedding request (the question) plus one generation
 #    request.
-DATABASE_URL=postgresql://ripple:ripple@localhost:5434/ripple \
-  python scripts/ask.py <REPO_ID> "What does aws_vpc.main create?"
+read -p "Continue with asking (one more embedding request plus one generation request)? [y/N] " CONFIRM_ASK
+if [ "$CONFIRM_ASK" != "y" ]; then
+  echo "Aborting before the generation call was made."
+  exit 1
+fi
+DATABASE_URL="$LOCAL_DATABASE_URL" \
+  python scripts/ask.py "$REPO_ID" "What does aws_vpc.main create?"
 
-# 8. Confirm ask() actually wrote a query_logs row, and that its stages_json shows
-#    the Day 6 pipeline actually ran vector, bm25, fusion, and produced a final list
-#    -- not just that some row exists.
-DATABASE_URL=postgresql://ripple:ripple@localhost:5434/ripple python3 -c "
+# 9. Strengthened query-log check -- prove the system actually retrieved evidence
+#    and generated an answer, not merely that the expected JSON keys exist.
+DATABASE_URL="$LOCAL_DATABASE_URL" python3 -c "
 from ripple import db
-repo_id = <REPO_ID>
+
+repo_id = $REPO_ID
 with db.get_connection() as conn, conn.cursor() as cur:
     cur.execute(
-        'SELECT stages_json FROM query_logs WHERE repo_id = %s '
+        'SELECT stages_json, answer FROM query_logs WHERE repo_id = %s '
         'ORDER BY id DESC LIMIT 1',
         (repo_id,),
     )
     row = cur.fetchone()
+
 assert row is not None, 'no query_logs row was written'
-stages = row[0]
-print(sorted(stages.keys()))
-assert {'vector', 'bm25', 'fusion', 'final'} <= set(stages.keys())
+stages, answer = row
+
+assert answer is not None and answer.strip(), 'answer is empty or NULL'
+assert len(stages.get('final', [])) >= 1, 'final stage has no results'
+for stage_name in ('vector', 'bm25', 'fusion'):
+    assert stages.get(stage_name), f'{stage_name} stage is missing or empty'
+
+print('query_logs OK -- answer present, final/vector/bm25/fusion all non-empty')
 "
 
-# 9. Teardown -- always run this, isolated project only, never the normal one.
-docker compose -p ripple-day7-check down -v
+echo "Day 7 local docker-compose acceptance check PASSED."
+# `cleanup` (isolated teardown, then restoring any normal services) runs
+# automatically here via the EXIT trap -- nothing further to do.
 ```
 
-If the precondition check required stopping the normal project's own containers to
-free the ports, restart them now: `docker compose start`.
+**Cost, stated precisely:** step 6 (indexing) makes one embedding API request (the
+fixture's few blocks batch into a single call); step 8 (asking) makes a second
+embedding request (the question itself) plus one generation request. Total:
+**approximately two embedding API requests and one generation API request** — the
+same small-cost category as every prior day's manual checks.
 
-**Cost, stated precisely (not "one embedding call"):** step 5 (indexing) makes one
-embedding API request (the fixture's few blocks batch into a single call); step 7
-(asking) makes a second embedding request (the question itself) plus one generation
-request. Total: **approximately two embedding API requests and one generation API
-request** — the same small-cost category as every prior day's manual checks, just
-counted correctly this time.
-
-**If any of steps 4, 6, or 8 fail — fewer than 4 tables, the extension missing, zero
-resources or zero edges after indexing, or no query_logs row / missing stage keys
-after asking — that is section 4's reproducibility claim genuinely not holding. Day 7
-cannot be marked complete in that case.** Report the actual failure and decide on a
-fix as a separate, deliberate step. Do not silently patch `schema.sql` or
-`docker-compose.yml` to make the check pass — if the fix turns out to belong there,
-that is a new decision to make explicitly, not something to slip into this
-consolidation cycle's diff.
+**If the script exits non-zero at any point — Docker unreachable, ports blocked,
+readiness timeout, missing tables/extension, zero resources or edges, or a failed
+query-log assertion — that is section 4's reproducibility claim genuinely not
+holding. Day 7 cannot be marked complete in that case.** Report the actual failure
+message the script printed and decide on a fix as a separate, deliberate step. Do
+not silently patch `schema.sql` or `docker-compose.yml` to make the check pass — if
+the fix turns out to belong there, that is a new decision to make explicitly, not
+something to slip into this consolidation cycle's diff. Teardown still runs via the
+trap regardless of where the script stopped — normal-project services (if any were
+stopped) are restored, and the isolated project's volume is always removed, on
+every failure path as well as on success.
 
 ## 6. Interfaces, data structures, and error behavior
 
@@ -422,24 +523,35 @@ one and no longer does.
   monkeypatches that raise if either is attempted (Step 1), not merely by observing
   an empty return value.
 - **The literal Day 7 "Done when," run for the first time this project has ever run
-  it — read section 5, Step 3 in full before attempting, including its port-conflict
-  precondition:** using an isolated Compose project (`ripple-day7-check`, never the
-  normal `ripple` project's own containers/volume), a fresh `docker compose up`
-  (local `pgvector/pgvector:pg16`, not Supabase) auto-applies `schema.sql` to
-  produce all 4 tables *and* the `vector` extension; `python scripts/index_repo.py`
-  and `python scripts/ask.py` — the actual CLI scripts, not `python -c` shortcuts —
-  both pointed at that local database via a shell-level `DATABASE_URL` override,
-  successfully index a repo (verified: `resources` count > 0 *and* `edges` count >
-  0, proving Day 2 and Day 4's work reproduces here too) and answer a question
-  (verified: a `query_logs` row exists whose `stages_json` contains `vector`,
-  `bm25`, `fusion`, and `final` keys, proving Day 6's pipeline actually ran, not
-  just that some answer text came back) — end to end, from a genuinely empty
-  database, using only `docker compose up` plus the two existing scripts.
+  it — read section 5, Step 3 in full before attempting, including its Docker
+  prerequisite and port-conflict precondition:** with Docker Desktop running
+  (`docker info` reachable) and using an isolated Compose project
+  (`ripple-day7-check`, never the normal `ripple` project's own containers/volume),
+  a fresh `docker compose up` (local `pgvector/pgvector:pg16`, not Supabase), waited
+  on with a *bounded* readiness check (30 attempts, not forever), produces all 4
+  tables *and* the `vector` extension — verified by querying
+  `information_schema.tables`/`pg_extension` directly, not by eyeballing `\dt`.
+  `python scripts/index_repo.py` and `python scripts/ask.py` — the actual CLI
+  scripts, not `python -c` shortcuts — both pointed at that local database via a
+  shell-level `DATABASE_URL` override, successfully index a repo (verified:
+  `resources` count > 0 *and* `edges` count > 0, proving Day 2 and Day 4's work
+  reproduces here too) and answer a question (verified: a `query_logs` row exists
+  whose `stages_json["final"]` has at least one result, whose `vector`/`bm25`/
+  `fusion` stages are each present *and non-empty*, and whose `answer` column is a
+  non-empty string — proving the system actually retrieved evidence and generated a
+  real answer, not just that some JSON keys happen to exist) — end to end, from a
+  genuinely empty database, using only `docker compose up` plus the two existing
+  scripts. The repo id used throughout comes from `index_repo.py`'s own printed
+  output (with a name-based fallback query that explicitly handles non-unique
+  names via `ORDER BY id DESC LIMIT 1`), never a hardcoded id.
   **Report the actual result. If any part of this fails, Day 7 is not complete** —
   see Step 3's closing paragraph for what to do instead of silently patching
   `schema.sql`/`docker-compose.yml` to force a pass. Do not assume success because
   the Supabase path has worked all along; those are different databases running the
   same `schema.sql`, and this is the first time the local one has been exercised.
+  Teardown (isolated project's volume, plus restoring any normal-project services
+  this run stopped) happens automatically on every exit path, success or failure,
+  via the script's `trap`-based cleanup.
 
 ## 9. Explicit non-goals
 
@@ -473,21 +585,28 @@ one and no longer does.
 - **If the docker-compose check fails**, the likely causes, roughly in order of
   probability: (a) `schema.sql`'s `CREATE EXTENSION IF NOT EXISTS vector` requires
   the `pgvector/pgvector:pg16` image specifically (already the image
-  `docker-compose.yml` uses, so low risk); (b) port `5434`/`8080` already bound by
-  the normal `ripple` project or something else — Step 3's precondition check
-  (`lsof`) catches this *before* the isolated project attempts to start, but if it's
-  something other than the normal project holding the port, that still needs
-  separate resolution; (c) a real drift between `schema.sql` and whatever the live
-  Supabase schema actually looks like today, if anything was ever changed by hand
-  against Supabase directly rather than through `schema.sql`. (c) would be the most
-  important finding of this entire cycle if it happens, since it would mean the two
-  databases this project can run against have silently diverged.
+  `docker-compose.yml` uses, so low risk); (b) port `5434`/`8080` already bound —
+  Step 3's precondition check (`lsof`) catches this before the isolated project
+  attempts to start, distinguishes the normal `ripple` project (asks to stop it
+  reversibly, records exactly which services, restores only those) from anything
+  else (stops and asks the user rather than touching an unrelated process); (c) a
+  real drift between `schema.sql` and whatever the live Supabase schema actually
+  looks like today, if anything was ever changed by hand against Supabase directly
+  rather than through `schema.sql`. (c) would be the most important finding of this
+  entire cycle if it happens, since it would mean the two databases this project can
+  run against have silently diverged.
 - **The isolated Compose project (`ripple-day7-check`) still shares host ports with
   the normal `ripple` project**, since `docker-compose.yml`'s port mappings aren't
   parameterized and this plan doesn't add an override file to change that. Isolation
   here means separate containers/volumes, not separate ports — Step 3's precondition
-  check and reversible `stop`/`start` around the normal project is how that's
-  handled without modifying `docker-compose.yml`.
+  check and reversible, service-scoped `stop`/`start` around the normal project is
+  how that's handled without modifying `docker-compose.yml`.
+- **Step 3's script uses `read -p` for its confirmation gates, which requires an
+  interactive terminal.** If this is ever run non-interactively (piped, or invoked
+  by an agent without a TTY attached), `read -p` will block waiting for input rather
+  than proceeding or failing fast. This is intentional — every gated point spends
+  real money or runs a destructive command, so silently defaulting to "yes" when
+  unattended would be worse than blocking. Run it interactively.
 - **The `k <= 0` fix reopens a file every prior day explicitly marked "do not
   modify."** That restriction existed to keep each day's diff scoped; Day 7's whole
   purpose is closing exactly this kind of deliberately-deferred item, so reopening it
