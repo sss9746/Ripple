@@ -272,6 +272,36 @@ far the script got afterward — stopping those services has its own, separate
 confirmation (step 1), and restoring them is never conditional on what happens to
 the isolated project.
 
+**Two corrections below, both found by actually running this script for the first
+time — read this before assuming the script as previously written was fine.** The
+underlying acceptance check itself passed: `index_repo.py` and `ask.py` genuinely
+reproduced the full pipeline from a clean, isolated local `docker compose up`. But
+getting there required two manual workarounds that the script should have handled
+itself:
+
+- **`PYTHON_BIN`, not a bare `python`/`python3`.** The first run failed outright with
+  `python: command not found` — this machine has no `python` on `PATH`, only
+  `python3`, and even `python3` alone would bypass the project's virtualenv
+  dependencies (`psycopg`, `openai`, etc. live in `.venv`, not the system
+  interpreter). `PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"`, validated with an
+  executable check before anything else runs, fixes both problems at once and lets
+  the variable be overridden (`PYTHON_BIN=python3.11 ...`) if a project's virtualenv
+  ever lives somewhere other than `.venv`.
+- **Line-by-line service capture, not `read -a` or `mapfile`.** The first run's
+  `NORMAL_RUNNING` was two lines (`adminer` and `db`, since the normal project has
+  both services running), but `read -r -a STOPPED_NORMAL_SERVICES <<< "$NORMAL_RUNNING"`
+  only reads the *first* line into the array — `db` was silently dropped, and the
+  printed "Restoring normal ripple service(s) this run stopped: adminer" message
+  only ever named one of the two. In that actual run, `db` still came back up
+  anyway — but only as a side effect of `docker-compose.yml`'s `adminer: depends_on:
+  [db]`, which made `docker compose start adminer` revive `db` too. **Restoration
+  must not rely on that coincidence** — two services with no `depends_on`
+  relationship between them would leave one orphaned in a stopped state. `mapfile`
+  would read every line correctly, but stock macOS ships bash 3.2, which has no
+  `mapfile`/`readarray` at all — so this uses a `while IFS= read -r service; do ...
+  done <<< "$NORMAL_RUNNING"` loop instead, which is bash-3.2-compatible and reads
+  every line.
+
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
@@ -279,8 +309,15 @@ set -euo pipefail
 PROJECT="ripple-day7-check"
 LOCAL_DATABASE_URL="postgresql://ripple:ripple@localhost:5434/ripple"
 REPO_NAME="day7-docker-check"
+PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
 STOPPED_NORMAL_SERVICES=()
 MANAGE_ISOLATED=false
+
+if [ ! -x "$PYTHON_BIN" ]; then
+  echo "Python virtual environment not found at $PYTHON_BIN."
+  echo "Create/activate the project virtual environment or set PYTHON_BIN explicitly."
+  exit 1
+fi
 
 cleanup() {
   if [ "$MANAGE_ISOLATED" = true ]; then
@@ -318,7 +355,15 @@ if lsof -i :5434 -sTCP:LISTEN >/dev/null 2>&1 || lsof -i :8080 -sTCP:LISTEN >/de
       echo "Aborting -- ports are not free and stopping was not confirmed."
       exit 1
     fi
-    read -r -a STOPPED_NORMAL_SERVICES <<< "$NORMAL_RUNNING"
+    # Bash-3.2-compatible line-by-line capture (stock macOS ships bash 3.2,
+    # which has no `mapfile`/`readarray`). `read -a` reads only a single line
+    # and would silently drop every service after the first whenever
+    # $NORMAL_RUNNING has more than one line -- this loop reads every line.
+    while IFS= read -r service; do
+      if [ -n "$service" ]; then
+        STOPPED_NORMAL_SERVICES+=("$service")
+      fi
+    done <<< "$NORMAL_RUNNING"
     docker compose stop
   else
     echo
@@ -365,7 +410,7 @@ fi
 
 # 5. Deterministic schema verification -- query for the four expected tables and
 #    the vector extension, rather than eyeballing `\dt`.
-DATABASE_URL="$LOCAL_DATABASE_URL" python3 -c "
+DATABASE_URL="$LOCAL_DATABASE_URL" "$PYTHON_BIN" -c "
 from ripple import db
 
 with db.get_connection() as conn, conn.cursor() as cur:
@@ -394,7 +439,7 @@ if [ "$CONFIRM_INDEX" != "y" ]; then
   exit 1
 fi
 INDEX_OUTPUT=$(DATABASE_URL="$LOCAL_DATABASE_URL" \
-  python scripts/index_repo.py tests/fixtures/reference_repo --name "$REPO_NAME")
+  "$PYTHON_BIN" scripts/index_repo.py tests/fixtures/reference_repo --name "$REPO_NAME")
 echo "$INDEX_OUTPUT"
 
 # Prefer the id index_repo.py actually printed. Repo names are not unique in the
@@ -412,7 +457,7 @@ echo "$INDEX_OUTPUT"
 REPO_ID=$(echo "$INDEX_OUTPUT" | grep -oE 'id=[0-9]+' | head -1 | cut -d= -f2) || true
 if [ -z "$REPO_ID" ]; then
   echo "Could not parse repo id from index_repo.py output; querying for it instead."
-  REPO_ID=$(DATABASE_URL="$LOCAL_DATABASE_URL" python3 -c "
+  REPO_ID=$(DATABASE_URL="$LOCAL_DATABASE_URL" "$PYTHON_BIN" -c "
 from ripple import db
 
 with db.get_connection() as conn, conn.cursor() as cur:
@@ -432,7 +477,7 @@ echo "Using repo_id=$REPO_ID"
 # 7. Confirm resources were actually indexed and at least one reference edge was
 #    extracted -- proving Day 2 and Day 4's work reproduces here too, not just
 #    that the repos row exists.
-DATABASE_URL="$LOCAL_DATABASE_URL" python3 -c "
+DATABASE_URL="$LOCAL_DATABASE_URL" "$PYTHON_BIN" -c "
 from ripple import db
 
 repo_id = $REPO_ID
@@ -456,11 +501,11 @@ if [ "$CONFIRM_ASK" != "y" ]; then
   exit 1
 fi
 DATABASE_URL="$LOCAL_DATABASE_URL" \
-  python scripts/ask.py "$REPO_ID" "What does aws_vpc.main create?"
+  "$PYTHON_BIN" scripts/ask.py "$REPO_ID" "What does aws_vpc.main create?"
 
 # 9. Strengthened query-log check -- prove the system actually retrieved evidence
 #    and generated an answer, not merely that the expected JSON keys exist.
-DATABASE_URL="$LOCAL_DATABASE_URL" python3 -c "
+DATABASE_URL="$LOCAL_DATABASE_URL" "$PYTHON_BIN" -c "
 from ripple import db
 
 repo_id = $REPO_ID
@@ -557,9 +602,10 @@ one and no longer does.
   on with a *bounded* readiness check (30 attempts, not forever), produces all 4
   tables *and* the `vector` extension — verified by querying
   `information_schema.tables`/`pg_extension` directly, not by eyeballing `\dt`.
-  `python scripts/index_repo.py` and `python scripts/ask.py` — the actual CLI
-  scripts, not `python -c` shortcuts — both pointed at that local database via a
-  shell-level `DATABASE_URL` override, successfully index a repo (verified:
+  `"$PYTHON_BIN" scripts/index_repo.py` and `"$PYTHON_BIN" scripts/ask.py` — the
+  actual CLI scripts, not `-c` shortcuts, run through the project's own virtualenv
+  interpreter — both pointed at that local database via a shell-level `DATABASE_URL`
+  override, successfully index a repo (verified:
   `resources` count > 0 *and* `edges` count > 0, proving Day 2 and Day 4's work
   reproduces here too) and answer a question (verified: a `query_logs` row exists
   whose `stages_json["final"]` has at least one result, whose `vector`/`bm25`/
@@ -578,6 +624,16 @@ one and no longer does.
   Teardown (isolated project's volume, plus restoring any normal-project services
   this run stopped) happens automatically on every exit path, success or failure,
   via the script's `trap`-based cleanup.
+
+**This check has, in fact, already passed once** — with the pre-`PYTHON_BIN` script,
+requiring a manual `python` → `python3` substitution to get past step 6, and manual
+confirmation afterward that both normal services (`db` and `adminer`) had genuinely
+come back up rather than trusting the script's own restoration message. `index_repo.py`
+reported "Indexed 7 resource blocks, Extracted 5 reference edges" and `ask.py`
+returned a real, correctly-cited answer about `aws_vpc.main`; the query-log check
+passed. **Day 7 is not being marked incomplete** — the two fixes above are
+portability corrections to the script itself, so the next run doesn't need that
+manual intervention, not evidence the underlying check ever failed.
 
 ## 9. Explicit non-goals
 
@@ -604,10 +660,13 @@ one and no longer does.
   one script, ask via another), not "the whole project has exactly one script,"
   since the latter reading would contradict Day 3's own deliverable. Flagged rather
   than silently assumed, since it's SPEC.md's phrasing, not this plan's.
-- **The docker-compose check is genuinely unverified as of this plan being written**
-  — this section itself is a prediction of what *should* happen given `schema.sql`
-  and the codebase's own DB calls, not a report of a check already run. Section 8
-  explicitly asks for the real result, whichever way it comes out.
+- **The docker-compose check has now actually been run and passed** (section 8) —
+  this section is no longer a prediction. The run that first exposed the two bugs
+  this revision fixes (bare `python` not on `PATH`; `db` silently dropped from
+  `STOPPED_NORMAL_SERVICES`) is the same run whose `index_repo.py`/`ask.py` output
+  is quoted in section 8 — the acceptance check passed despite those two script bugs,
+  because they were worked around manually rather than being failures of the
+  underlying system.
 - **If the docker-compose check fails**, the likely causes, roughly in order of
   probability: (a) `schema.sql`'s `CREATE EXTENSION IF NOT EXISTS vector` requires
   the `pgvector/pgvector:pg16` image specifically (already the image
