@@ -22,6 +22,25 @@ because you asked for it explicitly, and because getting these exactly right mat
 more here than in any prior cycle: this is the day the project's actual deliverable
 (measured numbers) starts existing.
 
+**Python interpreter portability.** This machine does not reliably have `python` or
+`python3` on `PATH` — the same issue Day 7's own `docker-compose` acceptance script
+had to work around. Every Python invocation described anywhere in this plan — running
+`pytest`, running `scripts/run_eval.py`, the manual benchmark-validation command,
+the address-inventory authoring helpers, and any inline `-c` snippet — resolves the
+interpreter once, the same way, and verifies it before use:
+```bash
+PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
+if [ ! -x "$PYTHON_BIN" ]; then
+  echo "Python interpreter not found or not executable: $PYTHON_BIN" >&2
+  exit 1
+fi
+```
+Every command shown later in this plan that runs Python — `"$PYTHON_BIN" -m pytest`,
+`"$PYTHON_BIN" scripts/run_eval.py ...`, `"$PYTHON_BIN" -c "..."`, or a scratch `.py`
+file run as `"$PYTHON_BIN" scratch.py` — assumes `$PYTHON_BIN` has already been
+resolved and verified this way. **Bare `python` or `python3` is never described as
+portable anywhere in this plan.**
+
 ## 1. Objective
 
 Build the 40-question labeled benchmark (Days 8–9), the machinery to score any
@@ -156,7 +175,9 @@ happens to be `repo_id = 13`, **but this number is environment-specific** — it
 depends on insertion order and which database you're pointed at (recall Day 1: this
 project's actual working `DATABASE_URL` is a Supabase instance, not the local
 `docker-compose` fallback). Any command in this plan that shows `--repo-id 13` is
-illustrative only; resolve the real value independently in your own environment:
+illustrative only; resolve the real value independently in your own environment, via
+`"$PYTHON_BIN"` (section 0 — e.g. `"$PYTHON_BIN" -c "..."` with the snippet below, or
+a scratch file run as `"$PYTHON_BIN" scratch.py`):
 ```python
 from ripple import db
 with db.get_connection() as conn, conn.cursor() as cur:
@@ -267,10 +288,10 @@ after Day 8, 40 after Day 9) and the **real, currently-indexed corpus's** `repo_
 still a required acceptance step for both days — but it is a **manual command**
 (section 6's Day 8/9 acceptance), run once per day by whoever is finishing that day,
 using the real `repo_id` resolved per section 3.1, **not** an automated `pytest`
-test. This keeps `python -m pytest` fully portable — passable on any machine, with any
-database state or none at all, per the existing skip-if-unreachable convention — while
-still requiring the real validation to actually happen before either day is called
-done.
+test. This keeps `"$PYTHON_BIN" -m pytest` (section 0) fully portable — passable on
+any machine, with any database state or none at all, per the existing
+skip-if-unreachable convention — while still requiring the real validation to
+actually happen before either day is called done.
 
 **Semantic verification — a required human/Codex process step, not something
 `dataset.py` can check automatically:** confirming an address *exists* in the
@@ -291,9 +312,10 @@ Writing 40 accurate questions means being able to answer, quickly and correctly:
 blocks actually have property Y" — all against the real, indexed corpus. These are
 **one-off authoring aids**, not new production code — no new script or module is
 proposed for this; every one of the following reuses functions that already exist
-(plus the one new `db.py` function in section 4). Run these directly in a `python3`
-REPL or scratch file while authoring, substituting the real `repo_id` from section
-3.1:
+(plus the one new `db.py` function in section 4). Run these directly via `"$PYTHON_BIN"`
+(section 0) — either an interactive REPL (`"$PYTHON_BIN"` with no arguments) or a
+scratch file (`"$PYTHON_BIN" scratch.py`) — while authoring, substituting the real
+`repo_id` from section 3.1:
 
 ```python
 from ripple import db
@@ -366,6 +388,7 @@ taken toward numeric edge cases):
 | `retrieved` has fewer than `k` items | no special case | `retrieved[:k]` naturally returns what's there; SPEC's formula already handles this correctly as written. |
 | No matches at all | no special case | All three functions already return `0.0` correctly per SPEC's own formulas — nothing to add. |
 | Aggregating an empty list of `QuestionResult`s | raise `ValueError` | mirrors the same "undefined, not zero" policy as the `expected == []` case; should never occur given 40 real entries, defense in depth again. |
+| `QuestionResult.latency` key sets differ across inputs to one `aggregate()`/`aggregate_by_category()` group | raise `ValueError` (finding 4) | all inputs to one aggregate ran the same `RetrievalConfig`, so they should have identical latency keys; a mismatch means a real per-question inconsistency, not something to average over silently. |
 | Per-category breakdown | grouped by `category`, categories emitted in **sorted order** | deterministic output — two runs over the same data always print categories in the same order. |
 
 `retrieved` must always be the address list **in pipeline rank order** —
@@ -409,20 +432,40 @@ the stages that ran, keyed by name — a vector-only config's dict has only
 execute are simply **absent** from the dict, never present with a misleading `0`.
 This plan preserves that shape all the way through: `QuestionResult` stores the
 **complete** `latency_json` mapping for that question (section 5's `latency` field),
-not just `total_ms`; `AggregateMetrics`/`CategoryMetrics` store the mean of
-`total_ms` across questions **and** the mean of every other stage key that appears in
-at least one question's latency mapping for that aggregate. A stage absent from every
-question's latency dict in a given config stays **absent** from that config's
-aggregate too — never backfilled with `0.0`, which would misleadingly suggest the
-stage ran instantly rather than not at all. `ConfigResult`'s JSON serialization
-(section 3.9) therefore carries both the raw per-question latency mappings and the
-aggregated per-stage means; the printed markdown table still shows only the single
-mean-`total_ms` **Latency (ms)** column, matching SPEC 10.3's table shape exactly —
-the richer per-stage data lives in JSON, without changing the table's column count.
-Tests (section 6, Day 10) hand-compute per-stage aggregation across at least two
-different executed-stage sets (a vector-only run's latency dicts have different keys
-than a vector+BM25+RRF run's) and confirm the aggregate only reports means for keys
-actually present in its input, never a synthesized zero for an absent one.
+not just `total_ms`.
+
+**`aggregate`/`aggregate_by_category` require every input's latency keys to match
+exactly (finding 4) — this is a consistency check, not a partial average.** All the
+`QuestionResult`s passed into one `aggregate()` (or, within `aggregate_by_category`,
+all the results sharing one category) were scored under the **same**
+`RetrievalConfig`, so they should all have run the same pipeline stages and therefore
+have **identical** latency dict keys. Before computing any stage mean, `aggregate`
+collects the set of `latency` keys from every input `QuestionResult`; if those key
+sets are not all identical, it raises `ValueError` naming the mismatch — this is
+deliberately **not** averaged over silently, because a genuine per-question
+difference in which stages ran (e.g. one question in a `"Vector + BM25 + RRF"` run
+somehow missing `fusion_ms`) means something is actually wrong with that run, not
+that some other question happens not to need that stage. If all key sets match,
+`AggregateMetrics.mean_latency_by_stage` is the mean of **every** key in that shared
+set, computed across **all** questions in the aggregate — never a partial mean over
+only the questions that happened to have a key, since after the consistency check
+every question has every key. **Missing stages are still never synthesized as
+`0.0`**: a key that is absent from every `QuestionResult` in one aggregate (because
+that config never executes that stage) is simply absent from `mean_latency_by_stage`
+too. **Different configurations may legitimately have different latency-key sets** —
+a `"Vector only"` `ConfigResult`'s aggregate has a different key set than a `"Vector +
+BM25 + RRF"` `ConfigResult`'s, and that's expected: each is aggregated
+**independently**, so this consistency rule applies *within* one config's own
+results, never *across* configs. `ConfigResult`'s JSON serialization (section 3.9)
+carries both the raw per-question latency mappings and the aggregated per-stage
+means; the printed markdown table still shows only the single mean-`total_ms`
+**Latency (ms)** column, matching SPEC 10.3's table shape exactly — the richer
+per-stage data lives in JSON, without changing the table's column count. Tests
+(section 6, Day 10) cover: hand-computed aggregation when every input's latency keys
+match; `aggregate`/`aggregate_by_category` raising `ValueError` when they don't;
+two independent aggregates (simulating two different configs) each succeeding with
+their own, mutually different key sets; and that a key absent from an entire
+config's results is absent from its aggregate, never a synthesized zero.
 
 ### 3.7 Cost and runtime — inspected, and deliberately left uncached
 
@@ -530,8 +573,8 @@ Modify:
 
 Do not modify: `SPEC.md`, `sql/schema.sql`, `docker-compose.yml`, `.env`/`.env.example`,
 `requirements.txt` (no new dependency required — `json`, `dataclasses`,
-`statistics.mean`, `hashlib`, and `subprocess` are all standard library, and if
-`GitPython` is used for section 3.9's Git-revision lookup instead of `subprocess`, it
+`statistics.mean`, and `hashlib` are all standard library, and `GitPython` — the
+single selected implementation for section 3.9's Git-revision lookup, finding 3 —
 is already a dependency since Day 1's `scripts/index_repo.py`), `ripple/config.py`,
 `ripple/ingest/*`, `ripple/llm/*`, `ripple/retrieval/*` (including `pipeline.py` —
 section 3.7 explains why its BM25 injection gap is flagged, not fixed, this cycle),
@@ -586,10 +629,14 @@ class AggregateMetrics:
     precision_at_5: float
     mean_latency_ms: float
     mean_latency_by_stage: dict[str, float]
-    # Mean of every stage key present in at least one input QuestionResult's
-    # `latency` dict, computed only over the questions that have that key. A key
-    # absent from every question's latency dict is absent here too -- never a
-    # synthesized 0.0 (section 3.6).
+    # Mean of every latency key, computed across ALL QuestionResults in this
+    # aggregate. Every QuestionResult passed to aggregate()/aggregate_by_category()
+    # (within one category) must have an identical set of `latency` keys -- raises
+    # ValueError if they don't (finding 4, section 3.6). A key absent from every
+    # question's latency dict (because that config never ran that stage) is simply
+    # absent here too -- never a synthesized 0.0. Different ConfigResults may
+    # legitimately have different key sets here, since each is aggregated
+    # independently.
 
 @dataclass
 class CategoryMetrics(AggregateMetrics):
@@ -654,14 +701,45 @@ ABLATION_CONFIGS: list[tuple[str, RetrievalConfig]] = [
 GIT_REVISION_UNAVAILABLE = "unavailable"
 
 def _corpus_git_revision(local_path: str) -> str:
-    # Best-effort only -- provenance metadata must never crash a real run. Either
-    # GitPython (git.Repo(local_path).head.commit.hexsha) or a subprocess call
-    # (subprocess.run(["git", "rev-parse", "HEAD"], cwd=local_path, capture_output=True,
-    # text=True, check=True).stdout.strip()) is acceptable; both are wrapped in a
-    # broad try/except so a missing directory, a directory that isn't a git repo, a
-    # git repo with no commits, or git not being installed all fall back to
-    # GIT_REVISION_UNAVAILABLE rather than raising out of build_report.
-    ...
+    # Single selected implementation: GitPython, with search_parent_directories=True
+    # (finding 3) -- not left as an "either GitPython or subprocess" choice. This
+    # matters concretely: the indexed repo's local_path is frequently a *nested*
+    # subdirectory of the actual git checkout (e.g. this project's own corpus,
+    # .repos/terraform-aws-vpc/examples/complete, sits inside the
+    # .repos/terraform-aws-vpc clone) -- without search_parent_directories=True,
+    # GitPython only looks for a .git directory directly inside local_path itself
+    # and would incorrectly report "unavailable" for every nested corpus path this
+    # project actually uses. Best-effort only -- provenance metadata must never
+    # crash a real run: wrapped broadly so a missing directory, a directory with no
+    # enclosing git repository at all, a repository with zero commits, or GitPython
+    # not being importable all fall back to GIT_REVISION_UNAVAILABLE rather than
+    # raising out of build_report.
+    try:
+        import git
+        return git.Repo(local_path, search_parent_directories=True).head.commit.hexsha
+    except Exception:
+        return GIT_REVISION_UNAVAILABLE
+
+def _indexed_corpus_fingerprint(repo_id: int) -> tuple[str, int]:
+    # Returns (indexed_corpus_sha256, resource_count) computed from the *database
+    # rows actually indexed* for repo_id -- not the working tree, and not row IDs
+    # (finding 2 / section 3.9). This proves what data these specific numbers were
+    # actually computed against, which corpus.git_revision alone cannot: git_revision
+    # only describes what commit local_path has checked out on disk right now: it
+    # says nothing about whether the database was ever indexed from that revision,
+    # or from an earlier one, or only partially.
+    rows = db.fetch_resource_bodies(repo_id)                     # (id, address, body)
+    pairs = sorted((address, body) for _id, address, body in rows)
+    # `id` is deliberately excluded -- an insertion-order artifact, not part of
+    # corpus identity. `resources` has a UNIQUE (repo_id, address) constraint, so
+    # sorting by address alone is already a total order (no ties possible) --
+    # sorting is what makes fetch order irrelevant to the resulting hash.
+    canonical = json.dumps(pairs, separators=(",", ":"))
+    # Fixed separators (no incidental whitespace) make the serialization
+    # byte-for-byte reproducible; sorting the input, not the JSON text, is what
+    # actually guarantees a stable hash independent of database fetch order.
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return digest, len(pairs)
 
 def build_report(
     repo_id: int,
@@ -670,10 +748,11 @@ def build_report(
     results: list[ConfigResult],
 ) -> dict:
     # Assembles the full provenance-carrying report (section 3.9). Calls the new
-    # db.fetch_repo(repo_id) for corpus identity/local_path, then
-    # _corpus_git_revision(local_path) for the Git revision. Never reads os.environ
-    # directly and never includes anything from it in the returned dict -- the only
-    # per-run facts in the report are repo_id, benchmark_path/hash, corpus identity,
+    # db.fetch_repo(repo_id) for corpus identity/local_path, _corpus_git_revision
+    # (local_path) for the Git revision, and _indexed_corpus_fingerprint(repo_id)
+    # for the indexed-corpus hash/count (finding 2). Never reads os.environ directly
+    # and never includes anything from it in the returned dict -- the only per-run
+    # facts in the report are repo_id, benchmark_path/hash, corpus identity,
     # embedding_model, and the ConfigResults themselves (finding 7's secrets-exclusion
     # requirement).
     ...
@@ -703,9 +782,13 @@ def fetch_repo(repo_id: int) -> tuple[str, str | None, str] | None:
 def main(argv=None):
     args = parse_args(argv)   # --repo-id (required), --benchmark (default data/benchmark.json),
                                # --config NAME (optional; omit = all three), --yes
-    benchmark_bytes = Path(args.benchmark).read_bytes()
+    benchmark_path = Path(args.benchmark)   # argparse gives a str; normalize to Path
+                                             # exactly once and reuse it everywhere below --
+                                             # load_benchmark's signature takes a Path,
+                                             # never a bare string (finding 5)
+    benchmark_bytes = benchmark_path.read_bytes()
     benchmark_sha256 = hashlib.sha256(benchmark_bytes).hexdigest()       # finding 7
-    entries = load_benchmark(args.benchmark)
+    entries = load_benchmark(benchmark_path)
     validate_addresses_exist(entries, args.repo_id)      # fail fast, before spending anything
     configs = [(args.config, dict(ABLATION_CONFIGS)[args.config])] if args.config else ABLATION_CONFIGS
     confirm_cost(len(entries), len(configs), skip=args.yes)   # section 3.7 -- real, uncached counts
@@ -713,7 +796,8 @@ def main(argv=None):
     print(render_markdown_table(results))
     report = build_report(                                # finding 7 -- provenance + results
         repo_id=args.repo_id,
-        benchmark_path=args.benchmark,
+        benchmark_path=str(benchmark_path),   # build_report's field is a JSON string,
+                                               # not a Path -- converted once, here
         benchmark_sha256=benchmark_sha256,
         results=results,
     )
@@ -803,7 +887,9 @@ invocation:
     "repo_name": "vpc-complete",
     "source_url": null,
     "local_path": ".repos/terraform-aws-vpc/examples/complete",
-    "git_revision": "<HEAD commit hash, or \"unavailable\">"
+    "git_revision": "<HEAD commit hash, or \"unavailable\">",
+    "indexed_corpus_sha256": "<sha256 of the sorted (address, body) pairs actually stored under repo_id>",
+    "resource_count": 114
   },
   "embedding_model": "text-embedding-3-small",
   "question_count": 40,
@@ -827,15 +913,45 @@ invocation:
 - **`corpus.git_revision` is derived at runtime, never hardcoded.** `db.fetch_repo`
   (new function, section 4) returns the repo's own `local_path` column; `runner.py`'s
   `_corpus_git_revision(local_path)` (section 5) resolves that path's current `HEAD`
-  commit — via `GitPython` (`git.Repo(local_path).head.commit.hexsha`, already a
-  project dependency since Day 1) or an equivalent `subprocess` call to
-  `git rev-parse HEAD`, implementer's choice. If `local_path` no longer exists, isn't
-  a Git repository, or Git isn't available, this reports the literal string
-  `"unavailable"` rather than crashing the run — provenance metadata failing to
-  resolve is not a reason to lose an otherwise-valid evaluation result.
+  commit via `GitPython` — `git.Repo(local_path, search_parent_directories=True)
+  .head.commit.hexsha` — the single selected implementation (finding 3), not left as
+  a choice between `GitPython` and a `subprocess` call. `search_parent_directories=
+  True` is required, not optional: `local_path` is frequently a nested subdirectory
+  of the actual git checkout (this project's own corpus, `.repos/terraform-aws-vpc/
+  examples/complete`, sits inside the `.repos/terraform-aws-vpc` clone), and without
+  it GitPython would only look for a `.git` directory directly inside `local_path`
+  itself, incorrectly reporting `"unavailable"` for every nested corpus this project
+  actually uses. `GitPython` is already a project dependency since Day 1's
+  `scripts/index_repo.py` — no new dependency is introduced. If `local_path` no
+  longer exists, has no enclosing Git repository at all, has zero commits, or
+  `GitPython` isn't importable, this reports the literal string `"unavailable"`
+  rather than crashing the run — provenance metadata failing to resolve is not a
+  reason to lose an otherwise-valid evaluation result.
   `EMBEDDING_MODEL` is imported from `ripple.llm.embeddings` (currently
   `"text-embedding-3-small"`), never re-typed as a string literal in `runner.py`, so
   it can't silently drift out of sync if the constant ever changes.
+- **`indexed_corpus_sha256`/`resource_count` are a separate fingerprint from
+  `git_revision`, and both are kept because they prove different things (finding
+  2).** `git_revision` describes what commit `local_path` has **checked out on
+  disk** right now — a fact about the filesystem. `indexed_corpus_sha256` and
+  `resource_count` (`_indexed_corpus_fingerprint`, section 5) describe what rows are
+  **actually stored in the database** under `repo_id` right now — a fact about the
+  database. These can genuinely diverge: `local_path` could be re-checked-out to a
+  different commit after indexing finished, the database could hold a stale or
+  partial index left over from an earlier, interrupted run, or someone could
+  re-index only part of the corpus by hand. Recording both closes that gap: a reader
+  of the report can tell not just "what commit exists on disk" but "what data these
+  specific numbers were actually computed against." The fingerprint is computed at
+  evaluation runtime, every run, from `db.fetch_resource_bodies(repo_id)`'s
+  `(address, body)` pairs only — never database row IDs, which are an
+  insertion-order artifact, not part of corpus identity — sorted by address (a total
+  order, since `resources` has a `UNIQUE (repo_id, address)` constraint) before
+  canonical-JSON serialization (`separators=(",", ":")`, no incidental whitespace)
+  and SHA-256 hashing. Sorting before serializing is what makes the hash identical
+  regardless of the order the database happens to return rows in; hashing `(address,
+  body)` and nothing else is what makes it change if either an address or a body
+  changes, and stay unchanged for anything else (row ID, insertion order, unrelated
+  columns).
 - **Every result row carries its own complete, serialized `RetrievalConfig`**
   (`dataclasses.asdict(result.config)`) — so a reader of the JSON file never has to
   cross-reference `ABLATION_CONFIGS`' current source code to know exactly what
@@ -846,11 +962,15 @@ invocation:
   serializes anything sourced from `.env` (`DATABASE_URL`, `OPENAI_API_KEY`). This is
   verified by a dedicated test (section 6, Day 10) that sets a fake secret in the
   environment and asserts it doesn't appear anywhere in a report built from fake data.
-- Tests (section 6, Day 10) also cover: deterministic hashing (same file bytes hashed
-  twice match; different content doesn't); correct `RetrievalConfig` serialization;
-  `_corpus_git_revision` against both a real temporary Git repo and a non-Git
-  directory; the collision-safe write behavior (finding 5); and that a three-config
-  run's report has exactly one file with three `results` entries.
+- Tests (section 6, Day 10) also cover: deterministic hashing of the benchmark file
+  (same file bytes hashed twice match; different content doesn't); correct
+  `RetrievalConfig` serialization; `_corpus_git_revision` against a real temporary
+  Git repo (including from a nested subdirectory inside it, finding 3), and a
+  non-Git directory; `_indexed_corpus_fingerprint`'s row-order independence,
+  address-change and body-change sensitivity, and correct `resource_count` (finding
+  2); the collision-safe write behavior and the first-write directory-creation
+  behavior (finding 5/6); and that a three-config run's report has exactly one file
+  with three `results` entries.
 
 ## 6. Day-by-day plan
 
@@ -888,12 +1008,16 @@ convention as every prior day — never a lookup by a real repo's name like
 `vpc-complete`, per section 3.3).
 
 **Manual acceptance command** (not a `pytest` test — section 3.3): after authoring all
-20 entries, verify them against the real, indexed corpus:
+20 entries, verify them against the real, indexed corpus, run via `"$PYTHON_BIN" -c
+"..."` or a scratch file (section 0):
 ```python
+from pathlib import Path
+
 from ripple.evaluation.dataset import load_benchmark, validate_addresses_exist
 
 REPO_ID = ...  # resolved per section 3.1, never hardcoded
-entries = load_benchmark("data/benchmark.json")
+entries = load_benchmark(Path("data/benchmark.json"))  # load_benchmark takes a Path,
+                                                         # never a bare string
 validate_addresses_exist(entries, REPO_ID)  # raises if anything is missing
 print(f"{len(entries)} entries, all addresses verified against repo_id={REPO_ID}")
 ```
@@ -940,8 +1064,10 @@ latency dicts and per-stage aggregate means — section 5), `score_question`/
 
 **Step 3** — `ripple/evaluation/runner.py`: `ConfigResult`, `run_benchmark`,
 `ABLATION_CONFIGS` (section 5, each entry now with `final_k=10` explicit per finding
-1/section 3.6), `_corpus_git_revision`, `build_report` (section 3.9 — assembles the
-provenance-carrying report, calling the new `db.fetch_repo`). `run_benchmark` calls
+1/section 3.6), `_corpus_git_revision` (finding 3 — GitPython,
+`search_parent_directories=True`), `_indexed_corpus_fingerprint` (finding 2),
+`build_report` (section 3.9 — assembles the provenance-carrying report, calling the
+new `db.fetch_repo`). `run_benchmark` calls
 `pipeline.run_pipeline` with no `embedder` override — every call uses the pipeline's
 own default, uncached `OpenAIEmbeddingProvider()` (section 3.7) — and passes the
 **full** `result.latency_json` mapping through to `score_question` unchanged
@@ -962,12 +1088,20 @@ current full capability). ~40 embedding requests, zero generation calls.
   raises for both `recall_at_k` and `precision_at_k`; empty `expected` raises for
   `recall_at_k`; `aggregate([])` raises; `aggregate_by_category` returns categories in
   sorted order regardless of input order; a mixed-category input produces correct
-  per-category means (hand-computed); **per-stage latency aggregation** (finding 2):
-  hand-computed `mean_latency_by_stage` across two sets of `QuestionResult`s whose
-  `latency` dicts have **different key sets** (one set all having only
-  `{"vector_query_ms", "total_ms"}`, another all having `{"vector_query_ms",
-  "bm25_ms", "fusion_ms", "total_ms"}`), confirming a stage absent from every input
-  dict stays absent from the aggregate, never backfilled with `0.0`.
+  per-category means (hand-computed); **per-stage latency aggregation** (finding 4):
+  hand-computed `mean_latency_by_stage` across a set of `QuestionResult`s whose
+  `latency` dicts all share the **same** key set (e.g. all having
+  `{"vector_query_ms", "bm25_ms", "fusion_ms", "total_ms"}`), confirming the mean is
+  correct for every key and that a key absent from that whole set (e.g.
+  `rerank_ms`) never appears in the aggregate, never backfilled with `0.0`;
+  `aggregate` **raises `ValueError`** when the input `QuestionResult`s have
+  **mismatched** `latency` key sets (e.g. one question's dict has `bm25_ms`, another
+  in the same call doesn't); two separate `aggregate()` calls, each internally
+  consistent but with **different** key sets from each other (simulating two
+  different `ABLATION_CONFIGS` entries), both succeed independently — proving the
+  consistency rule applies within one aggregate call, never across configs;
+  `aggregate_by_category` applies the same consistency check independently within
+  each category's own group of `QuestionResult`s.
 - `runner.py`: `run_benchmark` with `pipeline.run_pipeline` **monkeypatched** (module
   level, matching Day 6's established pattern for `test_pipeline.py`) to return
   canned `PipelineResult`s keyed by question — never a real database, never a real
@@ -989,18 +1123,40 @@ current full capability). ~40 embedding requests, zero generation calls.
   `OPENAI_API_KEY`/`DATABASE_URL` in the environment, builds a report from fake data,
   and asserts neither fake value appears anywhere in the serialized JSON string;
   `_corpus_git_revision` returns the real `HEAD` commit hash for a temporary
-  directory that **is** a real Git repo (created inside the test, e.g. `git init` plus
-  one commit in `tmp_path`) and returns `GIT_REVISION_UNAVAILABLE` for a `tmp_path`
-  that is **not** a Git repo.
+  directory that **is** a real Git repo — created inside the test via `git init` in
+  `tmp_path`, followed by **repository-local** identity configuration (`git config
+  user.name "Ripple Tests"` and `git config user.email "ripple-tests@example.invalid"`
+  run inside that temp repo, never relying on the developer machine's global Git
+  config, which may not be set at all in CI) and one commit; a **second test**
+  creates a subdirectory *inside* that same git-initialized `tmp_path` (e.g.
+  `tmp_path / "nested" / "subdir"`) and passes that nested path to
+  `_corpus_git_revision`, asserting it returns the **same** commit hash — the direct
+  test that `search_parent_directories=True` actually finds the enclosing repository
+  from a nested working path, matching this project's own corpus layout; and a
+  **third test** asserts `_corpus_git_revision` returns `GIT_REVISION_UNAVAILABLE`
+  for a `tmp_path` that is **not** a Git repo at all.
+- `runner.py` — `_indexed_corpus_fingerprint` (finding 2, offline: monkeypatches
+  `db.fetch_resource_bodies` to fixed fake `(id, address, body)` rows, no real
+  database): the same set of rows returned in **two different orders** produces the
+  **same** `indexed_corpus_sha256` (row-order independence); changing one row's
+  `body` (same address, same id) changes the hash; changing one row's `address`
+  (same body, same id) changes the hash; changing only a row's `id` (same address,
+  same body) does **not** change the hash (proving row IDs are correctly excluded);
+  `resource_count` equals the number of rows given; `build_report`'s assembled
+  report contains both `corpus.indexed_corpus_sha256` and `corpus.resource_count`.
 - `scripts/run_eval.py` — argument-parsing test (monkeypatch `run_benchmark` to a
   stub, assert the right `repo_id`/config selection reaches it); confirmation-gate
   test (declining the `y` prompt makes no calls to `run_benchmark` at all); **output
   test** (finding 5): a single-config run writes exactly one file whose `results`
   list has one entry, an all-three-configs run writes exactly one file whose
-  `results` list has three; **collision-safe write test** (finding 5): monkeypatching
-  the timestamp source to return the same value twice and asserting the second write
-  attempt raises `FileExistsError`, leaving the first file's content untouched — all
-  offline, no real API/DB.
+  `results` list has three; **first-write directory-creation test** (finding 6):
+  pointing the output path at a `tmp_path` subdirectory that does **not** exist yet,
+  running the write path, and asserting the directory is created, exactly one JSON
+  file is written inside it, and that file's contents parse back into the expected
+  top-level report keys (section 3.9); **collision-safe write test** (finding 5):
+  monkeypatching the timestamp source to return the same value twice and asserting
+  the second write attempt raises `FileExistsError`, leaving the first file's
+  content untouched — all offline, no real API/DB.
 - `tests/test_db.py` additions (finding 4): `fetch_resource_addresses` **integration**
   test against a temporary repo/resources setup created and torn down inside the test
   (DB-dependent, skip-if-unreachable, section 3.3); `fetch_repo` round-trip test —
@@ -1008,19 +1164,23 @@ current full capability). ~40 embedding requests, zero generation calls.
   local_path)`, and `fetch_repo` on a nonexistent id returns `None` (DB-dependent,
   skip-if-unreachable).
 
-**Acceptance**: `python -m pytest` passes (existing 123 plus this cycle's new tests —
-see section 10 for why an exact new total isn't quoted); one real, confirmed run of
-`scripts/run_eval.py --repo-id <resolved> --config "Vector + BM25 + RRF"` produces a
-real Recall@5/MRR row with full per-stage latency and provenance metadata
-(section 3.9), printed and saved to exactly one exclusively-created,
-microsecond-timestamped JSON file (section 3.8) containing that one `ConfigResult`,
-using the real, resolved `repo_id` (never `13` hardcoded anywhere in the command's
-own script — only ever passed as a CLI argument at invocation time).
+**Acceptance**: `"$PYTHON_BIN" -m pytest` (section 0) passes (existing 123 plus this
+cycle's new tests — see section 10 for why an exact new total isn't quoted); one
+real, confirmed run of `"$PYTHON_BIN" scripts/run_eval.py --repo-id <resolved>
+--config "Vector + BM25 + RRF"` produces a
+real Recall@5/MRR row with full per-stage latency and provenance metadata — including
+the indexed-corpus fingerprint (`indexed_corpus_sha256`/`resource_count`) and the
+Git revision, section 3.9 — printed and saved to exactly one exclusively-created,
+microsecond-timestamped JSON file (section 3.8, its parent directory created on
+first write per finding 6) containing that one `ConfigResult`, using the real,
+resolved `repo_id` (never `13` hardcoded anywhere in the command's own script — only
+ever passed as a CLI argument at invocation time).
 
 ### Day 11 — first three ablation rows
 
-**Step 1** — Run `scripts/run_eval.py --repo-id <resolved>` **without** `--config`
-(runs all three `ABLATION_CONFIGS` rows). **Confirm before this step** — ~120
+**Step 1** — Run `"$PYTHON_BIN" scripts/run_eval.py --repo-id <resolved>` (section 0)
+**without** `--config` (runs all three `ABLATION_CONFIGS` rows). **Confirm before
+this step** — ~120
 embedding requests total (3 configs × 40 questions, uncached — section 3.7), zero
 generation calls.
 
@@ -1043,9 +1203,10 @@ correctly.
 **Acceptance**: three real rows exist, all inside the single JSON report file that
 invocation produced (section 3.8 — a `--config`-less run always writes exactly one
 file containing all three `ConfigResult`s; there is no ambiguity about file count),
-each with full per-stage latency and provenance metadata (section 3.9), each number
-traceable to an actual run, and you can explain each row (section 11's own "Done
-when": "three rows exist and you can explain each one").
+each with full per-stage latency and provenance metadata — including the
+indexed-corpus fingerprint and Git revision, section 3.9 — each number traceable to
+an actual run, and you can explain each row (section 11's own "Done when": "three
+rows exist and you can explain each one").
 
 ## 7. Practical execution order (the actual collaboration loop)
 
@@ -1116,8 +1277,9 @@ verifiable in advance. This cycle adds **three new test files** (`test_dataset.p
 made during implementation (how many distinct edge cases `test_dataset.py` ends up
 covering, exactly how `test_runner.py`'s per-stage-latency and provenance tests are
 structured, etc.) — stating a precise number now would be a guess dressed up as a
-fact. What's verifiable in advance: `python -m pytest` must show **123 + (every new
-test this cycle adds)**, all passing, with zero regressions to the existing 123.
+fact. What's verifiable in advance: `"$PYTHON_BIN" -m pytest` (section 0) must show
+**123 + (every new test this cycle adds)**, all passing, with zero regressions to the
+existing 123.
 
 ## 11. Risks, ambiguities, and things flagged for your review
 
@@ -1198,6 +1360,28 @@ statement (finding 6, section 9); a full reproducibility-provenance schema with
 runtime Git-revision derivation and a new, justified `db.fetch_repo` helper (finding
 7, sections 3.9/4/5); and a full audit removing the stale references those findings
 identified while preserving every previously-approved decision (finding 8).
+
+**This revision additionally resolves Codex's 6 follow-up findings** on top of the
+data/eval_results/ directory-creation fix that preceded them: consistent
+`"$PYTHON_BIN"`-based Python invocation everywhere in the plan, replacing every bare
+`python`/`python3` reference and the false claim that bare `python -m pytest` is
+portable (finding 1, section 0 and throughout); an `indexed_corpus_sha256`/
+`resource_count` fingerprint of the database rows actually indexed under `repo_id`,
+distinct from and complementary to `corpus.git_revision`, computed via
+`_indexed_corpus_fingerprint` from `db.fetch_resource_bodies` with row-order-
+independent, address/body-sensitive canonical hashing (finding 2, section 3.9/5);
+`_corpus_git_revision` changed to the single selected `GitPython` implementation
+with `search_parent_directories=True` so nested `local_path` corpora (this project's
+own included) resolve correctly, plus a repo-local Git identity and a nested-
+subdirectory test (finding 3, sections 3.9/5/6); `aggregate`/`aggregate_by_category`
+changed from silently averaging over whichever questions happened to share a latency
+key to **raising `ValueError`** on any latency-key mismatch within one aggregate,
+computing every stage's mean over all questions once consistency is confirmed
+(finding 4, section 3.6/5); the manual acceptance command and `run_eval.py` sketch
+fixed to pass `load_benchmark` a `Path`, never a bare string (finding 5, sections
+3.4/6); and an explicit offline test proving the output parent directory is created
+on first write and exactly one correctly-structured report file results (finding 6,
+section 6).
 
 Everything else in this plan follows directly from SPEC.md's literal text or from
 this project's own established conventions (Days 1–7). Day 8 can begin.
