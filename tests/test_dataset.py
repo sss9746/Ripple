@@ -1,4 +1,5 @@
 import json
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -233,3 +234,15 @@ def test_validate_addresses_exist_reports_every_missing_pair(
     assert "q001: aws_subnet.missing" in message
     assert "q002: aws_db_instance.missing" in message
     assert "aws_vpc.main" not in message
+
+
+def test_real_benchmark_has_balanced_category_mix() -> None:
+    benchmark_path = Path(__file__).parents[1] / "data" / "benchmark.json"
+    entries = load_benchmark(benchmark_path)
+    counts = Counter(entry.category for entry in entries)
+
+    assert len(entries) == 40
+    assert counts["lookup"] >= 12
+    assert counts["relational"] >= 8
+    assert counts["blast_radius"] >= 6
+    assert counts["attribute"] >= 5

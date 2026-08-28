@@ -140,5 +140,135 @@
     "question": "Which blocks contain at least one private_dns_enabled = true setting?",
     "expected": ["module.vpc_endpoints"],
     "category": "attribute"
+  },
+  {
+    "id": "q021",
+    "question": "Which data block defines the generic VPC endpoint policy?",
+    "expected": ["data.aws_iam_policy_document.generic_endpoint_policy"],
+    "category": "lookup"
+  },
+  {
+    "id": "q022",
+    "question": "Which output exposes the CIDR blocks of the public subnets?",
+    "expected": ["output.public_subnets_cidr_blocks"],
+    "category": "lookup"
+  },
+  {
+    "id": "q023",
+    "question": "Which output exposes the database subnet group name?",
+    "expected": ["output.database_subnet_group_name"],
+    "category": "lookup"
+  },
+  {
+    "id": "q024",
+    "question": "Which output exposes the ARN of the Internet Gateway?",
+    "expected": ["output.igw_arn"],
+    "category": "lookup"
+  },
+  {
+    "id": "q025",
+    "question": "Which output exposes the DHCP options ID?",
+    "expected": ["output.dhcp_options_id"],
+    "category": "lookup"
+  },
+  {
+    "id": "q026",
+    "question": "Which output exposes the default VPC ID?",
+    "expected": ["output.default_vpc_id"],
+    "category": "lookup"
+  },
+  {
+    "id": "q027",
+    "question": "Which output exposes the full collection of created VPC endpoints?",
+    "expected": ["output.vpc_endpoints"],
+    "category": "lookup"
+  },
+  {
+    "id": "q028",
+    "question": "What block does the generic endpoint policy directly depend on?",
+    "expected": ["module.vpc"],
+    "category": "relational"
+  },
+  {
+    "id": "q029",
+    "question": "What block does output.natgw_ids directly depend on?",
+    "expected": ["module.vpc"],
+    "category": "relational"
+  },
+  {
+    "id": "q030",
+    "question": "What block does output.elasticache_subnet_group directly depend on?",
+    "expected": ["module.vpc"],
+    "category": "relational"
+  },
+  {
+    "id": "q031",
+    "question": "What block does output.vpc_endpoints directly depend on?",
+    "expected": ["module.vpc_endpoints"],
+    "category": "relational"
+  },
+  {
+    "id": "q032",
+    "question": "What block does output.vpc_endpoints_security_group_arn directly depend on?",
+    "expected": ["module.vpc_endpoints"],
+    "category": "relational"
+  },
+  {
+    "id": "q033",
+    "question": "What is directly affected if the generic endpoint policy is removed?",
+    "expected": [
+      "data.aws_iam_policy_document.generic_endpoint_policy",
+      "module.vpc_endpoints"
+    ],
+    "category": "blast_radius"
+  },
+  {
+    "id": "q034",
+    "question": "What is directly affected if module.vpc_endpoints_nocreate is removed?",
+    "expected": ["module.vpc_endpoints_nocreate"],
+    "category": "blast_radius"
+  },
+  {
+    "id": "q035",
+    "question": "What is directly affected if output.nat_public_ips is removed?",
+    "expected": ["output.nat_public_ips"],
+    "category": "blast_radius"
+  },
+  {
+    "id": "q036",
+    "question": "What is directly affected if output.dhcp_options_id is removed?",
+    "expected": ["output.dhcp_options_id"],
+    "category": "blast_radius"
+  },
+  {
+    "id": "q037",
+    "question": "Which blocks contain the exact reference module.vpc.vpc_cidr_block?",
+    "expected": [
+      "aws_security_group.rds",
+      "module.vpc_endpoints",
+      "output.vpc_cidr_block"
+    ],
+    "category": "attribute"
+  },
+  {
+    "id": "q038",
+    "question": "Which blocks contain the exact reference module.vpc.private_subnets?",
+    "expected": [
+      "module.vpc_endpoints",
+      "output.private_subnets"
+    ],
+    "category": "attribute"
+  },
+  {
+    "id": "q039",
+    "question": "Which block explicitly enables both a NAT gateway and single-NAT-gateway mode?",
+    "expected": ["module.vpc"],
+    "category": "attribute"
+  },
+  {
+    "id": "q040",
+    "question": "Which block defines services for both ecr.api and ecr.dkr?",
+    "expected": ["module.vpc_endpoints"],
+    "category": "attribute"
   }
 ]
