@@ -718,6 +718,10 @@ def main(argv=None):
         results=results,
     )
     path = timestamped_path()             # UTC, microsecond precision -- section 3.8
+    path.parent.mkdir(parents=True, exist_ok=True)  # data/eval_results/ does not exist
+                                                     # yet -- git doesn't track empty
+                                                     # directories -- create it, idempotently,
+                                                     # before the exclusive-create open below
     with path.open("x") as f:             # exclusive create -- raises FileExistsError
         json.dump(report, f, indent=2, default=dataclasses.asdict)  # rather than overwriting (finding 5)
     print(f"Wrote {path}")
@@ -747,13 +751,18 @@ def main(argv=None):
   `data/eval_results/2026-08-28T14-30-00-123456Z.json`) — **microsecond** precision,
   not second precision, because two runs started in quick succession (e.g. a Day 11
   re-run immediately after fixing a bug, per section 6's Step 3) could otherwise
-  collide on the same second-precision filename. The file is opened with Python's
-  **exclusive-create mode** (`path.open("x")`) — which *raises* `FileExistsError`
-  rather than silently truncating/overwriting an existing file — so even a genuine
-  timestamp collision fails loudly instead of quietly destroying a prior run's
-  evidence. `data/eval_results/` is **not** gitignored — it's a normal, tracked
-  directory — but writing the file and committing it are two separate, deliberate
-  actions, not one:
+  collide on the same second-precision filename. **`data/eval_results/` does not
+  exist in the repository yet** — git doesn't track empty directories, and nothing
+  has been committed into it before — so `scripts/run_eval.py` must create it before
+  its first write: `path.parent.mkdir(parents=True, exist_ok=True)`, called every
+  run, immediately before opening the file (idempotent — a no-op on every run after
+  the first, once the directory and any committed results already exist). The file
+  itself is then opened with Python's **exclusive-create mode** (`path.open("x")`) —
+  which *raises* `FileExistsError` rather than silently truncating/overwriting an
+  existing file — so even a genuine timestamp collision fails loudly instead of
+  quietly destroying a prior run's evidence. Once it exists, `data/eval_results/` is
+  **not** gitignored — it's a normal, tracked directory — but writing the file and
+  committing it are two separate, deliberate actions, not one:
   - `scripts/run_eval.py` only ever **writes the file to disk**. It never runs `git
     add`/`git commit` itself, and every run produces a file whether the results turn
     out to be exactly what was expected or not.
