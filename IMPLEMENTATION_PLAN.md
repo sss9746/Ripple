@@ -1,699 +1,791 @@
-# Implementation Plan — Day 7: Buffer and Consolidation
+# Implementation Plan — Days 8–11: Benchmark and First Ablation Rows
 
 ## 0. Process note for this cycle
 
-Same as Days 5–6: **`SPEC.md` is read-only.** Nothing below proposes editing it.
+**`SPEC.md` is read-only**, same as every prior cycle. If anything below runs into a
+genuine SPEC ambiguity or apparent bug, it is flagged in section 11, never silently
+resolved by editing `SPEC.md`.
 
-This cycle is smaller and different in character from Days 1–6: SPEC.md's own Day 7
-is a **buffer day**, not a new-feature day. Section 11 says, verbatim: "Absorb
-slippage from Days 2 and 4. If on schedule: tests for the parser, reference
-extractor, and tokenizer. **Done when:** everything from Week 1 runs from a clean
-`docker compose up` plus one script."
+This is a **consolidated plan covering four SPEC.md days** (8, 9, 10, 11) in one
+document, because they form one continuous arc — build the benchmark (8, 9), build the
+machinery to score it (10), then use that machinery to produce the first real numbers
+(11) — and the design decisions for one day constrain the others. The **execution
+stays incremental**: one small step at a time, you decide who implements each step
+(you or Codex), test and review before the next step, and commit at the end of each
+completed day rather than one giant commit at the end. Section 7 lays out that
+step-by-step order explicitly.
 
-This plan takes that literally rather than manufacturing busywork: it (1) closes the
-one piece of real, explicitly-flagged technical debt this project has actually
-accumulated, (2) adds a small number of *genuinely missing* regression tests for the
-parser and reference extractor — not padding, since both are already well-covered —
-and (3) actually verifies the "clean `docker compose up`" claim, which **no prior
-day's acceptance check has ever done**, because every prior day's manual check ran
-against the real Supabase-backed database (see section 3).
+**Two-level explanations.** Several ideas here (Recall@k, MRR, why embeddings still
+cost money without "asking" anything) get both a **Simple version** (plain language,
+no jargon) and a **Technical version** (precise, matches SPEC.md's formulas) — both
+because you asked for it explicitly, and because getting these exactly right matters
+more here than in any prior cycle: this is the day the project's actual deliverable
+(measured numbers) starts existing.
 
 ## 1. Objective
 
-Absorb the one real piece of deferred technical debt on the books
-(`PgVectorStore.query`'s missing `k <= 0` guard, explicitly flagged in Day 6's
-review as "worth fixing at the source eventually; not done here"), add two small,
-targeted regression tests closing genuine gaps in parser and reference-extractor
-coverage, and — for the first time in this project — actually prove the system
-reproduces from a clean `docker compose up` using the local `pgvector/pgvector:pg16`
-fallback, not the Supabase instance every prior day's checks have quietly relied on.
+Build the 40-question labeled benchmark (Days 8–9), the machinery to score any
+`RetrievalConfig` against it — metrics, a runner, `scripts/run_eval.py` (Day 10) — and
+use that machinery to produce the first three real, honestly-measured ablation rows
+(Day 11): Vector only, Vector + BM25 (no RRF), Vector + BM25 + RRF.
 
-This is SPEC.md's Day 7 milestone, sitting on top of Day 1–6, all already
-implemented and verified (119 passing tests as of Day 6, commit `3400ff5`).
+This sits on top of Days 1–7, all implemented and verified (123 passing tests,
+`docker compose` reproducibility confirmed). Days 12 (reranking), 13 (graph
+expansion), and 15 (query rewriting) are **not** touched — this plan explicitly stops
+short of them (section 8, section 9).
 
 ## 2. Relevant SPEC.md requirements
 
-- Section 11, Day 7: "Absorb slippage from Days 2 and 4. If on schedule: tests for
-  the parser, reference extractor, and tokenizer. **Done when:** everything from
-  Week 1 runs from a clean `docker compose up` plus one script."
-- Section 4 (Stack): "Docker Compose — local pgvector/pgvector:pg16 fallback — same
-  `schema.sql`, same `DATABASE_URL` var, so `docker compose up` alone still
-  reproduces the system from scratch without a Supabase or Pinecone account." This
-  is the literal claim section 8's "Done when" is checking — see section 3 for why
-  it has never actually been exercised.
-- Section 12 (Risk register) named Days 2 and 4 as the two likely slippage sources
-  when SPEC.md was written, before implementation started: "HCL line numbers (Day
-  2)" and (implicitly, via the reference-extraction regex) Day 4's `REF_RE`. Both
-  did in fact need real fixes — but those fixes already happened, during Day 2's and
-  Day 4's *own* review cycles, not left outstanding. See section 3 for what's
-  actually still open versus what's already closed.
+- **Section 10.1 (Dataset format)**, quoted in full:
+  ```json
+  [
+    {
+      "id": "q001",
+      "question": "Which resource creates the NAT gateway?",
+      "expected": ["aws_nat_gateway.this"],
+      "category": "lookup"
+    },
+    {
+      "id": "q002",
+      "question": "What breaks if I delete the worker security group?",
+      "expected": ["aws_security_group.worker", "aws_instance.node"],
+      "category": "blast_radius"
+    }
+  ]
+  ```
+  > Categories: `lookup` (one specific block), `relational` (depends-on questions),
+  > `blast_radius` (what references this), `attribute` (which blocks have property X).
+  >
+  > Aim for roughly 15 lookup, 10 relational, 8 blast radius, 7 attribute. Blast
+  > radius and relational questions are where graph expansion earns its row in the
+  > table — if the benchmark is all lookups, graph expansion will show no gain and the
+  > ablation is uninformative.
+  >
+  > **Every `expected` address must exist in the `resources` table.** Write a
+  > validator that checks this and run it as part of the test suite. A typo'd address
+  > silently caps your Recall at less than 100% and you will spend a day debugging
+  > retrieval that works fine.
+  - **`q002`'s worked example is load-bearing for this plan's labeling policy** (section
+    3.2): note that `expected` includes `aws_security_group.worker` *itself*, alongside
+    `aws_instance.node` (the thing that references it). This is the only worked
+    example SPEC.md gives for a non-`lookup` category, and it directly resolves one of
+    this plan's required decisions.
+- **Section 10.2 (Metrics)**, quoted in full:
+  ```python
+  def recall_at_k(expected, retrieved, k):
+      top = set(retrieved[:k])
+      return len(top & set(expected)) / len(expected)
 
-## 3. Current implementation gaps — an honest accounting, not a mirror of section 2
+  def precision_at_k(expected, retrieved, k):
+      top = retrieved[:k]
+      return sum(1 for a in top if a in set(expected)) / k
 
-**What SPEC.md named as likely Day 2/4 slippage is already closed**, not deferred:
-- Day 2's line-range/heredoc/comment handling was hardened through its own review
-  cycle (`tests/test_parser.py`'s `test_heredoc_comment_and_string_braces_do_not_end_block_early`,
-  `test_block_bodies_match_exact_source_lines`, etc.) before Day 2 was ever marked
-  done.
-- Day 4's `REF_RE` had a real bug (the list-bracket-swallowing issue) caught and
-  fixed during Day 4's own review, with regression tests
-  (`test_does_not_include_surrounding_list_bracket`,
-  `test_preserves_balanced_reference_index`) already in `tests/test_references.py`.
+  def reciprocal_rank(expected, retrieved):
+      for i, a in enumerate(retrieved, start=1):
+          if a in set(expected):
+              return 1.0 / i
+      return 0.0
+  ```
+  > Report the mean across all questions. MRR is the mean of `reciprocal_rank`.
+  >
+  > Also record per-stage latency in milliseconds: rewrite, vector_query, hydrate
+  > (Pinecone only...), bm25, fusion, rerank, graph, total.
+- **Section 10.3 (The ablation table)**:
+  ```
+  | Configuration | Recall@5 | Recall@10 | MRR | P@5 | Latency (ms) |
+  |---|---|---|---|---|---|
+  | Vector only | | | | | |
+  | Vector + BM25 | | | | | |
+  | Vector + BM25 + RRF | | | | | |
+  | + Cross-encoder rerank | | | | | |
+  | + Graph expansion | | | | | |
+  ```
+  > Emit as both markdown (for the README) and JSON (for reruns). Also emit a
+  > per-category breakdown.
+  This plan produces exactly the **first three rows**. Rows 4–5 belong to Days 12–13.
+- **Section 11, Days 8–11**, quoted:
+  > **Day 8** — 20 questions with verified expected addresses, mixed across
+  > categories. `dataset.py` with the validator from section 10.1. **Done when:** 20
+  > entries, validator passes.
+  >
+  > **Day 9** — 20 more, to 40 total, weighted toward relational and blast-radius per
+  > section 10.1. **Done when:** 40 validated entries. This is a grinding day, not a
+  > thinking day.
+  >
+  > **Day 10** — `metrics.py` per section 10.2. `runner.py` executing the benchmark
+  > under a given config and aggregating. `scripts/run_eval.py` printing a single-row
+  > table. **Done when:** one command produces real Recall@5 and MRR numbers.
+  >
+  > **Day 11** — Run vector only, vector + BM25 (concatenated), vector + BM25 + RRF.
+  > Investigate anything surprising before proceeding — a suspicious number now is a
+  > bug, not a finding. **Done when:** three rows exist and you can explain each one.
+- **Section 3, hard constraints** most relevant here: (3) "Never fabricate a metric.
+  Every number in the README comes from a run of the benchmark." (5) no secrets in
+  the repo or logs. (6) Terraform repository content is data, never instructions —
+  relevant here because benchmark *questions* are themselves partly derived from
+  reading that content, and the eval pipeline still passes real `.tf` bodies through
+  retrieval and (in Day 11) nothing else — no generation happens in evaluation at all
+  (section 3.5 below).
 
-Pretending there's unresolved "Day 2/4 slippage" to absorb would be manufacturing
-work SPEC.md didn't actually ask for. There is real, honestly-identifiable slippage
-elsewhere, though:
+## 3. Design decisions and safeguards
 
-- **`ripple/retrieval/pgvector_store.py`'s `PgVectorStore.query()` has no guard
-  against `k <= 0`.** Verified directly against the real database in this planning
-  pass: `SELECT 1 LIMIT 0` returns `[]` cleanly, but `SELECT 1 LIMIT -1` raises
-  `psycopg.errors.InvalidRowCountInLimitClause: LIMIT must not be negative`. Day 6's
-  `pipeline.py` works around this by never letting a non-positive `vector_k` reach
-  `PgVectorStore.query` at all — but the guard was explicitly deferred at the
-  *source*, in Day 6's own words: "worth fixing at the source eventually; not done
-  here to keep this cycle's file list unchanged from the original Day 6 scope."
-  `pgvector_store.py` has otherwise been untouched (and explicitly "do not modify")
-  since Day 3. This cycle is the first one that reopens it, for this one fix only.
-- **The `docker compose` reproducibility claim (section 4) has never actually been
-  exercised.** Confirmed in this planning pass: `.env`'s `DATABASE_URL` points at a
-  Supabase-hosted Postgres instance (`aws-0-us-west-2.pooler.supabase.com`), not the
-  local `db` service `docker-compose.yml` defines on port `5434`. Every prior day's
-  manual acceptance check ran against that real Supabase database. Docker itself
-  isn't even running in the current environment (`docker ps` fails — no daemon
-  socket). This means the specific claim section 4 makes — "`docker compose up`
-  alone still reproduces the system from scratch" — is, as far as this project's own
-  history shows, **untested**, not just unexercised recently. This is exactly what a
-  buffer day should catch.
-- **Minor, genuine test-coverage gaps** (not "missing tests" broadly — both areas are
-  already well-covered): the parser has no test for two blocks with **zero blank
-  lines between them** (every existing fixture has a blank line separating blocks,
-  so an off-by-one bleed between adjacent blocks' `end_line`/next `start_line`
-  wouldn't be caught); the reference extractor has no test for a **chained
-  bracket-then-attribute** reference (`aws_instance.node[0].id` — an index access
-  *followed by* a further attribute access), which is precisely the shape Day 4's
-  `REF_RE` fix was about and deserves one more concrete regression case beyond what
-  `test_preserves_balanced_reference_index` already covers (`module.vpc.private_subnets[0]`,
-  which ends at the bracket rather than continuing past it).
-- **The BM25 tokenizer needs no additional tests this cycle.** `tests/test_bm25.py`
-  already has 20 tests covering casing, hyphens, short-part filtering, consecutive
-  delimiters, terraform-syntax separators, the section-0a duplication fix, and
-  `embed_text`-shaped multi-token strings. Padding this further would be busywork,
-  not consolidation — noted explicitly so its absence from this plan isn't mistaken
-  for an oversight.
+This section is long on purpose — these are the decisions that make Days 8–11
+internally consistent, and getting them wrong here means redoing benchmark authoring
+later, which is the expensive kind of mistake.
 
-## 4. Exact files Codex (or you) should create or modify
+### 3.1 The benchmark corpus and `repo_id`
+
+**Simple version:** the 40 questions are about one specific, fixed Terraform codebase
+(`examples/complete`). But *where that codebase's data lives in the database*
+(`repo_id`) can be different on your machine than on Codex's, or after a re-index — so
+the questions themselves never mention a database ID, only Terraform addresses like
+`aws_vpc.main`. Whoever *runs* the benchmark tells the tool which `repo_id` to check
+against, every time.
+
+**Technical version:** `data/benchmark.json` entries contain no `repo_id` field at
+all — only `id`, `question`, `expected` (Terraform addresses), `category`. Both
+`ripple/evaluation/dataset.py`'s validator and `ripple/evaluation/runner.py`'s runner
+accept `repo_id` as a **runtime parameter** (a function argument, ultimately surfaced
+as a required `--repo-id` CLI flag on `scripts/run_eval.py`). It is never
+hardcoded into application code, tests, or the benchmark file.
+
+The corpus itself: `.repos/terraform-aws-vpc/examples/complete` — 114 indexed blocks,
+already verified end-to-end through Day 7 (parsing, embedding, edges, BM25, fusion,
+logging all confirmed working against it). In the current Supabase database this
+happens to be `repo_id = 13`, **but this number is environment-specific** — it
+depends on insertion order and which database you're pointed at (recall Day 1: this
+project's actual working `DATABASE_URL` is a Supabase instance, not the local
+`docker-compose` fallback). Any command in this plan that shows `--repo-id 13` is
+illustrative only; resolve the real value independently in your own environment:
+```python
+from ripple import db
+with db.get_connection() as conn, conn.cursor() as cur:
+    cur.execute("SELECT id FROM repos WHERE name = 'vpc-complete' ORDER BY id DESC LIMIT 1")
+    print(cur.fetchone())
+```
+(`ORDER BY id DESC LIMIT 1` — same Day 7 lesson: repo names aren't unique, so always
+take the most recent match rather than assuming exactly one row.)
+
+### 3.2 Labeling policy — precise and non-negotiable once set
+
+This is the single most important decision in this plan to get right and get
+consistent, because 40 hand-authored questions with an inconsistent policy produces
+a benchmark that silently measures the wrong thing.
+
+**What goes in `expected`, per category:**
+
+- **`lookup`** — "which resource does X." `expected` is exactly the block(s) that
+  directly answer the question — normally **one address**. SPEC's own framing
+  (section 1: "Ground truth is cheap... one correct answer a human can verify in
+  seconds") is the design target: write lookup questions so they have exactly one
+  correct answer. There is no separate "subject" here — the answer *is* the lookup
+  target.
+- **`blast_radius`** — "what breaks if I delete/change X" / "what references X."
+  **`expected` = {the subject block itself} ∪ {every block that directly references
+  it}.** This is not a guess — it is exactly what SPEC's own worked example does:
+  `q002` asks about `aws_security_group.worker` and its `expected` list is
+  `["aws_security_group.worker", "aws_instance.node"]` — the subject *and* its
+  dependent, both included. The reasoning generalizes cleanly: if you delete X, X
+  itself is gone (it "breaks" in the most literal sense) *and* everything that
+  pointed at X breaks too. Retrieval-wise: `graph.dependents(subject_id)` gives the
+  "everything that references it" half; the subject's own row is the other half.
+- **`relational`** — "what does X depend on." **`expected` = the block(s) X directly
+  references — `graph.dependencies(subject_id)` — and does *not* include the subject
+  itself.** SPEC gives no worked example for this category, so this is a genuine
+  judgment call, made explicitly rather than left ambiguous: "what does X depend on"
+  is not naturally answered by "X" (a thing doesn't "depend on itself"), unlike
+  `blast_radius`'s inclusive "what breaks" framing. This is also the choice that
+  keeps the category meaningful for measurement — if the subject (already named in
+  the question text) were always in `expected`, a retrieval method that does nothing
+  smarter than matching the literally-named address would get partial credit without
+  doing any actual relational reasoning, which is exactly the signal `relational`
+  and `blast_radius` exist to isolate (SPEC: "Blast radius and relational questions
+  are where graph expansion earns its row"). **This asymmetry between the two
+  categories is deliberate and should be stated explicitly wherever the labeling
+  policy is documented** (a code comment at the top of `data/benchmark.json`'s
+  authoring notes, or `dataset.py`'s docstring) so it's never "fixed" into
+  inconsistency later by someone assuming both categories work the same way.
+- **`attribute`** — "which blocks have property X" (e.g., "which security groups
+  allow inbound traffic on port 22?"). **`expected` = every block in the corpus that
+  actually has that property — exhaustively, not just one example remembered from
+  skimming the file.** This is the category most at risk of a silently-wrong
+  denominator: SPEC's `recall_at_k` formula divides by `len(expected)`, so an
+  *incomplete* `expected` set doesn't just under-count — it can make recall look
+  artificially perfect if retrieval happens to return exactly the (incomplete) set
+  you wrote down. Section 3.4's address-inventory workflow exists largely because of
+  this category — you cannot write a correct `attribute` question without actually
+  querying/grepping the whole corpus for every match, not recalling one from memory.
+
+**Duplicate-address rule**: the *same* address may legitimately appear in `expected`
+across *different* questions (e.g., `aws_vpc.main` can be the answer to a `lookup`
+question and also appear inside a `blast_radius` question's `expected` set for a
+different subject) — that's normal and expected. What must never happen is a
+duplicate address *within one entry's own* `expected` list (`["aws_vpc.main",
+"aws_vpc.main"]`) — that is always a copy-paste bug, and section 3.3's structural
+validator rejects it.
+
+### 3.3 Two kinds of validation, kept explicitly separate
+
+**Structural validation** (`ripple/evaluation/dataset.py`, pure, offline, no database,
+no `OPENAI_API_KEY`):
+- The file is a JSON array (matching section 10.1's literal format — not an object
+  wrapper).
+- Every entry has `id` (non-empty string, matching the `q\d{3}` convention SPEC's own
+  examples use, and **unique** across the file), `question` (non-empty string),
+  `category` (one of exactly `lookup`/`relational`/`blast_radius`/`attribute`), and
+  `expected` (a non-empty list of non-empty strings, no duplicate address within the
+  same entry — section 3.2).
+- Fails loudly, identifying the offending entry by `id` and index, never silently
+  drops or "fixes" a malformed entry.
+
+**Database validation** (`ripple/evaluation/dataset.py`, needs a real `repo_id` and a
+reachable database — the direct implementation of SPEC 10.1's required validator):
+- Every address in every entry's `expected` list exists in `resources.address` for
+  the given `repo_id`. Reports *every* missing `(entry_id, address)` pair in one pass,
+  not just the first — 40 questions means typos are likely, and fixing them one
+  test-run at a time would be exactly the "spend a day debugging retrieval that works
+  fine" trap SPEC.md warns about.
+
+**Semantic verification — a required human/Codex process step, not something
+`dataset.py` can check automatically:** confirming an address *exists* in the
+database is not the same as confirming the *question and its `expected` answer are
+actually true of the real code*. Before adding any entry to `data/benchmark.json`,
+whoever authors it must open the real source at that block's `file_path`/
+`start_line`/`end_line` (or read its `body` straight from `db.fetch_resource_bodies`)
+and confirm the question's premise genuinely holds — not "does this address exist"
+but "does this Terraform block actually do/reference/have what the question claims."
+This is a checklist item for every single entry (section 6, Day 8/9 steps), not a
+unit test — there is no automated way to check semantic truth without a second LLM
+judge, which is out of scope and not requested.
+
+### 3.4 Address-inventory workflow (for authoring, not application code)
+
+Writing 40 accurate questions means being able to answer, quickly and correctly:
+"what addresses exist," "what does X reference," "what references X," and "which
+blocks actually have property Y" — all against the real, indexed corpus. These are
+**one-off authoring aids**, not new production code — no new script or module is
+proposed for this; every one of the following reuses functions that already exist
+(plus the one new `db.py` function in section 4). Run these directly in a `python3`
+REPL or scratch file while authoring, substituting the real `repo_id` from section
+3.1:
+
+```python
+from ripple import db
+from ripple.retrieval import graph
+
+REPO_ID = ...  # resolved per section 3.1, never hardcoded in committed files
+
+# 1. Every indexed address for this repo (new db.py function, section 4):
+addresses = db.fetch_resource_addresses(REPO_ID)
+
+# 2. address -> id map, needed because graph.dependents/dependencies take an id:
+by_address = {addr: rid for rid, addr, body in db.fetch_resource_bodies(REPO_ID)}
+by_id_body = {rid: body for rid, addr, body in db.fetch_resource_bodies(REPO_ID)}
+
+# 3. What references aws_security_group.rds (candidate blast_radius subject):
+subject_id = by_address["aws_security_group.rds"]
+[n.address for n in graph.dependents(subject_id)]
+
+# 4. What aws_security_group.rds itself references (candidate relational subject):
+[n.address for n in graph.dependencies(subject_id)]
+
+# 5. Read the real body before writing/confirming a question about it:
+print(by_id_body[subject_id])
+```
+For `attribute` questions specifically: **grep the real `.tf` files directly**
+(`grep -rn "ingress" .repos/terraform-aws-vpc/examples/complete/`, or scan
+`db.fetch_resource_bodies`'s `body` field for every row) rather than relying on
+memory of what you skimmed earlier — this is the exhaustiveness check section 3.2
+requires.
+
+### 3.5 Evaluation stays independent of answer generation
+
+**Simple version:** grading the benchmark only checks "did the search find the right
+Terraform blocks," never "did the AI write a good sentence about them." So the eval
+code never has to actually ask the AI to write an answer — it just runs the search
+part and checks the results, which is much cheaper and faster.
+
+**Technical version:** `ripple/evaluation/runner.py` calls `pipeline.run_pipeline(
+repo_id, question, config)` and reads `result.blocks` (comparing `[block.address for
+block in result.blocks]` against `entry.expected`) and `result.latency_json[
+"total_ms"]`. **It never calls `ripple.llm.generate.answer_question` anywhere.** This
+is a hard requirement, verified by a dedicated test (section 6, Day 10) that fails
+loudly if `answer_question` is ever invoked during a benchmark run — protecting
+against exactly the "40 or 120 unnecessary generation calls" risk named in the
+request.
+
+This does **not** mean evaluation is free: every config in this plan has
+`use_vector=True`, and the vector stage still needs to turn the question text into an
+embedding to compare against stored vectors — that's a **retrieval** step (finding
+the right blocks), completely separate from **generation** (writing a natural-language
+answer about them). BM25 needs no embeddings at all (pure lexical matching); RRF/
+fusion needs no API calls either (pure math over already-retrieved lists). So: every
+question, under every one of this plan's three configs, costs exactly one embedding
+request if not for the caching decision in section 3.7 — which is precisely why that
+section exists.
+
+### 3.6 Metrics — exact formulas, explicit edge-case policy
+
+`ripple/evaluation/metrics.py` reproduces SPEC 10.2's three functions **exactly**
+for every valid input, plus explicit, documented behavior for the inputs SPEC's
+snippet doesn't address (rather than letting Python's own exceptions or slicing
+semantics decide silently — the same posture every prior day in this project has
+taken toward numeric edge cases):
+
+| Condition | Behavior | Why |
+|---|---|---|
+| `k <= 0` in `recall_at_k`/`precision_at_k` | raise `ValueError` | `retrieved[:k]` with negative `k` is Python's negative-slice reinterpretation (the exact bug class Day 6 fixed in `pipeline.py`) — never let it happen silently here either. |
+| `expected == []` in `recall_at_k` | raise `ValueError` | SPEC's formula divides by `len(expected)`; zero has no sensible "recall against nothing" reading. In practice this should never occur — section 3.3's structural validator requires non-empty `expected` for every entry — this guard is defense in depth, not an expected runtime path. |
+| `retrieved` has fewer than `k` items | no special case | `retrieved[:k]` naturally returns what's there; SPEC's formula already handles this correctly as written. |
+| No matches at all | no special case | All three functions already return `0.0` correctly per SPEC's own formulas — nothing to add. |
+| Aggregating an empty list of `QuestionResult`s | raise `ValueError` | mirrors the same "undefined, not zero" policy as the `expected == []` case; should never occur given 40 real entries, defense in depth again. |
+| Per-category breakdown | grouped by `category`, categories emitted in **sorted order** | deterministic output — two runs over the same data always print categories in the same order. |
+
+`retrieved` must always be the address list **in pipeline rank order** —
+`[block.address for block in result.blocks]`, never re-sorted — since both
+`reciprocal_rank` and every `top-k` slice depend on order being preserved exactly as
+the pipeline produced it.
+
+### 3.7 Cost and runtime — inspected, not assumed
+
+**Simple version:** asking the AI "what does this text mean as a vector of numbers"
+(an embedding) costs a little money each time. If we ran all 40 questions through
+all 3 configurations in Day 11 without thinking about it, that's 120 separate
+"what does this mean" calls for the *same 40 questions* asked 3 times over — wasteful,
+since the question text doesn't change between configurations. So the same
+embedding is computed once per question and reused for all 3 configurations.
+
+**Technical version, and the actual inspection this section is asking for:**
+`pipeline.run_pipeline(repo_id, question, config, embedder=None)` already accepts an
+injectable `embedder` parameter (built in Day 3, unchanged since) — this plan uses
+that **existing** injection point rather than changing `pipeline.py` at all.
+`ripple/evaluation/runner.py` defines a small `CachingEmbeddingProvider` (wraps any
+`EmbeddingProvider`, memoizes `.embed()` by exact input text) and constructs **one**
+instance per `run_eval` invocation, passed into every `run_pipeline` call across every
+config for the same benchmark run. Since embeddings only depend on question text —
+never on which `RetrievalConfig` subsequently uses them — this is a pure cost
+optimization with **zero change to retrieval semantics**. Effect: Day 11's naive cost
+would be 3 configs × 40 questions = 120 embedding requests; with caching, it's 40 (one
+per unique question, computed once, reused 3×).
+
+**What this plan explicitly does *not* do, flagged as a deferred decision rather than
+silently assumed:** `pipeline.run_pipeline` calls `build_index(repo_id)` (BM25)
+**internally**, with no equivalent injection point — unlike the embedder, there is no
+way to pass in an already-built `BM25Index` from outside. Reusing it across the ~80
+calls that need BM25 in Day 11 (2 of 3 configs × 40 questions) **would require an
+interface change to `pipeline.py`** (an optional `bm25_index=` parameter). This plan
+does **not** make that change: rebuilding a 114-block BM25 index costs no API money
+and is fast (pure local CPU, sub-second) — a real but minor runtime inefficiency, not
+a cost concern, and not worth touching Day 6's `pipeline.py` for during this cycle.
+If a future day wants that optimization, it's a one-parameter addition — surfaced
+here as a decision for you to make, not assumed.
+
+**Confirmation gate**: `scripts/run_eval.py` prints the number of configs, questions,
+and estimated embedding requests, and requires an explicit `y` confirmation
+(skippable via `--yes`) before the **first** real, paid run in both Day 10 and Day
+11 — same convention as every prior day's manual acceptance check.
+
+## 4. Exact file scope
+
+Create:
+- `ripple/evaluation/__init__.py`
+- `ripple/evaluation/dataset.py`
+- `ripple/evaluation/metrics.py`
+- `ripple/evaluation/runner.py`
+- `data/benchmark.json` (20 entries after Day 8, 40 after Day 9)
+- `scripts/run_eval.py`
+- `tests/test_dataset.py`
+- `tests/test_metrics.py`
+- `tests/test_runner.py`
 
 Modify:
-- `ripple/retrieval/pgvector_store.py` — add a `k <= 0` guard to `PgVectorStore.query`
-  (first change to this file since Day 3).
-- `tests/test_pgvector_store.py` — add the corresponding regression test.
-- `tests/test_parser.py` — add the adjacent-blocks-no-blank-line test.
-- `tests/test_references.py` — add the chained bracket-then-attribute test.
+- `ripple/db.py` — add **one** new function, `fetch_resource_addresses(repo_id) ->
+  list[str]` (`SELECT address FROM resources WHERE repo_id = %s`). Justification: the
+  existing `fetch_resource_bodies(repo_id)` returns `(id, address, body)` and *would*
+  technically work for the validator's existence check, but it always pulls every
+  block's full `body` text along with it — wasteful for a function whose only job is
+  "does this address exist," and it's called potentially many times (once per
+  `scripts/run_eval.py` invocation, plus every test run). A single-purpose, minimal
+  read is the more honest fit, consistent with this project's existing pattern of
+  narrow, purpose-built `db.py` functions (`fetch_bm25_documents` vs.
+  `fetch_resource_bodies` is the same kind of split, already precedented).
 
-Create: nothing. This is a consolidation cycle, not a new-module cycle.
+Do not modify: `SPEC.md`, `sql/schema.sql`, `docker-compose.yml`, `.env`/`.env.example`,
+`requirements.txt` (no new dependency — `json`, `dataclasses`, `statistics.mean` are
+all standard library), `ripple/config.py`, `ripple/ingest/*`, `ripple/llm/*`,
+`ripple/retrieval/*` (including `pipeline.py` — section 3.7 explains why its BM25
+injection gap is flagged, not fixed, this cycle), `scripts/index_repo.py`,
+`scripts/ask.py`, `AGENTS.md`, `CLAUDE.md`, `README.md`, and every existing test file.
 
-Do not modify: everything else — `sql/schema.sql`, `docker-compose.yml`,
-`.env.example`, `requirements.txt`, `ripple/config.py`, `ripple/ingest/*`,
-`ripple/llm/*`, `ripple/retrieval/vector_store.py`, `ripple/retrieval/bm25.py`,
-`ripple/retrieval/graph.py`, `ripple/retrieval/fusion.py`,
-`ripple/retrieval/pipeline.py`, `scripts/index_repo.py`, `scripts/ask.py`, `SPEC.md`,
-`AGENTS.md`, `CLAUDE.md`, `README.md`, `.env` (never touch real credentials — see
-section 5, Step 3, for how the docker-compose check avoids this entirely), and every
-other existing test file.
-
-## 5. Step-by-step implementation order
-
-### Step 1 — `PgVectorStore.query`'s `k <= 0` guard
-
-```python
-    def query(
-        self,
-        repo_id: int,
-        embedding: list[float],
-        k: int,
-    ) -> list[RetrievedBlock]:
-        if k <= 0:
-            return []
-
-        vector_param = Vector(embedding)
-        # ... unchanged from here down
-```
-
-One line, at the top of the existing method, before `Vector(embedding)` is even
-constructed. Mirrors `BM25Index.query`'s identical `k <= 0 -> []` convention from Day
-5 exactly, so both `VectorStore` implementations now agree on what a non-positive `k`
-means, independent of whether a caller goes through `pipeline.py` or calls
-`PgVectorStore` directly.
-
-**This does not make `pipeline.py`'s own `config.vector_k > 0` check redundant —
-read this before removing anything.** `pipeline.py`'s check skips constructing an
-`EmbeddingProvider` and making the OpenAI embedding call entirely when
-`vector_k <= 0`; this new guard only protects the database call *after* an embedding
-already exists. The two guards protect different costs (an API call vs. a malformed
-SQL clause) and both stay exactly as they are — this is an additive fix to close the
-gap for callers that bypass `pipeline.py`, not a refactor of `pipeline.py` itself.
-
-The test for this guard belongs in `tests/test_pgvector_store.py`, and must prove the
-short-circuit happens *before* any real work, not just that the return value happens
-to be `[]`:
+## 5. Interfaces and data structures
 
 ```python
-@pytest.mark.parametrize("k", [0, -1])
-def test_query_short_circuits_for_nonpositive_k(
-    monkeypatch: pytest.MonkeyPatch,
-    k: int,
-) -> None:
-    def _unexpected_vector(*args: object, **kwargs: object) -> None:
-        raise AssertionError("Vector(...) must not be constructed for k <= 0")
+# ripple/evaluation/dataset.py
+@dataclass
+class BenchmarkEntry:
+    id: str
+    question: str
+    expected: list[str]
+    category: str   # one of "lookup" | "relational" | "blast_radius" | "attribute"
 
-    def _unexpected_connection(*args: object, **kwargs: object) -> None:
-        raise AssertionError("db.get_connection() must not be called for k <= 0")
-
-    monkeypatch.setattr(
-        "ripple.retrieval.pgvector_store.Vector", _unexpected_vector
-    )
-    monkeypatch.setattr(db, "get_connection", _unexpected_connection)
-
-    result = PgVectorStore().query(
-        repo_id=1, embedding=[0.0] * EMBEDDING_DIM, k=k
-    )
-
-    assert result == []
+def load_benchmark(path: Path) -> list[BenchmarkEntry]: ...            # structural only
+def validate_addresses_exist(entries: list[BenchmarkEntry], repo_id: int) -> None: ...  # DB
 ```
-
-This is an **offline unit test — no database needed at all**, which is a stronger
-proof than a database-backed version would be: it shows `k <= 0` never reaches
-`Vector(...)` or `db.get_connection()` in the first place, for *any* `repo_id` or
-embedding, not just that a particular real query happened to come back empty. A
-separate database-backed version would only prove a weaker fact this test already
-implies, so none is added — closing this out as a real decision, not left open.
-`Vector` must be patched via its string path (`"ripple.retrieval.pgvector_store.Vector"`)
-since `pgvector_store.py` imports the name directly (`from pgvector import Vector`);
-patching `pgvector.Vector` itself would not affect the already-bound reference in
-`pgvector_store`'s own namespace. `db.get_connection` can be patched directly on the
-already-imported `db` module, since `pgvector_store.py` calls `db.get_connection()`
-by attribute lookup at call time, not a name captured at import time.
-
-### Step 2 — Two targeted regression tests
-
-`tests/test_parser.py` — adjacent blocks, no blank line between them:
 
 ```python
-def test_adjacent_blocks_with_no_blank_line_have_disjoint_ranges(
-    tmp_path: Path,
-) -> None:
-    source = (
-        'resource "aws_vpc" "main" {\n'
-        "  cidr_block = \"10.0.0.0/16\"\n"
-        "}\n"
-        'resource "aws_subnet" "public" {\n'
-        "  vpc_id = aws_vpc.main.id\n"
-        "}\n"
-    )
-    tf_file = tmp_path / "main.tf"
-    tf_file.write_text(source)
+# ripple/evaluation/metrics.py
+def recall_at_k(expected: list[str], retrieved: list[str], k: int) -> float: ...
+def precision_at_k(expected: list[str], retrieved: list[str], k: int) -> float: ...
+def reciprocal_rank(expected: list[str], retrieved: list[str]) -> float: ...
 
-    blocks = parse_file(tf_file, tmp_path)
+@dataclass
+class QuestionResult:
+    entry_id: str
+    category: str
+    expected: list[str]
+    retrieved: list[str]
+    recall_at_5: float
+    recall_at_10: float
+    reciprocal_rank_value: float
+    precision_at_5: float
+    latency_ms: float
 
-    assert [(b.address, b.start_line, b.end_line) for b in blocks] == [
-        ("aws_vpc.main", 1, 3),
-        ("aws_subnet.public", 4, 6),
-    ]
+@dataclass
+class AggregateMetrics:
+    question_count: int
+    recall_at_5: float
+    recall_at_10: float
+    mrr: float
+    precision_at_5: float
+    mean_latency_ms: float
+
+@dataclass
+class CategoryMetrics(AggregateMetrics):
+    category: str
+
+def score_question(entry: BenchmarkEntry, retrieved: list[str], latency_ms: float) -> QuestionResult: ...
+def aggregate(results: list[QuestionResult]) -> AggregateMetrics: ...
+def aggregate_by_category(results: list[QuestionResult]) -> list[CategoryMetrics]: ...
 ```
-
-`tests/test_references.py` — a chained bracket-then-attribute reference:
 
 ```python
-def test_extracts_reference_with_index_then_attribute() -> None:
-    body = "value = aws_instance.node[0].private_ip"
+# ripple/evaluation/runner.py
+class CachingEmbeddingProvider:
+    def __init__(self, inner: EmbeddingProvider) -> None: ...
+    def embed(self, texts: list[str]) -> list[list[float]]: ...   # memoized by text
 
-    assert references.extract_references(body) == [
-        "aws_instance.node[0].private_ip"
-    ]
+@dataclass
+class ConfigResult:
+    config_name: str
+    config: RetrievalConfig
+    per_question: list[QuestionResult]
+    aggregate: AggregateMetrics
+    by_category: list[CategoryMetrics]
+
+def run_benchmark(
+    repo_id: int,
+    entries: list[BenchmarkEntry],
+    config: RetrievalConfig,
+    config_name: str,
+    embedder: EmbeddingProvider | None = None,
+) -> ConfigResult: ...
+
+# Explicit, deterministic config names, matching section 10.3's table row labels
+# character-for-character. use_rerank/use_graph/use_rewrite are set False on every
+# row here even though RetrievalConfig defaults them True -- pipeline.py doesn't
+# read them yet (Day 12/13/15), but setting them explicitly now means these three
+# configs stay "vector/BM25/RRF only" even after those stages are wired in later,
+# rather than silently picking up reranking/graph/rewrite the day pipeline.py starts
+# reading them.
+ABLATION_CONFIGS: list[tuple[str, RetrievalConfig]] = [
+    ("Vector only", RetrievalConfig(
+        use_vector=True, use_bm25=False, use_rrf=False,
+        use_rerank=False, use_graph=False, use_rewrite=False,
+    )),
+    ("Vector + BM25", RetrievalConfig(
+        use_vector=True, use_bm25=True, use_rrf=False,
+        use_rerank=False, use_graph=False, use_rewrite=False,
+    )),
+    ("Vector + BM25 + RRF", RetrievalConfig(
+        use_vector=True, use_bm25=True, use_rrf=True,
+        use_rerank=False, use_graph=False, use_rewrite=False,
+    )),
+]
 ```
 
-Both are small, offline, no fixtures needed — matching the existing style of both
-test files (`test_invalid_hcl_raises_value_error` already writes an ad hoc file to
-`tmp_path` rather than using the shared fixtures; this follows the same pattern
-rather than risking the shared `sample_repo`/`reference_repo` fixtures other days'
-tests depend on).
+`PipelineResult.blocks` is consumed only as `[b.address for b in result.blocks]`;
+`latency_json` only as `result.latency_json["total_ms"]`. `result.config_json`/
+`stages_json` are not consumed by the runner at all — they exist for `query_logs`
+(Day 6), not for benchmark scoring, and `run_benchmark` does not call
+`db.insert_query_log` either (that would write 40–120 log rows per run for no
+benefit; evaluation and logged production queries are different concerns).
 
-### Step 3 — The actual "clean `docker compose up`" check
-
-**Read this section fully before running anything in it.** It involves
-`docker compose down -v`. The whole point is to never let it touch the real
-database, and to never touch the *normal* local `ripple` Compose project's own
-containers or volume either — this check runs under its own, isolated Compose
-project name, `ripple-day7-check`, specifically so `down -v` only ever deletes data
-this check itself created.
-
-`DATABASE_URL` is overridden **at the shell level, for individual commands only** —
-never by editing the tracked `.env` file, and never by pointing anything at the real
-Supabase instance. `psycopg`'s `load_dotenv()` (called in
-`db.py`/`embeddings.py`/`generate.py`) does not override an already-set shell
-environment variable, so this is both sufficient and safe — no code change needed.
-
-This is written as one script, not a loose sequence of copy-pasted commands, for one
-specific reason: **teardown must run on every exit path, success or failure**
-(finding 7) — but teardown must never do more than the user actually consented to.
-`trap cleanup EXIT` fires on *every* exit, including a declined confirmation, so
-`cleanup()` cannot unconditionally run the isolated project's `down -v` — if it did,
-declining that specific confirmation would still delete the isolated volume via the
-trap, which is exactly backwards. `MANAGE_ISOLATED` tracks whether that consent was
-actually given: it starts `false`, `cleanup()`'s isolated `down -v` is gated on it
-being `true`, and it is only ever set `true` immediately before the confirmed `down
--v` in step 2 below actually runs. Every early exit before that point — Docker
-unreachable, ports blocked, or the user declining any prompt up to and including
-step 2's own confirmation — leaves `MANAGE_ISOLATED=false`, so `cleanup()` skips the
-isolated teardown entirely in those cases; there is nothing to tear down that this
-run itself created. The normal-service restoration logic is independent of this
-flag and always runs if `STOPPED_NORMAL_SERVICES` is non-empty, regardless of how
-far the script got afterward — stopping those services has its own, separate
-confirmation (step 1), and restoring them is never conditional on what happens to
-the isolated project.
-
-**Two corrections below, both found by actually running this script for the first
-time — read this before assuming the script as previously written was fine.** The
-underlying acceptance check itself passed: `index_repo.py` and `ask.py` genuinely
-reproduced the full pipeline from a clean, isolated local `docker compose up`. But
-getting there required two manual workarounds that the script should have handled
-itself:
-
-- **`PYTHON_BIN`, not a bare `python`/`python3`.** The first run failed outright with
-  `python: command not found` — this machine has no `python` on `PATH`, only
-  `python3`, and even `python3` alone would bypass the project's virtualenv
-  dependencies (`psycopg`, `openai`, etc. live in `.venv`, not the system
-  interpreter). `PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"`, validated with an
-  executable check before anything else runs, fixes both problems at once and lets
-  the variable be overridden (`PYTHON_BIN=python3.11 ...`) if a project's virtualenv
-  ever lives somewhere other than `.venv`.
-- **Line-by-line service capture, not `read -a` or `mapfile`.** The first run's
-  `NORMAL_RUNNING` was two lines (`adminer` and `db`, since the normal project has
-  both services running), but `read -r -a STOPPED_NORMAL_SERVICES <<< "$NORMAL_RUNNING"`
-  only reads the *first* line into the array — `db` was silently dropped, and the
-  printed "Restoring normal ripple service(s) this run stopped: adminer" message
-  only ever named one of the two. In that actual run, `db` still came back up
-  anyway — but only as a side effect of `docker-compose.yml`'s `adminer: depends_on:
-  [db]`, which made `docker compose start adminer` revive `db` too. **Restoration
-  must not rely on that coincidence** — two services with no `depends_on`
-  relationship between them would leave one orphaned in a stopped state. `mapfile`
-  would read every line correctly, but stock macOS ships bash 3.2, which has no
-  `mapfile`/`readarray` at all — so this uses a `while IFS= read -r service; do ...
-  done <<< "$NORMAL_RUNNING"` loop instead, which is bash-3.2-compatible and reads
-  every line.
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-PROJECT="ripple-day7-check"
-LOCAL_DATABASE_URL="postgresql://ripple:ripple@localhost:5434/ripple"
-REPO_NAME="day7-docker-check"
-PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
-STOPPED_NORMAL_SERVICES=()
-MANAGE_ISOLATED=false
-
-if [ ! -x "$PYTHON_BIN" ]; then
-  echo "Python virtual environment not found at $PYTHON_BIN."
-  echo "Create/activate the project virtual environment or set PYTHON_BIN explicitly."
-  exit 1
-fi
-
-cleanup() {
-  if [ "$MANAGE_ISOLATED" = true ]; then
-    echo "--- Tearing down isolated project ($PROJECT) ---"
-    docker compose -p "$PROJECT" down -v || true
-  fi
-  if [ "${#STOPPED_NORMAL_SERVICES[@]}" -gt 0 ]; then
-    echo "--- Restoring normal ripple service(s) this run stopped: ${STOPPED_NORMAL_SERVICES[*]} ---"
-    docker compose start "${STOPPED_NORMAL_SERVICES[@]}" || true
-  fi
-}
-trap cleanup EXIT
-
-# 0. Docker prerequisite. Start Docker Desktop first if this fails, then re-run.
-if ! docker info >/dev/null 2>&1; then
-  echo "Docker daemon is not reachable. Start Docker Desktop and retry."
-  echo "Day 7 acceptance cannot run until Docker is available."
-  exit 1
-fi
-
-# 1. Port-conflict precondition. docker-compose.yml hardcodes 5434/8080 (not
-#    parameterized; this plan does not add an override), so the isolated project
-#    still needs these two host ports free.
-if lsof -i :5434 -sTCP:LISTEN >/dev/null 2>&1 || lsof -i :8080 -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "Port 5434 and/or 8080 is already in use:"
-  lsof -i :5434 -i :8080 -sTCP:LISTEN
-
-  NORMAL_RUNNING=$(docker compose ps --services --status running 2>/dev/null || true)
-  if [ -n "$NORMAL_RUNNING" ]; then
-    echo
-    echo "The normal (non-isolated) ripple Compose project appears to own these"
-    echo "ports -- currently running: $NORMAL_RUNNING"
-    read -p "Stop these normal ripple services reversibly (no -v) so the isolated check can bind the ports? [y/N] " CONFIRM_STOP
-    if [ "$CONFIRM_STOP" != "y" ]; then
-      echo "Aborting -- ports are not free and stopping was not confirmed."
-      exit 1
-    fi
-    # Bash-3.2-compatible line-by-line capture (stock macOS ships bash 3.2,
-    # which has no `mapfile`/`readarray`). `read -a` reads only a single line
-    # and would silently drop every service after the first whenever
-    # $NORMAL_RUNNING has more than one line -- this loop reads every line.
-    while IFS= read -r service; do
-      if [ -n "$service" ]; then
-        STOPPED_NORMAL_SERVICES+=("$service")
-      fi
-    done <<< "$NORMAL_RUNNING"
-    docker compose stop
-  else
-    echo
-    echo "Ports 5434/8080 are held by something other than the normal ripple"
-    echo "project. Stop here and resolve that yourself -- this check will not"
-    echo "try to identify or terminate an unrelated process."
-    exit 1
-  fi
-fi
-
-# 2. Confirm before deleting the ISOLATED project's own volume (created fresh in
-#    step 3 below). This cannot touch the normal ripple project's pgdata volume or
-#    the Supabase database -- `-p` gives it entirely separate containers/volumes.
-read -p "About to run 'docker compose -p $PROJECT down -v' (isolated project only). Continue? [y/N] " CONFIRM_DOWN
-if [ "$CONFIRM_DOWN" != "y" ]; then
-  echo "Aborting before any destructive command ran."
-  exit 1
-fi
-# Consent is now given -- only from this point on may cleanup() delete the
-# isolated project's volume on exit (including on a later failure).
-MANAGE_ISOLATED=true
-docker compose -p "$PROJECT" down -v
-
-# 3. Bring up a genuinely fresh, isolated local Postgres + pgvector.
-docker compose -p "$PROJECT" up -d
-
-# 4. Bounded readiness wait -- docker-compose.yml has no healthcheck, so `up -d`
-#    returning does not mean the database is ready. 30 attempts, 1 second apart;
-#    never loop forever.
-READY=false
-for attempt in $(seq 1 30); do
-  if docker compose -p "$PROJECT" exec -T db pg_isready -U ripple >/dev/null 2>&1; then
-    READY=true
-    break
-  fi
-  sleep 1
-done
-if [ "$READY" != "true" ]; then
-  echo "Postgres did not become ready after 30 attempts. Container logs:"
-  docker compose -p "$PROJECT" logs db
-  echo "Day 7 acceptance FAILED: local database never became ready."
-  exit 1
-fi
-
-# 5. Deterministic schema verification -- query for the four expected tables and
-#    the vector extension, rather than eyeballing `\dt`.
-DATABASE_URL="$LOCAL_DATABASE_URL" "$PYTHON_BIN" -c "
-from ripple import db
-
-with db.get_connection() as conn, conn.cursor() as cur:
-    cur.execute(
-        \"SELECT table_name FROM information_schema.tables \"
-        \"WHERE table_schema = 'public'\"
-    )
-    tables = {row[0] for row in cur.fetchall()}
-    cur.execute(\"SELECT extname FROM pg_extension WHERE extname = 'vector'\")
-    has_vector_extension = cur.fetchone() is not None
-
-expected_tables = {'repos', 'resources', 'edges', 'query_logs'}
-missing = expected_tables - tables
-assert not missing, f'missing tables: {missing}'
-assert has_vector_extension, 'vector extension is not installed'
-print('schema OK:', sorted(expected_tables), '| vector extension: OK')
-"
-
-# 6. Register and index a small repo against the LOCAL, isolated database only,
-#    using the real CLI script. Confirm before this line -- it makes one real
-#    OpenAI embedding request (one batched call covering every block parsed from
-#    the fixture).
-read -p "Continue with indexing (makes one real OpenAI embedding request)? [y/N] " CONFIRM_INDEX
-if [ "$CONFIRM_INDEX" != "y" ]; then
-  echo "Aborting before any OpenAI call was made."
-  exit 1
-fi
-INDEX_OUTPUT=$(DATABASE_URL="$LOCAL_DATABASE_URL" \
-  "$PYTHON_BIN" scripts/index_repo.py tests/fixtures/reference_repo --name "$REPO_NAME")
-echo "$INDEX_OUTPUT"
-
-# Prefer the id index_repo.py actually printed. Repo names are not unique in the
-# schema, so if that parse ever fails, fall back to the most recently created row
-# with this name (ORDER BY id DESC LIMIT 1) rather than an ambiguous bare lookup.
-#
-# The `|| true` is required, not decorative: under `set -o pipefail`, if grep
-# finds no match it exits 1, and that non-zero status propagates as the whole
-# pipeline's exit status even though `head`/`cut` themselves exit 0. Without
-# `|| true`, `set -e` would treat that as this assignment "failing" and kill the
-# script right here -- before the fallback query below ever gets a chance to run.
-# `|| true` only affects whether the *script* treats this line as fatal; grep's
-# (empty) stdout is still captured into REPO_ID either way, so the `-z` check
-# below still correctly detects "no match" and proceeds to the fallback.
-REPO_ID=$(echo "$INDEX_OUTPUT" | grep -oE 'id=[0-9]+' | head -1 | cut -d= -f2) || true
-if [ -z "$REPO_ID" ]; then
-  echo "Could not parse repo id from index_repo.py output; querying for it instead."
-  REPO_ID=$(DATABASE_URL="$LOCAL_DATABASE_URL" "$PYTHON_BIN" -c "
-from ripple import db
-
-with db.get_connection() as conn, conn.cursor() as cur:
-    cur.execute(
-        \"SELECT id FROM repos WHERE name = '$REPO_NAME' ORDER BY id DESC LIMIT 1\"
-    )
-    row = cur.fetchone()
-    print(row[0] if row else '')
-")
-fi
-if [ -z "$REPO_ID" ]; then
-  echo "Day 7 acceptance FAILED: could not determine repo id after indexing."
-  exit 1
-fi
-echo "Using repo_id=$REPO_ID"
-
-# 7. Confirm resources were actually indexed and at least one reference edge was
-#    extracted -- proving Day 2 and Day 4's work reproduces here too, not just
-#    that the repos row exists.
-DATABASE_URL="$LOCAL_DATABASE_URL" "$PYTHON_BIN" -c "
-from ripple import db
-
-repo_id = $REPO_ID
-with db.get_connection() as conn, conn.cursor() as cur:
-    cur.execute('SELECT count(*) FROM resources WHERE repo_id = %s', (repo_id,))
-    resource_count = cur.fetchone()[0]
-    cur.execute('SELECT count(*) FROM edges WHERE repo_id = %s', (repo_id,))
-    edge_count = cur.fetchone()[0]
-
-print('resources:', resource_count, '| edges:', edge_count)
-assert resource_count > 0, 'no resources were indexed'
-assert edge_count > 0, 'no reference edges were extracted'
-"
-
-# 8. Ask a real question through the actual CLI script. Confirm before this line --
-#    it makes a second OpenAI embedding request (the question) plus one generation
-#    request.
-read -p "Continue with asking (one more embedding request plus one generation request)? [y/N] " CONFIRM_ASK
-if [ "$CONFIRM_ASK" != "y" ]; then
-  echo "Aborting before the generation call was made."
-  exit 1
-fi
-DATABASE_URL="$LOCAL_DATABASE_URL" \
-  "$PYTHON_BIN" scripts/ask.py "$REPO_ID" "What does aws_vpc.main create?"
-
-# 9. Strengthened query-log check -- prove the system actually retrieved evidence
-#    and generated an answer, not merely that the expected JSON keys exist.
-DATABASE_URL="$LOCAL_DATABASE_URL" "$PYTHON_BIN" -c "
-from ripple import db
-
-repo_id = $REPO_ID
-with db.get_connection() as conn, conn.cursor() as cur:
-    cur.execute(
-        'SELECT stages_json, answer FROM query_logs WHERE repo_id = %s '
-        'ORDER BY id DESC LIMIT 1',
-        (repo_id,),
-    )
-    row = cur.fetchone()
-
-assert row is not None, 'no query_logs row was written'
-stages, answer = row
-
-assert answer is not None and answer.strip(), 'answer is empty or NULL'
-assert len(stages.get('final', [])) >= 1, 'final stage has no results'
-for stage_name in ('vector', 'bm25', 'fusion'):
-    assert stages.get(stage_name), f'{stage_name} stage is missing or empty'
-
-print('query_logs OK -- answer present, final/vector/bm25/fusion all non-empty')
-"
-
-echo "Day 7 local docker-compose acceptance check PASSED."
-# `cleanup` (isolated teardown, then restoring any normal services) runs
-# automatically here via the EXIT trap -- nothing further to do.
+```python
+# scripts/run_eval.py (sketch)
+def main(argv=None):
+    args = parse_args(argv)   # --repo-id (required), --benchmark (default data/benchmark.json),
+                               # --config NAME (optional; omit = all three), --yes
+    entries = load_benchmark(args.benchmark)
+    validate_addresses_exist(entries, args.repo_id)      # fail fast, before spending anything
+    configs = [(args.config, dict(ABLATION_CONFIGS)[args.config])] if args.config else ABLATION_CONFIGS
+    confirm_cost(len(entries), len(configs), skip=args.yes)   # section 3.7
+    embedder = CachingEmbeddingProvider(OpenAIEmbeddingProvider())
+    results = [run_benchmark(args.repo_id, entries, cfg, name, embedder=embedder) for name, cfg in configs]
+    print(render_markdown_table(results))
+    save_json(results, path=timestamped_path())          # section 3.8
 ```
 
-**Cost, stated precisely:** step 6 (indexing) makes one embedding API request (the
-fixture's few blocks batch into a single call); step 8 (asking) makes a second
-embedding request (the question itself) plus one generation request. Total:
-**approximately two embedding API requests and one generation API request** — the
-same small-cost category as every prior day's manual checks.
+### 3.8 Output behavior
 
-**If the script exits non-zero at any point — Docker unreachable, ports blocked,
-readiness timeout, missing tables/extension, zero resources or edges, or a failed
-query-log assertion — that is section 4's reproducibility claim genuinely not
-holding. Day 7 cannot be marked complete in that case.** Report the actual failure
-message the script printed and decide on a fix as a separate, deliberate step. Do
-not silently patch `schema.sql` or `docker-compose.yml` to make the check pass — if
-the fix turns out to belong there, that is a new decision to make explicitly, not
-something to slip into this consolidation cycle's diff. Teardown still runs via the
-trap regardless of where the script stopped — normal-project services (if any were
-stopped) are restored, and the isolated project's volume is always removed, on
-every failure path as well as on success.
+- **Markdown**: always printed to stdout, in section 10.3's exact column order
+  (`Configuration | Recall@5 | Recall@10 | MRR | P@5 | Latency (ms)`), plus a
+  per-category breakdown table beneath it. Not auto-written into `README.md` — that
+  stays a manual, deliberate copy-paste step for whichever day writes the README
+  (Day 19), never silently automated here.
+- **JSON**: always written to `data/eval_results/<UTC-timestamp>.json` (e.g.
+  `data/eval_results/2026-08-28T14-30-00Z.json`) — **a new file every run, nothing is
+  ever silently overwritten.** Contains every `ConfigResult` (aggregate, per-category,
+  and full per-question detail — the actual raw material "for reruns" SPEC.md asks
+  for). These files are meant to be committed (they *are* the honest record SPEC's
+  "never fabricate a metric" constraint exists to protect) — no `.gitignore` change is
+  proposed either way; that's a call for you, not silently decided here.
 
-## 6. Interfaces, data structures, and error behavior
+## 6. Day-by-day plan
 
-- `PgVectorStore.query(repo_id, embedding, k)` — now returns `[]` immediately for
-  `k <= 0`, without constructing a `Vector` or making any database call. Behavior for
-  `k > 0` is completely unchanged. This makes `PgVectorStore` and `BM25Index` (Day 5)
-  agree exactly on non-positive-`k` semantics.
-- No other public interface changes this cycle. `parse_file`, `extract_references`,
-  `pipeline.run_pipeline`, `ask()` — all unchanged; only new test coverage is added
-  around them.
+### Day 8 — first 20 questions, `dataset.py`
 
-## 7. Required tests
+**Step 1** — `ripple/evaluation/dataset.py`: `BenchmarkEntry`, `load_benchmark`
+(structural validation, section 3.3), `validate_addresses_exist` (DB validation,
+section 3.3), plus `db.fetch_resource_addresses` (section 4).
 
-- `tests/test_pgvector_store.py` — add `test_query_short_circuits_for_nonpositive_k`
-  (Step 1's code block), parametrized over `k=0` and `k=-1` — **2 collected test
-  items**. Fully offline: proves via monkeypatches that neither `Vector(...)` nor
-  `db.get_connection()` is ever reached, not just that the return value happens to be
-  `[]`. No database-backed counterpart is added (Step 1 explains why one wouldn't add
-  meaningful separate coverage).
-- `tests/test_parser.py` — the adjacent-blocks test (Step 2) — **1 collected test
-  item** — proving no off-by-one bleed between two blocks separated by nothing but a
-  newline.
-- `tests/test_references.py` — the chained-bracket-then-attribute test (Step 2) —
-  **1 collected test item**.
-- **Full-suite regression check**: `python -m pytest` must still show all
-  pre-existing tests passing, plus these 4 new collected items: **119 before this
-  cycle, 123 after** (119 + 2 parametrized `k` cases + 1 parser test + 1 references
-  test). This cycle adds tests and fixes one function; it does not change behavior
-  anywhere else, so nothing else should move.
+**Step 2** — Author 20 questions against the real corpus, using section 3.4's
+workflow, following section 3.2's labeling policy exactly. Rough mix (SPEC's target
+is 15/10/8/7 across all 40 — Day 8's 20 don't need to hit that ratio individually,
+but avoid making Day 8 all-`lookup`, since Day 9 is explicitly meant to weight toward
+`relational`/`blast_radius` on top of whatever Day 8 already has). For each entry:
+resolve the real address(es) via the inventory workflow, read the actual source
+(semantic verification, section 3.3), then write the entry.
 
-Run `python -m pytest` after implementation. **Every test this cycle adds is fully
-offline** — no `OPENAI_API_KEY`, no real network, and (per the redesign above) no
-database connection either, including the `PgVectorStore` test, which used to need
-one and no longer does.
+**Step 3** — Run `load_benchmark` + `validate_addresses_exist` against the real
+`repo_id` for all 20; fix anything that fails.
 
-## 8. Acceptance criteria
+**Tests**: `tests/test_dataset.py` — structural validation (pure, offline): valid
+minimal entry accepted; missing/wrong-typed field rejected per field; duplicate `id`
+rejected; invalid `category` rejected; empty `expected` rejected; duplicate address
+*within* one entry's `expected` rejected; non-array top-level JSON rejected — each as
+its own small, targeted test using an inline JSON string or a `tmp_path`-written
+file, not the real 20-entry file (keeps these tests fast, offline, and independent of
+how many real entries currently exist). DB validation test (skip-if-unreachable,
+same convention as every prior day): a fake `repo_id`/known-bad address correctly
+reported as missing; the real 20-entry file passes against the real corpus's
+`repo_id` (this one specific test legitimately needs the real environment-resolved
+`repo_id` — resolve it the same way section 3.1 shows, never hardcoded).
 
-- `python -m pytest` passes with no failures, full suite, **123 tests** (119 + 2
-  parametrized `PgVectorStore` cases + 1 parser test + 1 references test).
-- `PgVectorStore().query(repo_id, embedding, k=0)` and `k=-1` both return `[]`
-  **without ever calling `Vector(...)` or `db.get_connection()`** — proven by
-  monkeypatches that raise if either is attempted (Step 1), not merely by observing
-  an empty return value.
-- **The literal Day 7 "Done when," run for the first time this project has ever run
-  it — read section 5, Step 3 in full before attempting, including its Docker
-  prerequisite and port-conflict precondition:** with Docker Desktop running
-  (`docker info` reachable) and using an isolated Compose project
-  (`ripple-day7-check`, never the normal `ripple` project's own containers/volume),
-  a fresh `docker compose up` (local `pgvector/pgvector:pg16`, not Supabase), waited
-  on with a *bounded* readiness check (30 attempts, not forever), produces all 4
-  tables *and* the `vector` extension — verified by querying
-  `information_schema.tables`/`pg_extension` directly, not by eyeballing `\dt`.
-  `"$PYTHON_BIN" scripts/index_repo.py` and `"$PYTHON_BIN" scripts/ask.py` — the
-  actual CLI scripts, not `-c` shortcuts, run through the project's own virtualenv
-  interpreter — both pointed at that local database via a shell-level `DATABASE_URL`
-  override, successfully index a repo (verified:
-  `resources` count > 0 *and* `edges` count > 0, proving Day 2 and Day 4's work
-  reproduces here too) and answer a question (verified: a `query_logs` row exists
-  whose `stages_json["final"]` has at least one result, whose `vector`/`bm25`/
-  `fusion` stages are each present *and non-empty*, and whose `answer` column is a
-  non-empty string — proving the system actually retrieved evidence and generated a
-  real answer, not just that some JSON keys happen to exist) — end to end, from a
-  genuinely empty database, using only `docker compose up` plus the two existing
-  scripts. The repo id used throughout comes from `index_repo.py`'s own printed
-  output (with a name-based fallback query that explicitly handles non-unique
-  names via `ORDER BY id DESC LIMIT 1`), never a hardcoded id.
-  **Report the actual result. If any part of this fails, Day 7 is not complete** —
-  see Step 3's closing paragraph for what to do instead of silently patching
-  `schema.sql`/`docker-compose.yml` to force a pass. Do not assume success because
-  the Supabase path has worked all along; those are different databases running the
-  same `schema.sql`, and this is the first time the local one has been exercised.
-  Teardown (isolated project's volume, plus restoring any normal-project services
-  this run stopped) happens automatically on every exit path, success or failure,
-  via the script's `trap`-based cleanup.
+**Acceptance**: 20 entries in `data/benchmark.json`; `load_benchmark` and
+`validate_addresses_exist` both pass; every entry has had its source manually read
+and confirmed (section 3.3) — this is the "semantically verified" half of Day 8's
+"Done when," and it's a checklist a test suite cannot certify for you.
 
-**This check has, in fact, already passed once** — with the pre-`PYTHON_BIN` script,
-requiring a manual `python` → `python3` substitution to get past step 6, and manual
-confirmation afterward that both normal services (`db` and `adminer`) had genuinely
-come back up rather than trusting the script's own restoration message. `index_repo.py`
-reported "Indexed 7 resource blocks, Extracted 5 reference edges" and `ask.py`
-returned a real, correctly-cited answer about `aws_vpc.main`; the query-log check
-passed. **Day 7 is not being marked incomplete** — the two fixes above are
-portability corrections to the script itself, so the next run doesn't need that
-manual intervention, not evidence the underlying check ever failed.
+### Day 9 — 20 more, to 40 total
 
-## 9. Explicit non-goals
+**Step 1** — Author 20 more questions, this time deliberately weighted toward
+`relational`/`blast_radius` so the running total approaches SPEC's 15/10/8/7 target.
+Same process as Day 8 (section 3.4 workflow, section 3.2 policy, manual source
+verification per entry).
 
-- Any new feature, module, or pipeline stage. Day 7 is buffer/consolidation per
-  SPEC.md itself — Day 8 (benchmark construction) is next.
-- Manufacturing "Day 2/4 slippage" that doesn't actually exist. Section 3 explains
-  why both were already closed during their own review cycles.
-- Adding more tokenizer/BM25 tests. Already thoroughly covered (section 3).
-- Fixing `.env` to point at the local docker-compose database, or vice versa.
-  Whichever database this project uses day to day is a separate decision from
-  proving the *fallback* path works — this cycle only proves the fallback works, it
-  doesn't switch to it.
-- Any change to `docker-compose.yml` or `sql/schema.sql` — section 5, Step 3's check
-  is about *verifying* the existing setup, not modifying it. If the check fails,
-  that's a finding to report and decide on separately, not something to silently
-  patch mid-cycle.
-- Modifying `SPEC.md`.
+**Step 2** — Re-run `load_benchmark` + `validate_addresses_exist` against all 40.
 
-## 10. Risks, ambiguities, and things flagged for your review
+**Tests**: no new *test code* is required beyond Day 8's (the validator logic doesn't
+change) — but the existing DB-validation test that runs against the real file must
+now pass against 40 entries, and it's worth a light assertion on the final category
+distribution (e.g. `assert counts["relational"] >= 8` or similar loose bound) so a
+future accidental edit to `benchmark.json` that skews the mix back toward all-`lookup`
+gets caught.
 
-- **"One script" (section 11's exact wording) is slightly ambiguous** — by Day 7,
-  the project has *two* scripts (`index_repo.py` since Day 1, `ask.py` since Day 3).
-  Read as "each capability is reachable via a single script invocation" (index via
-  one script, ask via another), not "the whole project has exactly one script,"
-  since the latter reading would contradict Day 3's own deliverable. Flagged rather
-  than silently assumed, since it's SPEC.md's phrasing, not this plan's.
-- **The docker-compose check has now actually been run and passed** (section 8) —
-  this section is no longer a prediction. The run that first exposed the two bugs
-  this revision fixes (bare `python` not on `PATH`; `db` silently dropped from
-  `STOPPED_NORMAL_SERVICES`) is the same run whose `index_repo.py`/`ask.py` output
-  is quoted in section 8 — the acceptance check passed despite those two script bugs,
-  because they were worked around manually rather than being failures of the
-  underlying system.
-- **If the docker-compose check fails**, the likely causes, roughly in order of
-  probability: (a) `schema.sql`'s `CREATE EXTENSION IF NOT EXISTS vector` requires
-  the `pgvector/pgvector:pg16` image specifically (already the image
-  `docker-compose.yml` uses, so low risk); (b) port `5434`/`8080` already bound —
-  Step 3's precondition check (`lsof`) catches this before the isolated project
-  attempts to start, distinguishes the normal `ripple` project (asks to stop it
-  reversibly, records exactly which services, restores only those) from anything
-  else (stops and asks the user rather than touching an unrelated process); (c) a
-  real drift between `schema.sql` and whatever the live Supabase schema actually
-  looks like today, if anything was ever changed by hand against Supabase directly
-  rather than through `schema.sql`. (c) would be the most important finding of this
-  entire cycle if it happens, since it would mean the two databases this project can
-  run against have silently diverged.
-- **The isolated Compose project (`ripple-day7-check`) still shares host ports with
-  the normal `ripple` project**, since `docker-compose.yml`'s port mappings aren't
-  parameterized and this plan doesn't add an override file to change that. Isolation
-  here means separate containers/volumes, not separate ports — Step 3's precondition
-  check and reversible, service-scoped `stop`/`start` around the normal project is
-  how that's handled without modifying `docker-compose.yml`.
-- **Step 3's script uses `read -p` for its confirmation gates, which requires an
-  interactive terminal.** If this is ever run non-interactively (piped, or invoked
-  by an agent without a TTY attached), `read -p` will block waiting for input rather
-  than proceeding or failing fast. This is intentional — every gated point spends
-  real money or runs a destructive command, so silently defaulting to "yes" when
-  unattended would be worse than blocking. Run it interactively.
-- **The `k <= 0` fix reopens a file every prior day explicitly marked "do not
-  modify."** That restriction existed to keep each day's diff scoped; Day 7's whole
-  purpose is closing exactly this kind of deliberately-deferred item, so reopening it
-  now — for this one line only — is the plan working as intended, not a violation of
-  the pattern.
+**Acceptance**: 40 entries total; validator passes; every entry semantically
+verified; category counts close to 15/10/8/7 (exact SPEC wording is "aim for
+roughly," not an exact requirement — don't force it if reality lands at, say,
+14/11/8/7).
+
+### Day 10 — metrics, runner, first real row
+
+**Step 1** — `ripple/evaluation/metrics.py`: the three SPEC 10.2 functions plus
+section 3.6's edge-case guards, `QuestionResult`/`AggregateMetrics`/`CategoryMetrics`,
+`score_question`/`aggregate`/`aggregate_by_category`.
+
+**Step 2** — `ripple/evaluation/runner.py`: `CachingEmbeddingProvider`,
+`ConfigResult`, `run_benchmark`, `ABLATION_CONFIGS` (section 5).
+
+**Step 3** — `scripts/run_eval.py`: CLI, cost confirmation gate, markdown + timestamped
+JSON output (section 3.8).
+
+**Step 4** — First real, paid run: **confirm before this step** (section 3.7). One
+config only — `"Vector + BM25 + RRF"` is the natural choice (it's the pipeline's
+current full capability). ~40 embedding requests, zero generation calls.
+
+**Tests** (offline unless noted):
+- `metrics.py`: hand-computed values for `recall_at_k`/`precision_at_k`/
+  `reciprocal_rank` against small constructed `expected`/`retrieved` lists (including
+  a case where `retrieved` has fewer than `k` items, and a no-match case); `k <= 0`
+  raises for both `recall_at_k` and `precision_at_k`; empty `expected` raises for
+  `recall_at_k`; `aggregate([])` raises; `aggregate_by_category` returns categories in
+  sorted order regardless of input order; a mixed-category input produces correct
+  per-category means (hand-computed).
+- `runner.py`: `run_benchmark` with `pipeline.run_pipeline` **monkeypatched** (module
+  level, matching Day 6's established pattern for `test_pipeline.py`) to return
+  canned `PipelineResult`s keyed by question — never a real database, never a real
+  `OPENAI_API_KEY`. Assert: `retrieved` passed into `score_question` matches
+  `[b.address for b in canned_result.blocks]` in the same order; `latency_ms` comes
+  from `canned_result.latency_json["total_ms"]`; **a dedicated test asserting
+  `answer_question` is never imported/called** by monkeypatching
+  `ripple.llm.generate.answer_question` to raise if invoked, then running
+  `run_benchmark` end to end and confirming it never fires (the direct test for
+  section 3.5's independence requirement). `CachingEmbeddingProvider`: wraps a fake
+  inner provider that raises on a repeated input; call `.embed(["q1"])` twice and
+  once with `["q1", "q2"]`, assert the inner provider is called only for genuinely
+  new text and the cached result is still returned correctly for repeats.
+- `scripts/run_eval.py` — at minimum, an argument-parsing test (monkeypatch
+  `run_benchmark` to a stub, assert the right `repo_id`/config selection reaches it)
+  and a confirmation-gate test (declining the `y` prompt makes no calls to
+  `run_benchmark` at all) — both offline, no real API/DB.
+- `tests/test_db.py` addition: `fetch_resource_addresses` round-trip (DB-dependent,
+  skip-if-unreachable, same convention as every prior day).
+
+**Acceptance**: `python -m pytest` passes (existing 123 plus this cycle's new tests —
+see section 10 for why an exact new total isn't quoted); one real, confirmed run of
+`scripts/run_eval.py --repo-id <resolved> --config "Vector + BM25 + RRF"` produces a
+real Recall@5/MRR row, printed and saved to a timestamped JSON file, using the real,
+resolved `repo_id` (never `13` hardcoded anywhere in the command's own script — only
+ever passed as a CLI argument at invocation time).
+
+### Day 11 — first three ablation rows
+
+**Step 1** — Run `scripts/run_eval.py --repo-id <resolved>` **without** `--config`
+(runs all three `ABLATION_CONFIGS` rows). **Confirm before this step** — ~40
+embedding requests total (cached across all three configs per section 3.7), zero
+generation calls.
+
+**Step 2** — Read the three rows. **Investigate anything surprising before treating
+it as a finding** — SPEC's own words: "a suspicious number now is a bug, not a
+finding." Concretely: if "Vector + BM25" scores *worse* than "Vector only," or if
+`use_rrf=False`'s concat/dedup path produces identical results to plain vector-only,
+that's worth checking against `fusion.concat_dedup`'s actual behavior (Day 6) before
+writing it down as a real result.
+
+**Step 3** — Do not hand-edit any number. If a bug is found, fix it, re-run the whole
+three-row set from scratch (not just the one row that looked wrong — a bug found in
+one row may have silently affected the others too), and only then treat the numbers
+as final for this cycle.
+
+**Tests**: none new — Day 11 exercises Day 10's already-tested machinery across three
+configs; there's no new *code* to unit test, only a new *run* to produce and read
+correctly.
+
+**Acceptance**: three real rows exist (in one timestamped JSON file, or three — see
+implementation-time choice, either is fine as long as nothing is overwritten
+silently), each number traceable to an actual run, and you can explain each row
+(section 11's own "Done when": "three rows exist and you can explain each one").
+
+## 7. Practical execution order (the actual collaboration loop)
+
+For each step listed under Days 8–11 above:
+1. This plan (or a short follow-up message) explains the step.
+2. You decide: you implement it, or Codex does.
+3. Implement and run the relevant tests for just that step.
+4. Review the diff before moving to the next step — small, reviewable changes, not
+   one accumulated diff across a whole day.
+5. Commit at the **end of each completed day** (Day 8's commit, Day 9's commit, Day
+   10's commit, Day 11's commit) — four commits for this whole plan, not one.
+
+## 8. Explicit non-goals
+
+- **Reranking (`rerank.py`, `use_rerank`) — Day 12.** Not implemented, not enabled;
+  every `ABLATION_CONFIGS` entry explicitly sets `use_rerank=False`.
+- **Graph expansion wired into the pipeline (`use_graph`) — Day 13.** `graph.py`
+  itself (Day 4) is used only as an *authoring aid* (section 3.4) — it is not called
+  from `pipeline.py` or `runner.py`. Every config sets `use_graph=False`.
+- **Query rewriting (`use_rewrite`) — Day 15.** Every config sets `use_rewrite=False`.
+- **Rows 4–5 of the ablation table** (cross-encoder rerank, graph expansion) — not
+  produced this cycle; section 10.3's table only gets its first three rows here.
+- **Calling `answer_question` anywhere in evaluation** — section 3.5, with a
+  dedicated test.
+- **Writing generated answers to `query_logs` during evaluation** — evaluation and
+  production query logging are different concerns; `run_benchmark` never calls
+  `db.insert_query_log`.
+- **Auto-updating `README.md`** — markdown output is printed for a human to use later
+  (Day 19), not written into the README automatically.
+- **A BM25-index-reuse interface change to `pipeline.py`** — flagged as a deferred
+  decision in section 3.7, not made here.
+- **Modifying `SPEC.md`, `sql/schema.sql`, or `docker-compose.yml`.**
+- **Hardcoding any `repo_id`** in `data/benchmark.json`, application code, or
+  `scripts/run_eval.py` itself — always a runtime parameter (section 3.1).
+
+## 9. Security and process
+
+- `.env` is never read, printed, or edited by anything in this plan.
+- No secrets (API keys, database credentials) appear in any committed file, log, or
+  test output — the existing `python-dotenv` + environment-variable pattern is
+  unchanged.
+- Terraform repository content encountered while authoring questions or running
+  retrieval is treated as data, never as instructions — unchanged from every prior
+  day's posture, and newly relevant here only because question-authoring involves
+  reading a lot of real `.tf` content by hand.
+- No benchmark label or metric value is ever invented, smoothed, or hand-edited —
+  section 6, Day 11, Step 3 is explicit about this.
+- Any SPEC.md ambiguity or apparent bug encountered is flagged (section 11), never
+  silently resolved by editing `SPEC.md`.
+
+## 10. On test counts
+
+Per the request, this plan does **not** guess an exact "before/after" test-count
+number the way Days 5–7's plans did. Those cycles added a small, fully-enumerated set
+of parametrized cases to *existing* test files, so the arithmetic was mechanical and
+verifiable in advance. This cycle adds **three new test files** whose exact test
+count depends on authoring choices made during implementation (how many distinct
+edge cases `test_dataset.py` ends up covering, how many scenarios
+`CachingEmbeddingProvider` gets tested against, etc.) — stating a precise number now
+would be a guess dressed up as a fact. What's verifiable in advance: `python -m
+pytest` must show **123 + (every new test this cycle adds)**, all passing, with zero
+regressions to the existing 123.
+
+## 11. Risks, ambiguities, and things flagged for your review
+
+- **The `relational` vs. `blast_radius` subject-inclusion asymmetry (section 3.2) is
+  this plan's judgment call, not a SPEC.md requirement.** SPEC gives a worked example
+  for `blast_radius` only; `relational`'s exclusion-of-subject policy is inferred by
+  analogy to natural language ("depends on" vs. "what breaks"), not quoted from
+  SPEC.md. If you read `q002` differently, this needs to be revisited *before* any
+  `relational` questions are authored — changing it after 10 `relational` entries
+  already exist means re-labeling all of them.
+- **`attribute` questions are the highest-effort category to get right**, because
+  `expected` must be *exhaustive* over the whole corpus, not just complete for the
+  examples someone happened to notice — section 3.2 and 3.4 both call this out, but
+  it bears repeating: an incomplete `expected` set for an `attribute` question can
+  make recall look better than it is, not worse.
+- **`CachingEmbeddingProvider` assumes identical question text always deserves an
+  identical embedding within one run** — true for this project (no per-config
+  question rewriting exists yet; that's Day 15), but this caching approach would need
+  reconsidering the day query rewriting turns "one question" into "N different
+  strings" per config.
+- **The BM25 rebuild-per-call inefficiency (section 3.7) is real but deliberately not
+  fixed this cycle** — flagged as a decision for you, not assumed away.
+- **`data/eval_results/` being committed vs. gitignored is not decided here** —
+  flagged in section 3.8, no `.gitignore` change is proposed either way.
+- **Exact category counts may not land exactly on 15/10/8/7** — SPEC's own wording is
+  "aim for roughly," treated literally; forcing an exact ratio by padding with
+  artificial questions would be worse than a close-but-imperfect real mix.
+- **This plan assumes `examples/complete` remains the benchmark corpus** (matching
+  every prior day's corpus choice) — SPEC section 5 does mention eventually adding
+  the module root as a second, harder corpus, but that is explicitly out of scope
+  for Days 8–11 and not part of this plan.
+
+**Before Day 8 begins, this plan needs your explicit sign-off on:**
+1. The `relational`/`blast_radius` subject-inclusion policy (section 3.2) — the one
+   genuine judgment call with no SPEC.md worked example behind it.
+2. The `CachingEmbeddingProvider` cost-reduction design (section 3.7) — an additive,
+   low-risk change, but flagged per your own instruction to surface it as a decision.
+3. Whether `data/eval_results/` should be committed or gitignored (section 3.8).
+
+Everything else in this plan follows directly from SPEC.md's literal text or from
+this project's own established conventions (Days 1–7), and doesn't need a separate
+decision before starting.
