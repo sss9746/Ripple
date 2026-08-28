@@ -138,6 +138,22 @@ def fetch_resource_bodies(
             return cursor.fetchall()
 
 
+def fetch_resource_addresses(repo_id: int) -> list[str]:
+    """Return every resource address stored for one repository."""
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT address
+                FROM resources
+                WHERE repo_id = %s
+                ORDER BY address
+                """,
+                (repo_id,),
+            )
+            return [address for (address,) in cursor.fetchall()]
+
+
 def fetch_bm25_documents(
     repo_id: int,
 ) -> list[tuple[int, str, str, int, int, str, str]]:

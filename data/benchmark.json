@@ -1,0 +1,144 @@
+[
+  {
+    "id": "q001",
+    "question": "Which Terraform block configures the main VPC and its subnet layout?",
+    "expected": ["module.vpc"],
+    "category": "lookup"
+  },
+  {
+    "id": "q002",
+    "question": "Which resource allows inbound PostgreSQL traffic on TCP port 5432?",
+    "expected": ["aws_security_group.rds"],
+    "category": "lookup"
+  },
+  {
+    "id": "q003",
+    "question": "Which module configures the S3, DynamoDB, ECS, ECR, and RDS VPC endpoints?",
+    "expected": ["module.vpc_endpoints"],
+    "category": "lookup"
+  },
+  {
+    "id": "q004",
+    "question": "Which module invocation explicitly disables VPC endpoint creation?",
+    "expected": ["module.vpc_endpoints_nocreate"],
+    "category": "lookup"
+  },
+  {
+    "id": "q005",
+    "question": "Which data block defines the DynamoDB endpoint policy?",
+    "expected": ["data.aws_iam_policy_document.dynamodb_endpoint_policy"],
+    "category": "lookup"
+  },
+  {
+    "id": "q006",
+    "question": "Which output exposes the VPC ID?",
+    "expected": ["output.vpc_id"],
+    "category": "lookup"
+  },
+  {
+    "id": "q007",
+    "question": "Which output exposes the NAT gateway public IP addresses?",
+    "expected": ["output.nat_public_ips"],
+    "category": "lookup"
+  },
+  {
+    "id": "q008",
+    "question": "Which output exposes the IDs of the private subnets?",
+    "expected": ["output.private_subnets"],
+    "category": "lookup"
+  },
+  {
+    "id": "q009",
+    "question": "What block does aws_security_group.rds directly depend on?",
+    "expected": ["module.vpc"],
+    "category": "relational"
+  },
+  {
+    "id": "q010",
+    "question": "What block does the locals block depend on to obtain availability-zone names?",
+    "expected": ["data.aws_availability_zones.available"],
+    "category": "relational"
+  },
+  {
+    "id": "q011",
+    "question": "What block does the DynamoDB endpoint policy directly depend on for its VPC ID?",
+    "expected": ["module.vpc"],
+    "category": "relational"
+  },
+  {
+    "id": "q012",
+    "question": "Which blocks does module.vpc_endpoints directly depend on?",
+    "expected": [
+      "aws_security_group.rds",
+      "data.aws_iam_policy_document.dynamodb_endpoint_policy",
+      "data.aws_iam_policy_document.generic_endpoint_policy",
+      "module.vpc"
+    ],
+    "category": "relational"
+  },
+  {
+    "id": "q013",
+    "question": "What block does output.vpc_endpoints_security_group_id directly depend on?",
+    "expected": ["module.vpc_endpoints"],
+    "category": "relational"
+  },
+  {
+    "id": "q014",
+    "question": "What is directly affected if aws_security_group.rds is removed?",
+    "expected": [
+      "aws_security_group.rds",
+      "module.vpc_endpoints"
+    ],
+    "category": "blast_radius"
+  },
+  {
+    "id": "q015",
+    "question": "What is directly affected if the DynamoDB endpoint policy is removed?",
+    "expected": [
+      "data.aws_iam_policy_document.dynamodb_endpoint_policy",
+      "module.vpc_endpoints"
+    ],
+    "category": "blast_radius"
+  },
+  {
+    "id": "q016",
+    "question": "What is directly affected if module.vpc_endpoints is removed?",
+    "expected": [
+      "module.vpc_endpoints",
+      "output.vpc_endpoints",
+      "output.vpc_endpoints_security_group_arn",
+      "output.vpc_endpoints_security_group_id"
+    ],
+    "category": "blast_radius"
+  },
+  {
+    "id": "q017",
+    "question": "What is directly affected if data.aws_availability_zones.available is removed?",
+    "expected": [
+      "data.aws_availability_zones.available",
+      "locals:main.tf:7"
+    ],
+    "category": "blast_radius"
+  },
+  {
+    "id": "q018",
+    "question": "Which blocks contain an explicit create = false setting?",
+    "expected": [
+      "module.vpc_endpoints",
+      "module.vpc_endpoints_nocreate"
+    ],
+    "category": "attribute"
+  },
+  {
+    "id": "q019",
+    "question": "Which block explicitly enables both DNS support and DNS hostnames?",
+    "expected": ["module.vpc"],
+    "category": "attribute"
+  },
+  {
+    "id": "q020",
+    "question": "Which blocks contain at least one private_dns_enabled = true setting?",
+    "expected": ["module.vpc_endpoints"],
+    "category": "attribute"
+  }
+]

@@ -342,3 +342,70 @@ def test_insert_query_log_round_trip() -> None:
         with db.get_connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute("DELETE FROM repos WHERE id = %s", (repo_id,))
+
+
+def test_fetch_resource_addresses_is_scoped_to_repo() -> None:
+    try:
+        connection = db.get_connection()
+    except (RuntimeError, psycopg.OperationalError):
+        pytest.skip("database not reachable")
+    else:
+        connection.close()
+
+    repo_ids: list[int] = []
+
+    def resource_row(address: str) -> _ResourceRow:
+        resource_type, resource_name = address.split(".", maxsplit=1)
+        return _ResourceRow(
+            block_kind="resource",
+            resource_type=resource_type,
+            resource_name=resource_name,
+            address=address,
+            file_path="main.tf",
+            start_line=1,
+            end_line=3,
+            body=f'resource "{resource_type}" "{resource_name}" {{}}',
+            embed_text=address,
+            embedding=[0.0] * 1536,
+        )
+
+    try:
+        requested_repo_id = db.insert_repo(
+            name="pytest-fetch-addresses-requested",
+            source_url=None,
+            local_path="/tmp/pytest-fetch-addresses-requested",
+        )
+        repo_ids.append(requested_repo_id)
+
+        other_repo_id = db.insert_repo(
+            name="pytest-fetch-addresses-other",
+            source_url=None,
+            local_path="/tmp/pytest-fetch-addresses-other",
+        )
+        repo_ids.append(other_repo_id)
+
+        db.replace_resources(
+            requested_repo_id,
+            [
+                resource_row("aws_vpc.zeta"),
+                resource_row("aws_subnet.alpha"),
+            ],
+        )
+        db.replace_resources(
+            other_repo_id,
+            [resource_row("aws_instance.other")],
+        )
+
+        assert db.fetch_resource_addresses(requested_repo_id) == [
+            "aws_subnet.alpha",
+            "aws_vpc.zeta",
+        ]
+    finally:
+        if repo_ids:
+            with db.get_connection() as connection:
+                with connection.cursor() as cursor:
+                    for repo_id in repo_ids:
+                        cursor.execute(
+                            "DELETE FROM repos WHERE id = %s",
+                            (repo_id,),
+                        )
