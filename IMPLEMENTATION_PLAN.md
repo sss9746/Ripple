@@ -250,6 +250,28 @@ reachable database — the direct implementation of SPEC 10.1's required validat
   test-run at a time would be exactly the "spend a day debugging retrieval that works
   fine" trap SPEC.md warns about.
 
+**How this gets tested is deliberately different from how it gets used for real
+acceptance, and must stay that way:** `validate_addresses_exist`'s *logic* (correctly
+reporting every missing pair, not just the first) is unit-tested by **monkeypatching
+`db.fetch_resource_addresses`** to return a small, fixed, in-test address set — no
+real database connection, and no dependency on which repo happens to be indexed on
+whatever machine runs the test suite. Separately, `db.fetch_resource_addresses`
+*itself* (the real SQL) is integration-tested against a **temporary, throwaway
+repo/resources setup** created and torn down inside the test (this project's existing
+ad hoc fixture pattern — insert a couple of rows, assert, then `DELETE FROM repos
+WHERE id = %s`, same cleanup convention used since Day 6/7) — **never** a lookup by a
+real repo's name like `vpc-complete`, which would make the test suite's pass/fail
+depend on which repo happens to exist in whatever database it's pointed at. Running
+`validate_addresses_exist` against the **real** `data/benchmark.json` (20 entries
+after Day 8, 40 after Day 9) and the **real, currently-indexed corpus's** `repo_id` is
+still a required acceptance step for both days — but it is a **manual command**
+(section 6's Day 8/9 acceptance), run once per day by whoever is finishing that day,
+using the real `repo_id` resolved per section 3.1, **not** an automated `pytest`
+test. This keeps `python -m pytest` fully portable — passable on any machine, with any
+database state or none at all, per the existing skip-if-unreachable convention — while
+still requiring the real validation to actually happen before either day is called
+done.
+
 **Semantic verification — a required human/Codex process step, not something
 `dataset.py` can check automatically:** confirming an address *exists* in the
 database is not the same as confirming the *question and its `expected` answer are
@@ -311,8 +333,10 @@ part and checks the results, which is much cheaper and faster.
 
 **Technical version:** `ripple/evaluation/runner.py` calls `pipeline.run_pipeline(
 repo_id, question, config)` and reads `result.blocks` (comparing `[block.address for
-block in result.blocks]` against `entry.expected`) and `result.latency_json[
-"total_ms"]`. **It never calls `ripple.llm.generate.answer_question` anywhere.** This
+block in result.blocks]` against `entry.expected`) and the **full** `result.
+latency_json` mapping, unchanged (section 3.6 explains why the complete per-stage
+mapping is preserved rather than reduced to `total_ms` at this point). **It never
+calls `ripple.llm.generate.answer_question` anywhere.** This
 is a hard requirement, verified by a dedicated test (section 6, Day 10) that fails
 loudly if `answer_question` is ever invoked during a benchmark run — protecting
 against exactly the "40 or 120 unnecessary generation calls" risk named in the
@@ -348,6 +372,57 @@ taken toward numeric edge cases):
 `[block.address for block in result.blocks]`, never re-sorted — since both
 `reciprocal_rank` and every `top-k` slice depend on order being preserved exactly as
 the pipeline produced it.
+
+**`final_k` must be at least 10 for Recall@10 to be meaningful.**
+`RetrievalConfig.final_k` defaults to `8` (`ripple/config.py`) — a production default
+tuned for answer-generation context size, not for evaluation. `PipelineResult.blocks`
+is capped at `final_k` items, so if evaluation scored `PipelineResult.blocks` under a
+`RetrievalConfig` using that default, `retrieved` could never contain 10 items and
+`recall_at_k(expected, retrieved, k=10)` would be structurally incapable of measuring
+what a `k=10` cutoff is supposed to measure — it would silently degrade to
+`recall_at_8` while still being printed and labeled as `Recall@10`. **This is an
+evaluation-only setting, not a change to `ripple/config.py`'s production default**:
+`ripple/evaluation/runner.py`'s `ABLATION_CONFIGS` (section 5) sets `final_k=10`
+explicitly on all three configs, alongside the already-set `vector_k=30`/`bm25_k=30`.
+Neither `ripple/config.py` nor `ripple/retrieval/pipeline.py` is touched — this is
+purely a choice of *which config values evaluation constructs and passes in*, exactly
+like every other field `ABLATION_CONFIGS` already sets explicitly (`use_rerank=False`
+etc.). Tests (section 6, Day 10) assert every entry in `ABLATION_CONFIGS` has
+`final_k >= 10`, and separately assert that a canned 10-block `PipelineResult` has all
+10 addresses survive into `QuestionResult.retrieved` unmodified. **Flagged for your
+awareness, not something this plan resolves inside `SPEC.md`**: SPEC.md's own
+`RetrievalConfig` default (`final_k=8`) and SPEC 10.3's `Recall@10` column are in
+tension for any caller that doesn't override `final_k` — e.g. `scripts/ask.py`'s
+default config returns at most 8 blocks, so a hypothetical Recall@10 measured against
+`ask.py`'s literal default would read differently (and worse) than what this plan
+reports using `final_k=10`. This plan resolves the tension only for its own three
+ablation rows, as SPEC 10.3's table demands; it does not edit `SPEC.md` or
+`ripple/config.py` to resolve the tension more broadly, since that's a genuine
+specification ambiguity, not a bug in this plan's own code (see also section 11).
+
+**Per-stage latency is preserved end to end, not collapsed to a total.** SPEC 10.2
+asks for per-stage latency (`rewrite`, `vector_query`, `hydrate`, `bm25`, `fusion`,
+`rerank`, `graph`, `total`), and `PipelineResult.latency_json` already reports exactly
+the stages that ran, keyed by name — a vector-only config's dict has only
+`{"vector_query_ms", "total_ms"}`; a vector+BM25+RRF config's has
+`{"vector_query_ms", "bm25_ms", "fusion_ms", "total_ms"}` — stages that did not
+execute are simply **absent** from the dict, never present with a misleading `0`.
+This plan preserves that shape all the way through: `QuestionResult` stores the
+**complete** `latency_json` mapping for that question (section 5's `latency` field),
+not just `total_ms`; `AggregateMetrics`/`CategoryMetrics` store the mean of
+`total_ms` across questions **and** the mean of every other stage key that appears in
+at least one question's latency mapping for that aggregate. A stage absent from every
+question's latency dict in a given config stays **absent** from that config's
+aggregate too — never backfilled with `0.0`, which would misleadingly suggest the
+stage ran instantly rather than not at all. `ConfigResult`'s JSON serialization
+(section 3.9) therefore carries both the raw per-question latency mappings and the
+aggregated per-stage means; the printed markdown table still shows only the single
+mean-`total_ms` **Latency (ms)** column, matching SPEC 10.3's table shape exactly —
+the richer per-stage data lives in JSON, without changing the table's column count.
+Tests (section 6, Day 10) hand-compute per-stage aggregation across at least two
+different executed-stage sets (a vector-only run's latency dicts have different keys
+than a vector+BM25+RRF run's) and confirm the aggregate only reports means for keys
+actually present in its input, never a synthesized zero for an absent one.
 
 ### 3.7 Cost and runtime — inspected, and deliberately left uncached
 
@@ -424,23 +499,46 @@ Create:
 - `tests/test_runner.py`
 
 Modify:
-- `ripple/db.py` — add **one** new function, `fetch_resource_addresses(repo_id) ->
-  list[str]` (`SELECT address FROM resources WHERE repo_id = %s`). Justification: the
-  existing `fetch_resource_bodies(repo_id)` returns `(id, address, body)` and *would*
-  technically work for the validator's existence check, but it always pulls every
-  block's full `body` text along with it — wasteful for a function whose only job is
-  "does this address exist," and it's called potentially many times (once per
-  `scripts/run_eval.py` invocation, plus every test run). A single-purpose, minimal
-  read is the more honest fit, consistent with this project's existing pattern of
-  narrow, purpose-built `db.py` functions (`fetch_bm25_documents` vs.
-  `fetch_resource_bodies` is the same kind of split, already precedented).
+- `ripple/db.py` — add **two** new, narrow functions:
+  - `fetch_resource_addresses(repo_id) -> list[str]` (`SELECT address FROM resources
+    WHERE repo_id = %s`). Justification: the existing `fetch_resource_bodies(repo_id)`
+    returns `(id, address, body)` and *would* technically work for the validator's
+    existence check, but it always pulls every block's full `body` text along with
+    it — wasteful for a function whose only job is "does this address exist," and
+    it's called potentially many times (once per `scripts/run_eval.py` invocation,
+    plus every test run). A single-purpose, minimal read is the more honest fit,
+    consistent with this project's existing pattern of narrow, purpose-built `db.py`
+    functions (`fetch_bm25_documents` vs. `fetch_resource_bodies` is the same kind of
+    split, already precedented).
+  - `fetch_repo(repo_id) -> tuple[str, str | None, str] | None` — returns
+    `(name, source_url, local_path)` for that repo, or `None` if it doesn't exist.
+    Justification (finding 7): there is currently **no** function that reads a
+    repo's own identity back by id — `insert_repo` only writes one. The
+    reproducibility-provenance report (section 3.9) needs the corpus's name and
+    `source_url` for identity, and its `local_path` to derive the corpus's Git
+    revision at runtime. Without a narrow, purpose-built read function,
+    `scripts/run_eval.py` would have no supported way to get this and would be
+    tempted to hand-write raw SQL outside `ripple/db.py`, breaking this project's
+    established pattern of keeping all database access inside that one module.
+- `tests/test_db.py` — this file is no longer untouched (see the corrected
+  Do-not-modify note below). It gains: a `fetch_resource_addresses` integration test
+  against a **temporary repo/resources setup** created and torn down inside the test
+  (finding 3, section 3.3 — never a lookup by a real repo's name); a `fetch_repo`
+  round-trip test (`insert_repo` then `fetch_repo` returns the same tuple back, and
+  `fetch_repo` on a nonexistent id returns `None`); both DB-dependent, both
+  skip-if-unreachable, same convention as every prior day.
 
 Do not modify: `SPEC.md`, `sql/schema.sql`, `docker-compose.yml`, `.env`/`.env.example`,
-`requirements.txt` (no new dependency — `json`, `dataclasses`, `statistics.mean` are
-all standard library), `ripple/config.py`, `ripple/ingest/*`, `ripple/llm/*`,
-`ripple/retrieval/*` (including `pipeline.py` — section 3.7 explains why its BM25
-injection gap is flagged, not fixed, this cycle), `scripts/index_repo.py`,
-`scripts/ask.py`, `AGENTS.md`, `CLAUDE.md`, `README.md`, and every existing test file.
+`requirements.txt` (no new dependency required — `json`, `dataclasses`,
+`statistics.mean`, `hashlib`, and `subprocess` are all standard library, and if
+`GitPython` is used for section 3.9's Git-revision lookup instead of `subprocess`, it
+is already a dependency since Day 1's `scripts/index_repo.py`), `ripple/config.py`,
+`ripple/ingest/*`, `ripple/llm/*`, `ripple/retrieval/*` (including `pipeline.py` —
+section 3.7 explains why its BM25 injection gap is flagged, not fixed, this cycle),
+`scripts/index_repo.py`, `scripts/ask.py`, `AGENTS.md`, `CLAUDE.md`, `README.md`.
+**Every existing test file is untouched except `tests/test_db.py`** (see Modify
+above) — this replaces the prior, now-inaccurate claim that every existing test file
+was left alone.
 
 ## 5. Interfaces and data structures
 
@@ -473,7 +571,11 @@ class QuestionResult:
     recall_at_10: float
     reciprocal_rank_value: float
     precision_at_5: float
-    latency_ms: float
+    latency: dict[str, float]
+    # Full PipelineResult.latency_json for this question, e.g.
+    # {"vector_query_ms": .., "total_ms": ..} -- keys present depend on which
+    # stages executed for this config (section 3.6). Never reduced to a single
+    # float here.
 
 @dataclass
 class AggregateMetrics:
@@ -483,12 +585,17 @@ class AggregateMetrics:
     mrr: float
     precision_at_5: float
     mean_latency_ms: float
+    mean_latency_by_stage: dict[str, float]
+    # Mean of every stage key present in at least one input QuestionResult's
+    # `latency` dict, computed only over the questions that have that key. A key
+    # absent from every question's latency dict is absent here too -- never a
+    # synthesized 0.0 (section 3.6).
 
 @dataclass
 class CategoryMetrics(AggregateMetrics):
     category: str
 
-def score_question(entry: BenchmarkEntry, retrieved: list[str], latency_ms: float) -> QuestionResult: ...
+def score_question(entry: BenchmarkEntry, retrieved: list[str], latency: dict[str, float]) -> QuestionResult: ...
 def aggregate(results: list[QuestionResult]) -> AggregateMetrics: ...
 def aggregate_by_category(results: list[QuestionResult]) -> list[CategoryMetrics]: ...
 ```
@@ -521,60 +628,132 @@ def run_benchmark(
 # read them yet (Day 12/13/15), but setting them explicitly now means these three
 # configs stay "vector/BM25/RRF only" even after those stages are wired in later,
 # rather than silently picking up reranking/graph/rewrite the day pipeline.py starts
-# reading them.
+# reading them. final_k=10 is set explicitly on every row (finding 1 / section 3.6):
+# RetrievalConfig's production default is final_k=8, which would make Recall@10
+# structurally invalid (PipelineResult.blocks could never hold 10 items). This is an
+# evaluation-only override -- ripple/config.py's default is unchanged. vector_k=30
+# and bm25_k=30 are also unchanged from RetrievalConfig's own defaults.
 ABLATION_CONFIGS: list[tuple[str, RetrievalConfig]] = [
     ("Vector only", RetrievalConfig(
         use_vector=True, use_bm25=False, use_rrf=False,
         use_rerank=False, use_graph=False, use_rewrite=False,
+        final_k=10,
     )),
     ("Vector + BM25", RetrievalConfig(
         use_vector=True, use_bm25=True, use_rrf=False,
         use_rerank=False, use_graph=False, use_rewrite=False,
+        final_k=10,
     )),
     ("Vector + BM25 + RRF", RetrievalConfig(
         use_vector=True, use_bm25=True, use_rrf=True,
         use_rerank=False, use_graph=False, use_rewrite=False,
+        final_k=10,
     )),
 ]
+
+GIT_REVISION_UNAVAILABLE = "unavailable"
+
+def _corpus_git_revision(local_path: str) -> str:
+    # Best-effort only -- provenance metadata must never crash a real run. Either
+    # GitPython (git.Repo(local_path).head.commit.hexsha) or a subprocess call
+    # (subprocess.run(["git", "rev-parse", "HEAD"], cwd=local_path, capture_output=True,
+    # text=True, check=True).stdout.strip()) is acceptable; both are wrapped in a
+    # broad try/except so a missing directory, a directory that isn't a git repo, a
+    # git repo with no commits, or git not being installed all fall back to
+    # GIT_REVISION_UNAVAILABLE rather than raising out of build_report.
+    ...
+
+def build_report(
+    repo_id: int,
+    benchmark_path: str,
+    benchmark_sha256: str,
+    results: list[ConfigResult],
+) -> dict:
+    # Assembles the full provenance-carrying report (section 3.9). Calls the new
+    # db.fetch_repo(repo_id) for corpus identity/local_path, then
+    # _corpus_git_revision(local_path) for the Git revision. Never reads os.environ
+    # directly and never includes anything from it in the returned dict -- the only
+    # per-run facts in the report are repo_id, benchmark_path/hash, corpus identity,
+    # embedding_model, and the ConfigResults themselves (finding 7's secrets-exclusion
+    # requirement).
+    ...
 ```
 
-`PipelineResult.blocks` is consumed only as `[b.address for b in result.blocks]`;
-`latency_json` only as `result.latency_json["total_ms"]`. `result.config_json`/
-`stages_json` are not consumed by the runner at all — they exist for `query_logs`
-(Day 6), not for benchmark scoring, and `run_benchmark` does not call
-`db.insert_query_log` either (that would write 40–120 log rows per run for no
-benefit; evaluation and logged production queries are different concerns).
+`PipelineResult.blocks` is consumed only as `[b.address for b in result.blocks]`; the
+**full** `latency_json` mapping is passed through to `score_question` and stored on
+`QuestionResult.latency` unchanged (section 3.6) — never reduced to `total_ms` before
+that point. `result.config_json`/`stages_json` are not consumed by the runner at all —
+they exist for `query_logs` (Day 6), not for benchmark scoring, and `run_benchmark`
+does not call `db.insert_query_log` either (that would write 40–120 log rows per run
+for no benefit; evaluation and logged production queries are different concerns).
+`build_report` (above) is the only place provenance assembly (`db.fetch_repo`, Git
+revision, benchmark hashing) happens — `run_benchmark` itself stays focused purely on
+scoring one config and knows nothing about provenance.
+
+```python
+# ripple/db.py addition (finding 7)
+def fetch_repo(repo_id: int) -> tuple[str, str | None, str] | None:
+    # Returns (name, source_url, local_path) for repo_id, or None if it doesn't
+    # exist. SELECT name, source_url, local_path FROM repos WHERE id = %s.
+    ...
+```
 
 ```python
 # scripts/run_eval.py (sketch)
 def main(argv=None):
     args = parse_args(argv)   # --repo-id (required), --benchmark (default data/benchmark.json),
                                # --config NAME (optional; omit = all three), --yes
+    benchmark_bytes = Path(args.benchmark).read_bytes()
+    benchmark_sha256 = hashlib.sha256(benchmark_bytes).hexdigest()       # finding 7
     entries = load_benchmark(args.benchmark)
     validate_addresses_exist(entries, args.repo_id)      # fail fast, before spending anything
     configs = [(args.config, dict(ABLATION_CONFIGS)[args.config])] if args.config else ABLATION_CONFIGS
     confirm_cost(len(entries), len(configs), skip=args.yes)   # section 3.7 -- real, uncached counts
     results = [run_benchmark(args.repo_id, entries, cfg, name) for name, cfg in configs]
     print(render_markdown_table(results))
-    save_json(results, path=timestamped_path())          # section 3.8 -- written locally; staging
-                                                           # the file into git is a separate, deliberate
-                                                           # review step (section 3.8), not part of main()
+    report = build_report(                                # finding 7 -- provenance + results
+        repo_id=args.repo_id,
+        benchmark_path=args.benchmark,
+        benchmark_sha256=benchmark_sha256,
+        results=results,
+    )
+    path = timestamped_path()             # UTC, microsecond precision -- section 3.8
+    with path.open("x") as f:             # exclusive create -- raises FileExistsError
+        json.dump(report, f, indent=2, default=dataclasses.asdict)  # rather than overwriting (finding 5)
+    print(f"Wrote {path}")
+    # Staging/committing this file into git is a separate, deliberate, manual review
+    # step (section 3.8) -- never done automatically here.
 ```
 
 ### 3.8 Output behavior
 
 - **Markdown**: always printed to stdout, in section 10.3's exact column order
   (`Configuration | Recall@5 | Recall@10 | MRR | P@5 | Latency (ms)`), plus a
-  per-category breakdown table beneath it. Not auto-written into `README.md` — that
-  stays a manual, deliberate copy-paste step for whichever day writes the README
-  (Day 19), never silently automated here.
-- **JSON**: always written **locally** to `data/eval_results/<UTC-timestamp>.json`
-  (e.g. `data/eval_results/2026-08-28T14-30-00Z.json`) — **a new file every run,
-  nothing is ever silently overwritten.** Contains every `ConfigResult` (aggregate,
-  per-category, and full per-question detail — the actual raw material "for reruns"
-  SPEC.md asks for). `data/eval_results/` is **not** gitignored — it's a normal,
-  tracked directory — but writing the file and committing it are two separate,
-  deliberate actions, not one:
+  per-category breakdown table beneath it. `Latency (ms)` is the mean **total**
+  latency only — section 3.6's richer per-stage detail lives in JSON, not the table,
+  since SPEC 10.3's table has exactly one latency column. Not auto-written into
+  `README.md` — that stays a manual, deliberate copy-paste step for whichever day
+  writes the README (Day 19), never silently automated here.
+- **JSON: exactly one report file per `scripts/run_eval.py` invocation, whatever
+  number of configs it ran (finding 5).** There is no "one file or three" choice —
+  a single `--config NAME` run writes one file whose `results` list holds **one**
+  `ConfigResult`; a run with no `--config` (all three `ABLATION_CONFIGS`) writes one
+  file whose `results` list holds all **three**. The report is always the single
+  schema in section 3.9, regardless of how many entries its `results` list holds — no
+  caller ever has to guess whether a given file holds one row or three.
+- **Filenames are collision-resistant, and creation is exclusive, so nothing is ever
+  silently overwritten (finding 5):** `data/eval_results/
+  <UTC-timestamp-with-microseconds>.json` (e.g.
+  `data/eval_results/2026-08-28T14-30-00-123456Z.json`) — **microsecond** precision,
+  not second precision, because two runs started in quick succession (e.g. a Day 11
+  re-run immediately after fixing a bug, per section 6's Step 3) could otherwise
+  collide on the same second-precision filename. The file is opened with Python's
+  **exclusive-create mode** (`path.open("x")`) — which *raises* `FileExistsError`
+  rather than silently truncating/overwriting an existing file — so even a genuine
+  timestamp collision fails loudly instead of quietly destroying a prior run's
+  evidence. `data/eval_results/` is **not** gitignored — it's a normal, tracked
+  directory — but writing the file and committing it are two separate, deliberate
+  actions, not one:
   - `scripts/run_eval.py` only ever **writes the file to disk**. It never runs `git
     add`/`git commit` itself, and every run produces a file whether the results turn
     out to be exactly what was expected or not.
@@ -586,14 +765,83 @@ def main(argv=None):
     bug fix partway through, or an exploratory run made while debugging something
     unrelated is left as an uncommitted (or manually deleted) local file — never
     swept in with a blanket `git add data/eval_results/`.
-  - Concretely, across this plan's own milestones: the accepted Day 10 single-row
-    result gets committed with Day 10's commit; the accepted Day 11 three-row result
-    gets committed with Day 11's commit. Any earlier attempts at either that didn't
-    make the cut are not part of either commit.
+  - Concretely, across this plan's own milestones: the accepted Day 10 run writes one
+    file with one `ConfigResult`, committed with Day 10's commit; the accepted Day 11
+    run writes one file with three `ConfigResult`s, committed with Day 11's commit.
+    Any earlier attempts at either that didn't make the cut are not part of either
+    commit.
   - This is a documented **process** step (section 6/7), not something
-    `scripts/run_eval.py`'s code enforces — the script cannot know which run you've
-    decided to accept; that judgment is exactly what "investigate anything
-    surprising before proceeding" (SPEC.md, Day 11) requires a human for.
+    `scripts/run_eval.py`'s code enforces beyond refusing to silently overwrite — the
+    script cannot know which run you've decided to accept; that judgment is exactly
+    what "investigate anything surprising before proceeding" (SPEC.md, Day 11)
+    requires a human for.
+
+### 3.9 Reproducibility provenance
+
+Every accepted JSON report (section 3.8) is not just numbers — it's evidence that a
+specific run of specific code, against a specific corpus state, produced those
+numbers. `build_report` (section 5) assembles one top-level JSON object per
+invocation:
+
+```json
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-28T14:30:00.123456Z",
+  "repo_id": 13,
+  "benchmark_path": "data/benchmark.json",
+  "benchmark_sha256": "<sha256 of the exact benchmark file bytes used for this run>",
+  "corpus": {
+    "repo_name": "vpc-complete",
+    "source_url": null,
+    "local_path": ".repos/terraform-aws-vpc/examples/complete",
+    "git_revision": "<HEAD commit hash, or \"unavailable\">"
+  },
+  "embedding_model": "text-embedding-3-small",
+  "question_count": 40,
+  "results": [
+    {
+      "config_name": "Vector only",
+      "config": { "...": "dataclasses.asdict(RetrievalConfig) -- every field" },
+      "aggregate": { "...": "AggregateMetrics, including mean_latency_by_stage" },
+      "by_category": [ "...": "CategoryMetrics per category" ],
+      "per_question": [ "...": "QuestionResult per entry, including the full latency dict" ]
+    }
+  ]
+}
+```
+
+- `repo_id`, `benchmark_path`, and `benchmark_sha256` are **never hardcoded anywhere
+  in application code** — `repo_id` comes from the CLI argument (section 3.1),
+  `benchmark_path` from the CLI's `--benchmark` default or override, and
+  `benchmark_sha256` is computed fresh, at runtime, from the exact bytes read for
+  that invocation.
+- **`corpus.git_revision` is derived at runtime, never hardcoded.** `db.fetch_repo`
+  (new function, section 4) returns the repo's own `local_path` column; `runner.py`'s
+  `_corpus_git_revision(local_path)` (section 5) resolves that path's current `HEAD`
+  commit — via `GitPython` (`git.Repo(local_path).head.commit.hexsha`, already a
+  project dependency since Day 1) or an equivalent `subprocess` call to
+  `git rev-parse HEAD`, implementer's choice. If `local_path` no longer exists, isn't
+  a Git repository, or Git isn't available, this reports the literal string
+  `"unavailable"` rather than crashing the run — provenance metadata failing to
+  resolve is not a reason to lose an otherwise-valid evaluation result.
+  `EMBEDDING_MODEL` is imported from `ripple.llm.embeddings` (currently
+  `"text-embedding-3-small"`), never re-typed as a string literal in `runner.py`, so
+  it can't silently drift out of sync if the constant ever changes.
+- **Every result row carries its own complete, serialized `RetrievalConfig`**
+  (`dataclasses.asdict(result.config)`) — so a reader of the JSON file never has to
+  cross-reference `ABLATION_CONFIGS`' current source code to know exactly what
+  configuration produced a given row, even if that source later changes.
+- **No secrets appear anywhere in this structure.** `build_report` only ever reads
+  from its explicit parameters, `db.fetch_repo`'s return value, and
+  `ripple.llm.embeddings.EMBEDDING_MODEL` — it never touches `os.environ` and never
+  serializes anything sourced from `.env` (`DATABASE_URL`, `OPENAI_API_KEY`). This is
+  verified by a dedicated test (section 6, Day 10) that sets a fake secret in the
+  environment and asserts it doesn't appear anywhere in a report built from fake data.
+- Tests (section 6, Day 10) also cover: deterministic hashing (same file bytes hashed
+  twice match; different content doesn't); correct `RetrievalConfig` serialization;
+  `_corpus_git_revision` against both a real temporary Git repo and a non-Git
+  directory; the collision-safe write behavior (finding 5); and that a three-config
+  run's report has exactly one file with three `results` entries.
 
 ## 6. Day-by-day plan
 
@@ -620,16 +868,34 @@ rejected; invalid `category` rejected; empty `expected` rejected; duplicate addr
 *within* one entry's `expected` rejected; non-array top-level JSON rejected — each as
 its own small, targeted test using an inline JSON string or a `tmp_path`-written
 file, not the real 20-entry file (keeps these tests fast, offline, and independent of
-how many real entries currently exist). DB validation test (skip-if-unreachable,
-same convention as every prior day): a fake `repo_id`/known-bad address correctly
-reported as missing; the real 20-entry file passes against the real corpus's
-`repo_id` (this one specific test legitimately needs the real environment-resolved
-`repo_id` — resolve it the same way section 3.1 shows, never hardcoded).
+how many real entries currently exist). `validate_addresses_exist` logic test
+(offline, **monkeypatching `db.fetch_resource_addresses`** to a fixed fake address
+set — no real database, section 3.3): a known-bad address is reported missing; and
+**multiple** missing `(entry_id, address)` pairs across multiple entries are **all**
+reported in one failure, not just the first. `tests/test_db.py` addition:
+`fetch_resource_addresses` **integration** test against a temporary repo/resources
+setup created and torn down inside the test (DB-dependent, skip-if-unreachable, same
+convention as every prior day — never a lookup by a real repo's name like
+`vpc-complete`, per section 3.3).
 
-**Acceptance**: 20 entries in `data/benchmark.json`; `load_benchmark` and
-`validate_addresses_exist` both pass; every entry has had its source manually read
-and confirmed (section 3.3) — this is the "semantically verified" half of Day 8's
-"Done when," and it's a checklist a test suite cannot certify for you.
+**Manual acceptance command** (not a `pytest` test — section 3.3): after authoring all
+20 entries, verify them against the real, indexed corpus:
+```python
+from ripple.evaluation.dataset import load_benchmark, validate_addresses_exist
+
+REPO_ID = ...  # resolved per section 3.1, never hardcoded
+entries = load_benchmark("data/benchmark.json")
+validate_addresses_exist(entries, REPO_ID)  # raises if anything is missing
+print(f"{len(entries)} entries, all addresses verified against repo_id={REPO_ID}")
+```
+This is the actual, required check that today's 20 real addresses exist in the real
+database — it just isn't automated, for the portability reason section 3.3 explains.
+
+**Acceptance**: 20 entries in `data/benchmark.json`; `load_benchmark` passes (pytest);
+the manual acceptance command above passes against the real corpus; every entry has
+had its source manually read and confirmed (section 3.3) — this is the "semantically
+verified" half of Day 8's "Done when," and it's a checklist a test suite cannot
+certify for you.
 
 ### Day 9 — 20 more, to 40 total
 
@@ -638,14 +904,15 @@ and confirmed (section 3.3) — this is the "semantically verified" half of Day 
 Same process as Day 8 (section 3.4 workflow, section 3.2 policy, manual source
 verification per entry).
 
-**Step 2** — Re-run `load_benchmark` + `validate_addresses_exist` against all 40.
+**Step 2** — Re-run the Day 8 manual acceptance command against all 40 entries.
 
 **Tests**: no new *test code* is required beyond Day 8's (the validator logic doesn't
-change) — but the existing DB-validation test that runs against the real file must
-now pass against 40 entries, and it's worth a light assertion on the final category
-distribution (e.g. `assert counts["relational"] >= 8` or similar loose bound) so a
-future accidental edit to `benchmark.json` that skews the mix back toward all-`lookup`
-gets caught.
+change, and the manual acceptance command is re-run, not re-written). It's worth
+adding one small, offline, pure structural test in `tests/test_dataset.py` that reads
+the real `data/benchmark.json` directly (no database) and asserts the final category
+distribution stays within a loose bound (e.g. `assert counts["relational"] >= 8`), so
+a future accidental edit to `benchmark.json` that skews the mix back toward
+all-`lookup` gets caught by `pytest` without needing a database connection.
 
 **Acceptance**: 40 entries total; validator passes; every entry semantically
 verified; category counts close to 15/10/8/7 (exact SPEC wording is "aim for
@@ -655,18 +922,27 @@ roughly," not an exact requirement — don't force it if reality lands at, say,
 ### Day 10 — metrics, runner, first real row
 
 **Step 1** — `ripple/evaluation/metrics.py`: the three SPEC 10.2 functions plus
-section 3.6's edge-case guards, `QuestionResult`/`AggregateMetrics`/`CategoryMetrics`,
-`score_question`/`aggregate`/`aggregate_by_category`.
+section 3.6's edge-case guards and per-stage latency aggregation policy (finding 2),
+`QuestionResult`/`AggregateMetrics`/`CategoryMetrics` (now carrying per-question
+latency dicts and per-stage aggregate means — section 5), `score_question`/
+`aggregate`/`aggregate_by_category`.
 
-**Step 2** — `ripple/evaluation/runner.py`: `ConfigResult`, `run_benchmark`,
-`ABLATION_CONFIGS` (section 5). `run_benchmark` calls `pipeline.run_pipeline` with no
-`embedder` override — every call uses the pipeline's own default, uncached
-`OpenAIEmbeddingProvider()` (section 3.7).
+**Step 2** — `ripple/db.py`: add `fetch_repo(repo_id)` (finding 7, section 4).
 
-**Step 3** — `scripts/run_eval.py`: CLI, cost confirmation gate, markdown + timestamped
-JSON output (section 3.8).
+**Step 3** — `ripple/evaluation/runner.py`: `ConfigResult`, `run_benchmark`,
+`ABLATION_CONFIGS` (section 5, each entry now with `final_k=10` explicit per finding
+1/section 3.6), `_corpus_git_revision`, `build_report` (section 3.9 — assembles the
+provenance-carrying report, calling the new `db.fetch_repo`). `run_benchmark` calls
+`pipeline.run_pipeline` with no `embedder` override — every call uses the pipeline's
+own default, uncached `OpenAIEmbeddingProvider()` (section 3.7) — and passes the
+**full** `result.latency_json` mapping through to `score_question` unchanged
+(section 3.6).
 
-**Step 4** — First real, paid run: **confirm before this step** (section 3.7). One
+**Step 4** — `scripts/run_eval.py`: CLI, cost confirmation gate, benchmark hashing,
+markdown output, and the single exclusively-created, microsecond-timestamped JSON
+report (sections 3.8, 3.9).
+
+**Step 5** — First real, paid run: **confirm before this step** (section 3.7). One
 config only — `"Vector + BM25 + RRF"` is the natural choice (it's the pipeline's
 current full capability). ~40 embedding requests, zero generation calls.
 
@@ -677,30 +953,60 @@ current full capability). ~40 embedding requests, zero generation calls.
   raises for both `recall_at_k` and `precision_at_k`; empty `expected` raises for
   `recall_at_k`; `aggregate([])` raises; `aggregate_by_category` returns categories in
   sorted order regardless of input order; a mixed-category input produces correct
-  per-category means (hand-computed).
+  per-category means (hand-computed); **per-stage latency aggregation** (finding 2):
+  hand-computed `mean_latency_by_stage` across two sets of `QuestionResult`s whose
+  `latency` dicts have **different key sets** (one set all having only
+  `{"vector_query_ms", "total_ms"}`, another all having `{"vector_query_ms",
+  "bm25_ms", "fusion_ms", "total_ms"}`), confirming a stage absent from every input
+  dict stays absent from the aggregate, never backfilled with `0.0`.
 - `runner.py`: `run_benchmark` with `pipeline.run_pipeline` **monkeypatched** (module
   level, matching Day 6's established pattern for `test_pipeline.py`) to return
   canned `PipelineResult`s keyed by question — never a real database, never a real
   `OPENAI_API_KEY`. Assert: `retrieved` passed into `score_question` matches
-  `[b.address for b in canned_result.blocks]` in the same order; `latency_ms` comes
-  from `canned_result.latency_json["total_ms"]`; **a dedicated test asserting
-  `answer_question` is never imported/called** by monkeypatching
-  `ripple.llm.generate.answer_question` to raise if invoked, then running
-  `run_benchmark` end to end and confirming it never fires (the direct test for
-  section 3.5's independence requirement).
-- `scripts/run_eval.py` — at minimum, an argument-parsing test (monkeypatch
-  `run_benchmark` to a stub, assert the right `repo_id`/config selection reaches it)
-  and a confirmation-gate test (declining the `y` prompt makes no calls to
-  `run_benchmark` at all) — both offline, no real API/DB.
-- `tests/test_db.py` addition: `fetch_resource_addresses` round-trip (DB-dependent,
-  skip-if-unreachable, same convention as every prior day).
+  `[b.address for b in canned_result.blocks]` in the same order; `QuestionResult.latency`
+  equals `canned_result.latency_json` **unchanged** (finding 2 — not reduced to
+  `total_ms`); **a dedicated test asserting `answer_question` is never
+  imported/called** by monkeypatching `ripple.llm.generate.answer_question` to raise
+  if invoked, then running `run_benchmark` end to end and confirming it never fires
+  (the direct test for section 3.5's independence requirement); **a config test**
+  (finding 1) asserting every entry in `ABLATION_CONFIGS` has `final_k >= 10`; **a
+  10-block preservation test** (finding 1) using a canned `PipelineResult` with 10
+  `RetrievedBlock`s, confirming all 10 addresses survive into
+  `QuestionResult.retrieved` with nothing along the way silently truncating below 10.
+- `runner.py` — `build_report` (finding 7): benchmark hashing is deterministic (the
+  same file bytes hashed twice match; different content produces a different hash);
+  `RetrievalConfig` serializes correctly via `dataclasses.asdict` (spot-check a few
+  fields); the assembled report contains no secret values — a test sets a fake
+  `OPENAI_API_KEY`/`DATABASE_URL` in the environment, builds a report from fake data,
+  and asserts neither fake value appears anywhere in the serialized JSON string;
+  `_corpus_git_revision` returns the real `HEAD` commit hash for a temporary
+  directory that **is** a real Git repo (created inside the test, e.g. `git init` plus
+  one commit in `tmp_path`) and returns `GIT_REVISION_UNAVAILABLE` for a `tmp_path`
+  that is **not** a Git repo.
+- `scripts/run_eval.py` — argument-parsing test (monkeypatch `run_benchmark` to a
+  stub, assert the right `repo_id`/config selection reaches it); confirmation-gate
+  test (declining the `y` prompt makes no calls to `run_benchmark` at all); **output
+  test** (finding 5): a single-config run writes exactly one file whose `results`
+  list has one entry, an all-three-configs run writes exactly one file whose
+  `results` list has three; **collision-safe write test** (finding 5): monkeypatching
+  the timestamp source to return the same value twice and asserting the second write
+  attempt raises `FileExistsError`, leaving the first file's content untouched — all
+  offline, no real API/DB.
+- `tests/test_db.py` additions (finding 4): `fetch_resource_addresses` **integration**
+  test against a temporary repo/resources setup created and torn down inside the test
+  (DB-dependent, skip-if-unreachable, section 3.3); `fetch_repo` round-trip test —
+  `insert_repo` followed by `fetch_repo` returns the same `(name, source_url,
+  local_path)`, and `fetch_repo` on a nonexistent id returns `None` (DB-dependent,
+  skip-if-unreachable).
 
 **Acceptance**: `python -m pytest` passes (existing 123 plus this cycle's new tests —
 see section 10 for why an exact new total isn't quoted); one real, confirmed run of
 `scripts/run_eval.py --repo-id <resolved> --config "Vector + BM25 + RRF"` produces a
-real Recall@5/MRR row, printed and saved to a timestamped JSON file, using the real,
-resolved `repo_id` (never `13` hardcoded anywhere in the command's own script — only
-ever passed as a CLI argument at invocation time).
+real Recall@5/MRR row with full per-stage latency and provenance metadata
+(section 3.9), printed and saved to exactly one exclusively-created,
+microsecond-timestamped JSON file (section 3.8) containing that one `ConfigResult`,
+using the real, resolved `repo_id` (never `13` hardcoded anywhere in the command's
+own script — only ever passed as a CLI argument at invocation time).
 
 ### Day 11 — first three ablation rows
 
@@ -725,10 +1031,12 @@ as final for this cycle.
 configs; there's no new *code* to unit test, only a new *run* to produce and read
 correctly.
 
-**Acceptance**: three real rows exist (in one timestamped JSON file, or three — see
-implementation-time choice, either is fine as long as nothing is overwritten
-silently), each number traceable to an actual run, and you can explain each row
-(section 11's own "Done when": "three rows exist and you can explain each one").
+**Acceptance**: three real rows exist, all inside the single JSON report file that
+invocation produced (section 3.8 — a `--config`-less run always writes exactly one
+file containing all three `ConfigResult`s; there is no ambiguity about file count),
+each with full per-stage latency and provenance metadata (section 3.9), each number
+traceable to an actual run, and you can explain each row (section 11's own "Done
+when": "three rows exist and you can explain each one").
 
 ## 7. Practical execution order (the actual collaboration loop)
 
@@ -766,7 +1074,16 @@ For each step listed under Days 8–11 above:
 
 ## 9. Security and process
 
-- `.env` is never read, printed, or edited by anything in this plan.
+- `.env` **may be read** — `ripple/db.py`, `ripple/llm/embeddings.py`, and
+  `ripple/llm/generate.py` all call `load_dotenv()` at import time (established since
+  Day 1), so any evaluation code that imports `ripple.db`/`ripple.retrieval.pipeline`
+  transitively reads `.env` through this project's normal, already-established
+  pattern — that is expected, and not a violation of anything. What this plan holds
+  to exactly, like every prior day: `.env` is never **modified**, never **printed**,
+  never **staged**, and never **committed** by anything in this plan, and no secret it
+  contains (API keys, database credentials) ever appears in a result JSON file, a log
+  line, a terminal summary, or a commit (section 3.9 covers the specific,
+  test-verified guarantee for evaluation report JSON).
 - No secrets (API keys, database credentials) appear in any committed file, log, or
   test output — the existing `python-dotenv` + environment-variable pattern is
   unchanged.
@@ -784,9 +1101,11 @@ For each step listed under Days 8–11 above:
 Per the request, this plan does **not** guess an exact "before/after" test-count
 number the way Days 5–7's plans did. Those cycles added a small, fully-enumerated set
 of parametrized cases to *existing* test files, so the arithmetic was mechanical and
-verifiable in advance. This cycle adds **three new test files** whose exact test
-count depends on authoring choices made during implementation (how many distinct
-edge cases `test_dataset.py` ends up covering, exactly how `test_runner.py` is
+verifiable in advance. This cycle adds **three new test files** (`test_dataset.py`,
+`test_metrics.py`, `test_runner.py`) plus targeted additions to one existing file
+(`tests/test_db.py`, finding 4) whose exact test count depends on authoring choices
+made during implementation (how many distinct edge cases `test_dataset.py` ends up
+covering, exactly how `test_runner.py`'s per-stage-latency and provenance tests are
 structured, etc.) — stating a precise number now would be a guess dressed up as a
 fact. What's verifiable in advance: `python -m pytest` must show **123 + (every new
 test this cycle adds)**, all passing, with zero regressions to the existing 123.
@@ -830,15 +1149,46 @@ test this cycle adds)**, all passing, with zero regressions to the existing 123.
   every prior day's corpus choice) — SPEC section 5 does mention eventually adding
   the module root as a second, harder corpus, but that is explicitly out of scope
   for Days 8–11 and not part of this plan.
+- **`RetrievalConfig.final_k` defaults to `8` in `ripple/config.py`, but SPEC 10.3
+  requires a `Recall@10` column (section 3.6, finding 1).** This plan's own three
+  ablation rows resolve this by setting `final_k=10` explicitly in
+  `ABLATION_CONFIGS` — an evaluation-only override, not a change to the production
+  default. The underlying tension is real and broader than this plan: any other
+  caller of `pipeline.run_pipeline` that doesn't override `final_k` (e.g.
+  `scripts/ask.py`'s own default) would produce a different, worse-looking Recall@10
+  if measured against it. Flagged for your awareness; not resolved in `SPEC.md` or
+  `ripple/config.py` by this plan, since that would be a broader specification
+  decision, not a bug in Days 8–11's own code.
+- **`corpus.git_revision` in the provenance report (section 3.9, finding 7) can
+  legitimately be `"unavailable"`** — if the indexed repo's `local_path` no longer
+  exists on disk, isn't a Git repository, or Git isn't installed in the environment
+  running `scripts/run_eval.py`. This is a deliberate, honest fallback, not an error
+  that blocks the run: provenance metadata failing to resolve is not a reason to
+  discard an otherwise-valid evaluation result. If this happens on an accepted,
+  committed report, it's worth noting in that day's commit message so the gap in
+  reproducibility metadata is visible later, not silently buried in a JSON field.
 
-**All three decisions previously flagged for sign-off are now resolved**, per your
-explicit decisions above:
+**All three decisions previously flagged for sign-off remain resolved**, per your
+explicit decisions from that round:
 1. Labeling policy (section 3.2) — approved as written.
-2. No `CachingEmbeddingProvider` — removed from this plan entirely (interfaces,
+2. No `CachingEmbeddingProvider` — absent from this plan entirely (interfaces,
    pseudocode, tests, cost estimates, runner construction, acceptance criteria); cost
-   estimates now state the real, uncached request counts.
+   estimates state the real, uncached request counts (**~40 embedding requests for
+   Day 10's one configuration, ~120 for Day 11's three**).
 3. `data/eval_results/` is committed, with a deliberate review-then-stage workflow
    rather than blanket auto-commit (section 3.8).
+
+**This revision additionally resolves Codex's 8 final review findings**: Recall@10
+validity via explicit `final_k=10` (finding 1, section 3.6); full per-stage latency
+preservation instead of total-only (finding 2, sections 3.6/5); removal of the
+real-corpus-named `pytest` coupling in favor of monkeypatched/temp-repo tests plus a
+manual acceptance command (finding 3, sections 3.3/6); `tests/test_db.py` correctly
+listed in file scope (finding 4, section 4); collision-safe, exclusively-created,
+one-report-per-invocation output (finding 5, section 3.8); an accurate `.env`
+statement (finding 6, section 9); a full reproducibility-provenance schema with
+runtime Git-revision derivation and a new, justified `db.fetch_repo` helper (finding
+7, sections 3.9/4/5); and a full audit removing the stale references those findings
+identified while preserving every previously-approved decision (finding 8).
 
 Everything else in this plan follows directly from SPEC.md's literal text or from
 this project's own established conventions (Days 1–7). Day 8 can begin.
