@@ -201,10 +201,14 @@ a benchmark that silently measures the wrong thing.
   doing any actual relational reasoning, which is exactly the signal `relational`
   and `blast_radius` exist to isolate (SPEC: "Blast radius and relational questions
   are where graph expansion earns its row"). **This asymmetry between the two
-  categories is deliberate and should be stated explicitly wherever the labeling
-  policy is documented** (a code comment at the top of `data/benchmark.json`'s
-  authoring notes, or `dataset.py`'s docstring) so it's never "fixed" into
-  inconsistency later by someone assuming both categories work the same way.
+  categories is deliberate and must be documented in `ripple/evaluation/dataset.py`**
+  — as the module or `BenchmarkEntry` docstring, stating both rules explicitly and
+  naming SPEC.md's `q002` as the source of the `blast_radius` convention — so it's
+  never "fixed" into inconsistency later by someone assuming both categories work
+  the same way. **Not in `data/benchmark.json` itself** — JSON has no comment syntax,
+  so nothing here is ever proposed as an in-file annotation; `dataset.py` (or, if a
+  longer explanation is wanted later, a short standalone doc under `data/` or
+  `ripple/evaluation/`) is the only place this policy lives in the codebase.
 - **`attribute`** — "which blocks have property X" (e.g., "which security groups
   allow inbound traffic on port 22?"). **`expected` = every block in the corpus that
   actually has that property — exhaustively, not just one example remembered from
@@ -321,8 +325,7 @@ the right blocks), completely separate from **generation** (writing a natural-la
 answer about them). BM25 needs no embeddings at all (pure lexical matching); RRF/
 fusion needs no API calls either (pure math over already-retrieved lists). So: every
 question, under every one of this plan's three configs, costs exactly one embedding
-request if not for the caching decision in section 3.7 — which is precisely why that
-section exists.
+request — real counts and why they are not reduced by caching are in section 3.7.
 
 ### 3.6 Metrics — exact formulas, explicit edge-case policy
 
@@ -346,42 +349,64 @@ taken toward numeric edge cases):
 `reciprocal_rank` and every `top-k` slice depend on order being preserved exactly as
 the pipeline produced it.
 
-### 3.7 Cost and runtime — inspected, not assumed
+### 3.7 Cost and runtime — inspected, and deliberately left uncached
 
 **Simple version:** asking the AI "what does this text mean as a vector of numbers"
-(an embedding) costs a little money each time. If we ran all 40 questions through
-all 3 configurations in Day 11 without thinking about it, that's 120 separate
-"what does this mean" calls for the *same 40 questions* asked 3 times over — wasteful,
-since the question text doesn't change between configurations. So the same
-embedding is computed once per question and reused for all 3 configurations.
+(an embedding) costs a little money and takes a little time, every time. Running all
+40 questions through all 3 configurations in Day 11 means 120 of these calls — the
+same 40 questions asked 3 times over. That sounds wasteful, and it would be tempting
+to compute each question's embedding once and reuse it across all 3 configurations.
+**This plan deliberately does not do that**, because the pipeline's own timing
+measurement would stop being trustworthy if it did — see below for why.
 
-**Technical version, and the actual inspection this section is asking for:**
-`pipeline.run_pipeline(repo_id, question, config, embedder=None)` already accepts an
-injectable `embedder` parameter (built in Day 3, unchanged since) — this plan uses
-that **existing** injection point rather than changing `pipeline.py` at all.
-`ripple/evaluation/runner.py` defines a small `CachingEmbeddingProvider` (wraps any
-`EmbeddingProvider`, memoizes `.embed()` by exact input text) and constructs **one**
-instance per `run_eval` invocation, passed into every `run_pipeline` call across every
-config for the same benchmark run. Since embeddings only depend on question text —
-never on which `RetrievalConfig` subsequently uses them — this is a pure cost
-optimization with **zero change to retrieval semantics**. Effect: Day 11's naive cost
-would be 3 configs × 40 questions = 120 embedding requests; with caching, it's 40 (one
-per unique question, computed once, reused 3×).
+**Technical version:** `pipeline.run_pipeline(repo_id, question, config,
+embedder=None)` measures `vector_query_ms` as *one* span that starts before the
+question is embedded and ends after `vector_store.query` returns — the embedding API
+call's latency is **inside** `vector_query_ms`, not separated out (SPEC.md's own
+`hydrate_ms` precedent aside, there is currently no distinct `embedding_ms` field).
+If a single embedding were computed once and reused across all three
+`ABLATION_CONFIGS`, whichever configuration happened to run **first** for a given
+question would pay the real embedding latency, and the two that ran **after** it
+would show artificially low `vector_query_ms` from a cache hit that has nothing to
+do with that configuration's actual retrieval cost. The reported latency column
+would then depend on *the order the configs happened to run in* — exactly the kind
+of measurement artifact this project's whole "never fabricate a metric" posture
+exists to prevent. Recall/MRR would be unaffected (identical embeddings produce
+identical retrieval results either way), but the latency numbers would not be
+honest, comparable measurements anymore.
 
-**What this plan explicitly does *not* do, flagged as a deferred decision rather than
-silently assumed:** `pipeline.run_pipeline` calls `build_index(repo_id)` (BM25)
-**internally**, with no equivalent injection point — unlike the embedder, there is no
-way to pass in an already-built `BM25Index` from outside. Reusing it across the ~80
-calls that need BM25 in Day 11 (2 of 3 configs × 40 questions) **would require an
-interface change to `pipeline.py`** (an optional `bm25_index=` parameter). This plan
-does **not** make that change: rebuilding a 114-block BM25 index costs no API money
-and is fast (pure local CPU, sub-second) — a real but minor runtime inefficiency, not
-a cost concern, and not worth touching Day 6's `pipeline.py` for during this cycle.
-If a future day wants that optimization, it's a one-parameter addition — surfaced
-here as a decision for you to make, not assumed.
+**So**: `ripple/evaluation/runner.py` uses `OpenAIEmbeddingProvider` directly,
+uncached, exactly as `pipeline.run_pipeline`'s default already does — no wrapper, no
+new class, `embedder` is simply never overridden by the runner. Every question, under
+every configuration, pays its own real embedding call. Cost, stated plainly:
+**Day 10's single-configuration run makes approximately 40 embedding requests; Day
+11's three-configuration run makes approximately 120** (3 × 40, no sharing). Both
+numbers are real, not reduced by an optimization that would have compromised the
+latency column's validity.
 
-**Confirmation gate**: `scripts/run_eval.py` prints the number of configs, questions,
-and estimated embedding requests, and requires an explicit `y` confirmation
+**Recorded as future work, not built now:** if per-question embedding reuse is
+wanted later, it needs one of two things first — either `pipeline.py` starts
+recording a separate `embedding_ms` span (so a cached lookup's near-zero time isn't
+silently folded into `vector_query_ms`), or embeddings are precomputed *outside* the
+timed region entirely (e.g., embed every question once before starting any timed
+run, then pass precomputed vectors in) as a deliberate `pipeline.py` interface
+change. Either is a real design decision for whichever future day takes it on, not
+something to slip in quietly under Days 8–11.
+
+**The same reasoning does not apply to BM25, and it stays a known, low-priority
+inefficiency rather than something worth fixing here for a different reason**:
+`pipeline.run_pipeline` calls `build_index(repo_id)` **internally**, with no
+injection point equivalent to `embedder=`, so nothing outside `pipeline.py` could
+reuse a `BM25Index` across calls even if it wanted to. Rebuilding a 114-block BM25
+index costs no API money and is fast (pure local CPU, sub-second) — unlike the
+embedding case, reusing it would be a runtime nicety with no cost or latency-honesty
+motivation strong enough to justify changing Day 6's `pipeline.py` during this
+cycle. Flagged here as a possible future `bm25_index=` parameter, not assumed or
+built.
+
+**Confirmation gate**: `scripts/run_eval.py` prints the number of configurations,
+questions, and the real (uncached) estimated embedding-request count — ~40 for a
+single configuration, ~120 for all three — and requires an explicit `y` confirmation
 (skippable via `--yes`) before the **first** real, paid run in both Day 10 and Day
 11 — same convention as every prior day's manual acceptance check.
 
@@ -470,10 +495,6 @@ def aggregate_by_category(results: list[QuestionResult]) -> list[CategoryMetrics
 
 ```python
 # ripple/evaluation/runner.py
-class CachingEmbeddingProvider:
-    def __init__(self, inner: EmbeddingProvider) -> None: ...
-    def embed(self, texts: list[str]) -> list[list[float]]: ...   # memoized by text
-
 @dataclass
 class ConfigResult:
     config_name: str
@@ -487,8 +508,12 @@ def run_benchmark(
     entries: list[BenchmarkEntry],
     config: RetrievalConfig,
     config_name: str,
-    embedder: EmbeddingProvider | None = None,
 ) -> ConfigResult: ...
+# No embedder parameter: run_benchmark calls pipeline.run_pipeline(repo_id,
+# entry.question, config) with no embedder override, so every call uses
+# run_pipeline's own default OpenAIEmbeddingProvider() -- the same uncached path
+# production ask() already uses. Tests mock pipeline.run_pipeline itself (Day 6's
+# established pattern), so run_benchmark never needs its own injection point.
 
 # Explicit, deterministic config names, matching section 10.3's table row labels
 # character-for-character. use_rerank/use_graph/use_rewrite are set False on every
@@ -528,11 +553,12 @@ def main(argv=None):
     entries = load_benchmark(args.benchmark)
     validate_addresses_exist(entries, args.repo_id)      # fail fast, before spending anything
     configs = [(args.config, dict(ABLATION_CONFIGS)[args.config])] if args.config else ABLATION_CONFIGS
-    confirm_cost(len(entries), len(configs), skip=args.yes)   # section 3.7
-    embedder = CachingEmbeddingProvider(OpenAIEmbeddingProvider())
-    results = [run_benchmark(args.repo_id, entries, cfg, name, embedder=embedder) for name, cfg in configs]
+    confirm_cost(len(entries), len(configs), skip=args.yes)   # section 3.7 -- real, uncached counts
+    results = [run_benchmark(args.repo_id, entries, cfg, name) for name, cfg in configs]
     print(render_markdown_table(results))
-    save_json(results, path=timestamped_path())          # section 3.8
+    save_json(results, path=timestamped_path())          # section 3.8 -- written locally; staging
+                                                           # the file into git is a separate, deliberate
+                                                           # review step (section 3.8), not part of main()
 ```
 
 ### 3.8 Output behavior
@@ -542,13 +568,32 @@ def main(argv=None):
   per-category breakdown table beneath it. Not auto-written into `README.md` — that
   stays a manual, deliberate copy-paste step for whichever day writes the README
   (Day 19), never silently automated here.
-- **JSON**: always written to `data/eval_results/<UTC-timestamp>.json` (e.g.
-  `data/eval_results/2026-08-28T14-30-00Z.json`) — **a new file every run, nothing is
-  ever silently overwritten.** Contains every `ConfigResult` (aggregate, per-category,
-  and full per-question detail — the actual raw material "for reruns" SPEC.md asks
-  for). These files are meant to be committed (they *are* the honest record SPEC's
-  "never fabricate a metric" constraint exists to protect) — no `.gitignore` change is
-  proposed either way; that's a call for you, not silently decided here.
+- **JSON**: always written **locally** to `data/eval_results/<UTC-timestamp>.json`
+  (e.g. `data/eval_results/2026-08-28T14-30-00Z.json`) — **a new file every run,
+  nothing is ever silently overwritten.** Contains every `ConfigResult` (aggregate,
+  per-category, and full per-question detail — the actual raw material "for reruns"
+  SPEC.md asks for). `data/eval_results/` is **not** gitignored — it's a normal,
+  tracked directory — but writing the file and committing it are two separate,
+  deliberate actions, not one:
+  - `scripts/run_eval.py` only ever **writes the file to disk**. It never runs `git
+    add`/`git commit` itself, and every run produces a file whether the results turn
+    out to be exactly what was expected or not.
+  - **Only inspected, accepted results get committed**: after a run, look at the
+    numbers (Day 11, Step 2's "investigate anything surprising" applies here
+    directly), and only once they're judged correct and final for that milestone do
+    you `git add data/eval_results/<that specific timestamped file>.json` and commit
+    it as part of that day's commit (section 7). A failed run, a run interrupted by a
+    bug fix partway through, or an exploratory run made while debugging something
+    unrelated is left as an uncommitted (or manually deleted) local file — never
+    swept in with a blanket `git add data/eval_results/`.
+  - Concretely, across this plan's own milestones: the accepted Day 10 single-row
+    result gets committed with Day 10's commit; the accepted Day 11 three-row result
+    gets committed with Day 11's commit. Any earlier attempts at either that didn't
+    make the cut are not part of either commit.
+  - This is a documented **process** step (section 6/7), not something
+    `scripts/run_eval.py`'s code enforces — the script cannot know which run you've
+    decided to accept; that judgment is exactly what "investigate anything
+    surprising before proceeding" (SPEC.md, Day 11) requires a human for.
 
 ## 6. Day-by-day plan
 
@@ -613,8 +658,10 @@ roughly," not an exact requirement — don't force it if reality lands at, say,
 section 3.6's edge-case guards, `QuestionResult`/`AggregateMetrics`/`CategoryMetrics`,
 `score_question`/`aggregate`/`aggregate_by_category`.
 
-**Step 2** — `ripple/evaluation/runner.py`: `CachingEmbeddingProvider`,
-`ConfigResult`, `run_benchmark`, `ABLATION_CONFIGS` (section 5).
+**Step 2** — `ripple/evaluation/runner.py`: `ConfigResult`, `run_benchmark`,
+`ABLATION_CONFIGS` (section 5). `run_benchmark` calls `pipeline.run_pipeline` with no
+`embedder` override — every call uses the pipeline's own default, uncached
+`OpenAIEmbeddingProvider()` (section 3.7).
 
 **Step 3** — `scripts/run_eval.py`: CLI, cost confirmation gate, markdown + timestamped
 JSON output (section 3.8).
@@ -640,10 +687,7 @@ current full capability). ~40 embedding requests, zero generation calls.
   `answer_question` is never imported/called** by monkeypatching
   `ripple.llm.generate.answer_question` to raise if invoked, then running
   `run_benchmark` end to end and confirming it never fires (the direct test for
-  section 3.5's independence requirement). `CachingEmbeddingProvider`: wraps a fake
-  inner provider that raises on a repeated input; call `.embed(["q1"])` twice and
-  once with `["q1", "q2"]`, assert the inner provider is called only for genuinely
-  new text and the cached result is still returned correctly for repeats.
+  section 3.5's independence requirement).
 - `scripts/run_eval.py` — at minimum, an argument-parsing test (monkeypatch
   `run_benchmark` to a stub, assert the right `repo_id`/config selection reaches it)
   and a confirmation-gate test (declining the `y` prompt makes no calls to
@@ -661,8 +705,8 @@ ever passed as a CLI argument at invocation time).
 ### Day 11 — first three ablation rows
 
 **Step 1** — Run `scripts/run_eval.py --repo-id <resolved>` **without** `--config`
-(runs all three `ABLATION_CONFIGS` rows). **Confirm before this step** — ~40
-embedding requests total (cached across all three configs per section 3.7), zero
+(runs all three `ABLATION_CONFIGS` rows). **Confirm before this step** — ~120
+embedding requests total (3 configs × 40 questions, uncached — section 3.7), zero
 generation calls.
 
 **Step 2** — Read the three rows. **Investigate anything surprising before treating
@@ -742,11 +786,10 @@ number the way Days 5–7's plans did. Those cycles added a small, fully-enumera
 of parametrized cases to *existing* test files, so the arithmetic was mechanical and
 verifiable in advance. This cycle adds **three new test files** whose exact test
 count depends on authoring choices made during implementation (how many distinct
-edge cases `test_dataset.py` ends up covering, how many scenarios
-`CachingEmbeddingProvider` gets tested against, etc.) — stating a precise number now
-would be a guess dressed up as a fact. What's verifiable in advance: `python -m
-pytest` must show **123 + (every new test this cycle adds)**, all passing, with zero
-regressions to the existing 123.
+edge cases `test_dataset.py` ends up covering, exactly how `test_runner.py` is
+structured, etc.) — stating a precise number now would be a guess dressed up as a
+fact. What's verifiable in advance: `python -m pytest` must show **123 + (every new
+test this cycle adds)**, all passing, with zero regressions to the existing 123.
 
 ## 11. Risks, ambiguities, and things flagged for your review
 
@@ -754,23 +797,32 @@ regressions to the existing 123.
   this plan's judgment call, not a SPEC.md requirement.** SPEC gives a worked example
   for `blast_radius` only; `relational`'s exclusion-of-subject policy is inferred by
   analogy to natural language ("depends on" vs. "what breaks"), not quoted from
-  SPEC.md. If you read `q002` differently, this needs to be revisited *before* any
-  `relational` questions are authored — changing it after 10 `relational` entries
-  already exist means re-labeling all of them.
+  SPEC.md. **Approved** — relational excludes the subject, blast_radius includes it —
+  documented in `ripple/evaluation/dataset.py`, not in `data/benchmark.json` (JSON
+  has no comment syntax, so nothing is proposed there).
 - **`attribute` questions are the highest-effort category to get right**, because
   `expected` must be *exhaustive* over the whole corpus, not just complete for the
   examples someone happened to notice — section 3.2 and 3.4 both call this out, but
   it bears repeating: an incomplete `expected` set for an `attribute` question can
   make recall look better than it is, not worse.
-- **`CachingEmbeddingProvider` assumes identical question text always deserves an
-  identical embedding within one run** — true for this project (no per-config
-  question rewriting exists yet; that's Day 15), but this caching approach would need
-  reconsidering the day query rewriting turns "one question" into "N different
-  strings" per config.
+- **Embeddings are deliberately left uncached across configurations (section 3.7).**
+  A shared cache would make whichever configuration ran first pay real embedding
+  latency while later configurations saw artificial cache-hit speed, making the
+  latency column depend on run order rather than reflecting each configuration's
+  real cost. `run_benchmark` uses `pipeline.run_pipeline`'s own default,
+  uncached `OpenAIEmbeddingProvider()` — real counts: **~40 embedding requests for
+  Day 10's one configuration, ~120 for Day 11's three.** Recorded as future work
+  (section 3.7): reuse would need a separate `embedding_ms` measurement or a
+  deliberate precompute-before-timing redesign, not a quiet cache.
 - **The BM25 rebuild-per-call inefficiency (section 3.7) is real but deliberately not
-  fixed this cycle** — flagged as a decision for you, not assumed away.
-- **`data/eval_results/` being committed vs. gitignored is not decided here** —
-  flagged in section 3.8, no `.gitignore` change is proposed either way.
+  fixed this cycle**, for a different reason than the embedding case — it costs no
+  API money and is fast, so there's no cost or latency-honesty motivation to change
+  `pipeline.py` for it here. Flagged as a decision for you, not assumed away.
+- **`data/eval_results/` is committed, not gitignored — but not automatically.**
+  Every run writes a timestamped file locally; only a run whose numbers have been
+  inspected and accepted gets `git add`ed and committed, as part of that milestone's
+  commit (section 3.8, section 7). Failed, partial, debug, and exploratory runs stay
+  local and uncommitted.
 - **Exact category counts may not land exactly on 15/10/8/7** — SPEC's own wording is
   "aim for roughly," treated literally; forcing an exact ratio by padding with
   artificial questions would be worse than a close-but-imperfect real mix.
@@ -779,13 +831,14 @@ regressions to the existing 123.
   the module root as a second, harder corpus, but that is explicitly out of scope
   for Days 8–11 and not part of this plan.
 
-**Before Day 8 begins, this plan needs your explicit sign-off on:**
-1. The `relational`/`blast_radius` subject-inclusion policy (section 3.2) — the one
-   genuine judgment call with no SPEC.md worked example behind it.
-2. The `CachingEmbeddingProvider` cost-reduction design (section 3.7) — an additive,
-   low-risk change, but flagged per your own instruction to surface it as a decision.
-3. Whether `data/eval_results/` should be committed or gitignored (section 3.8).
+**All three decisions previously flagged for sign-off are now resolved**, per your
+explicit decisions above:
+1. Labeling policy (section 3.2) — approved as written.
+2. No `CachingEmbeddingProvider` — removed from this plan entirely (interfaces,
+   pseudocode, tests, cost estimates, runner construction, acceptance criteria); cost
+   estimates now state the real, uncached request counts.
+3. `data/eval_results/` is committed, with a deliberate review-then-stage workflow
+   rather than blanket auto-commit (section 3.8).
 
 Everything else in this plan follows directly from SPEC.md's literal text or from
-this project's own established conventions (Days 1–7), and doesn't need a separate
-decision before starting.
+this project's own established conventions (Days 1–7). Day 8 can begin.
