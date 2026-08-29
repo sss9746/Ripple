@@ -306,10 +306,17 @@ model weights:
   to 50 short (`max_length=512`) pairs per question is expected to take on the order
   of hundreds of milliseconds to a few seconds — but this plan does **not** assert a
   precise cache size or peak RSS figure, because neither has actually been measured
-  on this machine yet. The **confirmed `prepare()` step in section 9** is where the
-  real, observed download size, load time, and preparation time get recorded — that
-  measurement, not a number written into this plan in advance, is what the accepted
-  report's `reranker_json` (section 5.6) reflects.
+  on this machine yet. **What is actually measured and where (reconciled, section
+  5.6/9/11)**: `CrossEncoderReranker.prepare()` records exactly **one** combined
+  duration — model load plus one dummy prediction — as `prepare_ms`, stored in
+  `reranker_json`. **Nothing in this plan separately measures model-load time apart
+  from the dummy-prediction time, and nothing in the JSON report records download
+  size.** If you want the on-disk cache size or a load-only timing breakdown, that is
+  a manual, human-run check (e.g., `du -sh ~/.cache/huggingface/hub` before/after the
+  first real construction) noted in prose in `DAY_12_ANALYSIS.md` — it is not a
+  structured report field, and this plan does not pretend otherwise anywhere else in
+  this document (sections 5.6, 9, and 11 all refer back to this single paragraph
+  rather than restating a different claim).
 - **CPU / Apple Silicon**: this machine is `arm64` macOS; `sentence-transformers`
   runs on CPU here (no CUDA, no MPS enabled by this plan).
 - **If memory or runtime turns out to be unacceptable**: fall back to SPEC's own
@@ -317,14 +324,26 @@ model weights:
   explicitly in `DAY_12_ANALYSIS.md` (section 9). **The model itself is never
   silently swapped** for a smaller or different one — that would no longer be
   "BAAI/bge-reranker-base per SPEC 9.7."
-- **Offline / CI / unit-test behavior — corrected, no contradiction (finding 7)**:
-  **No `pytest` test path ever imports `sentence_transformers`, constructs a real
-  `CrossEncoder`, or reaches the network.** This holds for the *entire* suite, not
-  "everything except one path" — every `test_rerank.py` test injects a fake model
-  object (section 5.3/8); every pipeline test that touches `use_rerank=True`
-  (exactly one, after section 4.1's audit) injects a fake `Reranker` double, never a
-  real `CrossEncoderReranker`. The only two places a real download/construction can
-  ever happen are the manually-run, explicitly-confirmed smoke test and full
+- **Offline / CI / unit-test behavior — corrected, no contradiction (finding 7 of
+  the prior revision; tightened further this revision, finding 1)**: **No `pytest`
+  test path ever imports `sentence_transformers`, constructs a real `CrossEncoder`,
+  or reaches the network.** This holds for the *entire* suite, including
+  `describe()` (section 5.6) — the prior draft of `describe()` had `import
+  sentence_transformers` inside its own body specifically to read
+  `sentence_transformers.__version__`, which is itself an import (a lighter one
+  than constructing a model, but still a real import of the package, executed every
+  time a test calls `describe()`, contradicting "pytest never imports
+  sentence_transformers"). **Corrected**: `describe()` reads the installed
+  version via `importlib.metadata.version("sentence-transformers")` (Python's
+  standard library reads installed-package metadata from disk without importing
+  the package's own code at all) — so calling `describe()` in a test never imports
+  `sentence_transformers`, never touches `torch`, and never has any chance of
+  triggering a network call, regardless of whether a real or fake model is
+  attached to the reranker instance. Every `test_rerank.py` test injects a fake
+  model object (section 5.3/8); every pipeline test that touches `use_rerank=True`
+  (exactly one, after section 4.1's audit) injects a fake `Reranker` double, never
+  a real `CrossEncoderReranker`. The only two places a real download/construction
+  can ever happen are the manually-run, explicitly-confirmed smoke test and full
   evaluation in section 9 — **never** `pytest`. Section 8 restates this as the exact
   full-suite command's expected behavior, with no caveat about a "first real
   download during the suite" — there is no such path.
@@ -663,26 +682,56 @@ def prepare(self) -> None:
     self.prepare_ms = (time.perf_counter() - start) * 1000
 
 def _resolved_model_revision(self) -> str:
-    """Best-effort local snapshot revision -- never a full filesystem path
-    (which could otherwise leak the local username/home directory into a
-    committed report). Falls back to the literal string "unavailable"."""
-    try:
-        ...  # inspect the loaded model's cached snapshot directory name;
-             # return only the short revision identifier, nothing path-shaped
-    except Exception:
-        return "unavailable"
+    """Best-effort commit hash from the already-loaded model's own Hugging Face
+    config -- never a cache path (which could otherwise leak the local
+    username/home directory into a committed report; a commit hash is a short,
+    path-free git SHA). Every attribute access is guarded with getattr(...,
+    None) so a missing attribute at any point in the chain -- real model,
+    fake test model, or a sentence-transformers version whose internal layout
+    differs -- falls back to "unavailable" rather than raising."""
+    for attribute_path in (
+        ("model", "config", "_commit_hash"),  # CrossEncoder wraps a HF model
+                                               # at .model; its .config carries
+                                               # the resolved revision after a
+                                               # real hub download
+        ("config", "_commit_hash"),           # fallback shape, in case a given
+                                               # sentence-transformers version
+                                               # exposes .config directly
+    ):
+        value = self._model
+        for attribute in attribute_path:
+            value = getattr(value, attribute, None)
+            if value is None:
+                break
+        if value:
+            return str(value)
+    return "unavailable"
 
 def describe(self) -> dict:
-    import sentence_transformers
+    from importlib.metadata import version as _installed_version
+
     return {
         "model_name": self._model_name,
         "max_length": self._max_length,
-        "sentence_transformers_version": sentence_transformers.__version__,
+        "sentence_transformers_version": _installed_version(
+            "sentence-transformers"
+        ),
         "model_revision": self._resolved_model_revision(),
         "prepare_ms": self.prepare_ms,
         "enabled": True,
     }
 ```
+
+`importlib.metadata.version(...)` reads the installed distribution's metadata from
+disk — it does **not** import `sentence_transformers` itself (finding 1). This
+closes the one place the prior draft's design still imported the package during a
+call that every unit test exercises.
+
+`_resolved_model_revision()` is tested (section 8) against **both** a fake model
+that exposes the attribute chain (asserting the exact revision string is returned)
+and a fake model that doesn't expose it at all — plain `object()`, or any fake
+lacking `.model`/`.config`/`._commit_hash` — asserting the literal fallback
+`"unavailable"`. Neither test touches a real model or the filesystem.
 
 **Corrected terminology (finding 8)**: the prior draft's `warm_up()` only called
 `_get_model()` — it loaded the model but never ran a forward pass, so the *first*
@@ -704,10 +753,11 @@ does automatically — confirmed by reading `build_report`'s current implementat
 (section 4), not assumed.
 
 **Secrets check, extended (finding 4's explicit ask)**: `describe()` reads only
-`self._model_name`, `self._max_length`, `sentence_transformers.__version__`,
-`self.prepare_ms`, and a best-effort **short revision string** (never a full path,
-per `_resolved_model_revision`'s own docstring above) — it never touches
-`os.environ`, `.env`, or any credential. Section 8's existing secrets test
+`self._model_name`, `self._max_length`, the installed `sentence-transformers`
+version (via `importlib.metadata`, never importing the package), `self.prepare_ms`,
+and a best-effort **short revision string** (never a full path, per
+`_resolved_model_revision`'s own docstring above) — it never touches `os.environ`,
+`.env`, or any credential. Section 8's existing secrets test
 (assembled from fake data, asserting no injected fake secret value appears in the
 serialized report) is extended to also build a report containing a populated
 `reranker_json` and re-run the same assertion.
@@ -744,8 +794,14 @@ needed: no code reads an old report back in and re-derives a new one from it.
 - `ripple/evaluation/runner.py` — fourth `ABLATION_CONFIGS` row (section 5.6);
   `ConfigResult` gains `reranker_json: dict | None = None`; `run_benchmark`
   conditionally constructs/prepares one reranker and preserves the exact
-  three-argument `run_pipeline` call when `use_rerank=False` (section 5.4); new
-  `import time` (not currently imported in this file).
+  three-argument `run_pipeline` call when `use_rerank=False` (section 5.4).
+  **Correction**: the prior revision of this plan proposed a new `import time` in
+  this file — wrong; `time.perf_counter()` is used inside
+  `CrossEncoderReranker.prepare()` (`ripple/retrieval/rerank.py`, a new file that
+  already needs its own `import time`), not in `runner.py` itself.
+  `run_benchmark`'s only new work is calling `reranker.prepare()` and printing the
+  already-computed `reranker.prepare_ms`, neither of which needs `time` imported in
+  this file.
 - `tests/test_pipeline.py` — **audit-driven changes only, nothing incidental**:
   add `use_rerank=False` to the 15 sites in section 4.1's table; inject a fake
   `Reranker` into `test_config_json_separates_requested_and_executed_stages` and
@@ -773,22 +829,32 @@ needed: no code reads an old report back in and re-derives a new one from it.
 - `tests/test_run_eval.py` — rename
   `test_main_runs_all_three_configs_when_config_is_omitted` to
   `test_main_runs_all_configured_rows_when_config_is_omitted` (cosmetic only,
-  section 4.3).
+  section 4.3); add/update a CLI help-text assertion (below).
+- `scripts/run_eval.py` — **one-line correction, newly added to scope this
+  revision**: the `--config` argument's `help=` string is hardcoded prose —
+  `"run one retrieval configuration (default: run all three)"` — even though
+  `CONFIG_NAMES`/`ABLATION_CONFIGS` are already fully generic (section 4). This
+  literal string does not update itself just because a fourth row exists
+  elsewhere; it must be edited by hand, once, to `"run one retrieval configuration
+  (default: run all configured rows)"` (or equivalent wording that doesn't name a
+  specific count). No other change to this file — `select_configs`,
+  `render_markdown_table`, and `main`'s control flow remain exactly as generic as
+  section 4 already found them.
 
-**Explicitly not modified, by choice**: `scripts/run_eval.py`. Finding 12 asks
-whether a change is needed there "if you choose to automate [pre-confirmation cost]
-disclosure rather than relying on manual commentary" — **this plan chooses manual
-commentary** (section 9's smoke-test procedure is a set of commands and explicit,
-conversational confirmations, not new code), so no change to this file is proposed.
-If you'd rather have `scripts/run_eval.py` itself print reranker-specific cost
-information before its existing `confirm_cost` prompt, that's a small, reasonable
-addition — flagged here as an open option, not assumed.
+**Pre-confirmation cost disclosure remains manual commentary, not automated code**
+(unchanged decision, restated for clarity): section 9's smoke-test procedure is a
+set of commands and explicit conversational confirmations, not new
+`scripts/run_eval.py` code that prints reranker-specific cost information before
+its existing `confirm_cost` prompt. That remains an open option, not implemented
+here (section 12).
 
 **Do not modify**: `SPEC.md`, `sql/schema.sql`, `docker-compose.yml`,
 `.env`/`.env.example`, `requirements.txt`, `ripple/config.py`,
 `ripple/retrieval/fusion.py`, `ripple/retrieval/graph.py`, `ripple/ingest/*`,
 `ripple/llm/*`, `ripple/evaluation/dataset.py`, `ripple/evaluation/metrics.py`,
-`scripts/run_eval.py` (see above), `scripts/index_repo.py`, `scripts/ask.py`,
+`scripts/index_repo.py`, `scripts/ask.py` — **`scripts/run_eval.py` moved to the
+Modify list above this revision** (finding 2's one-line help-text fix; everything
+else in that file stays exactly as generic as section 4 found it) —
 `AGENTS.md`, `CLAUDE.md`, `README.md`, `data/benchmark.json`, either existing file
 under `data/eval_results/`, `data/eval_results/DAY_11_ANALYSIS.md`,
 `tests/test_dataset.py`, `tests/test_metrics.py`, `tests/test_db.py`, and every
@@ -868,9 +934,23 @@ no real `sentence_transformers` import anywhere in this file):
 - **`describe()`**: assert the returned dict has exactly the keys
   `model_name`/`max_length`/`sentence_transformers_version`/`model_revision`/
   `prepare_ms`/`enabled`; `prepare_ms` is `None` before `prepare()` is called and a
-  float after; `model_revision` falls back to `"unavailable"` for a fake model that
-  doesn't expose whatever real attribute a genuine `CrossEncoder` would.
-- Merely `import ripple.retrieval.rerank` does not import `sentence_transformers`.
+  float after; `sentence_transformers_version` equals
+  `importlib.metadata.version("sentence-transformers")`'s real return value (safe
+  to call directly in the test — it reads installed-package metadata, not the
+  package itself) without `describe()` ever importing `sentence_transformers`
+  (assert `"sentence_transformers" not in sys.modules` after calling `describe()`
+  in a test process that hasn't imported it for any other reason).
+- **`_resolved_model_revision()` — both cases required (finding 6)**: one fake
+  model exposing the attribute chain (e.g., a simple object with
+  `.model.config._commit_hash = "abc123"`) — assert `describe()["model_revision"]
+  == "abc123"`; one fake model **without** that chain (a bare `object()`, or a fake
+  missing `.model`/`.config`/`._commit_hash` at any level) — assert
+  `describe()["model_revision"] == "unavailable"`. Neither test touches a real
+  model, and neither result is ever a filesystem path.
+- Merely `import ripple.retrieval.rerank` does not import `sentence_transformers`
+  — true both at module-import time and after calling `describe()` (the fix in
+  section 5.6/finding 1 is specifically what makes the latter half of this
+  assertion hold).
 
 **`tests/test_pgvector_store.py`**: assert `results[i].embed_text` equals the
 existing `_row()` fixture's `embed_text` value (already distinct from `body`) — a
@@ -942,11 +1022,22 @@ Days 8–11 cycle):
 - Extended secrets test (section 5.6): a fake secret in the environment does not
   appear anywhere in a report that includes a populated `reranker_json`.
 
+**`tests/test_run_eval.py`** (new bullet this revision, finding 2): a CLI help-text
+test — invoke `parse_args(["--help"])` (or inspect the constructed
+`ArgumentParser`'s help output directly, whichever this project's existing
+argparse-testing style prefers) and assert the `--config` option's help string does
+**not** contain the literal text `"all three"` — the stale count this revision
+removes from `scripts/run_eval.py` — and instead reads something like `"default:
+run all configured rows"`. This is a regression guard against the exact staleness
+finding 2 identified: `CONFIG_NAMES` being generic doesn't make hardcoded prose
+generic too.
+
 **Focused test commands** (offline; run after each step):
 ```bash
 .venv/bin/python -m pytest -q tests/test_rerank.py
 .venv/bin/python -m pytest -q tests/test_pipeline.py
 .venv/bin/python -m pytest -q tests/test_runner.py
+.venv/bin/python -m pytest -q tests/test_run_eval.py
 .venv/bin/python -m pytest -q tests/test_pgvector_store.py tests/test_bm25.py  # DB-dependent, skip-if-unreachable
 ```
 
@@ -977,23 +1068,47 @@ and triggering a model load) before any confirmation existed in the plan at all.
 `scripts/ask.py`, which calls `answer_question` (an unnecessary paid generation
 request) and `db.insert_query_log` (a write this smoke test has no reason to make),
 and only shows a prose answer — not the actual candidate ranks this feature needs to
-demonstrate. Corrected: call `pipeline.run_pipeline` directly, print exactly what's
-needed to judge reranking's effect, and make **zero** generation calls and **zero**
-log writes:
+demonstrate.
+
+**Corrected again this revision (finding 3)**: the immediately-prior version of
+this smoke command built its own ad hoc `RetrievalConfig(final_k=10)` — which is
+**not** the same config row four actually uses (`RetrievalConfig`'s class defaults
+have `use_graph=True`/`use_rewrite=True`, unlike row four's explicit
+`use_graph=False`/`use_rewrite=False`; nothing crashes today since neither stage is
+wired in yet, but it's real configuration drift, not the config being evaluated).
+It also printed the **entire** fused candidate list without regard to
+`rerank_top_n` — since reranking only ever receives
+`candidates[:config.rerank_top_n]` (section 5.4), finding an address anywhere in
+that full printed list does **not** prove it reached the reranker; only its
+position relative to `rerank_top_n` does. Corrected command — uses the exact row
+from `ABLATION_CONFIGS` (no drift possible) and explicitly checks pool membership
+before printing anything else:
 
 ```bash
 .venv/bin/python -c "
-from ripple.config import RetrievalConfig
+from ripple.evaluation.runner import ABLATION_CONFIGS
 from ripple.retrieval import pipeline
 
 REPO_ID = ...  # resolved per section 3.1's convention, never hardcoded
 QUESTION = 'Which blocks contain at least one private_dns_enabled = true setting?'  # q020
+EXPECTED_ADDRESS = 'module.vpc_endpoints'
 
-result = pipeline.run_pipeline(REPO_ID, QUESTION, RetrievalConfig(final_k=10))
+config = dict(ABLATION_CONFIGS)['+ Cross-encoder rerank']  # the exact evaluated
+                                                            # config, never a
+                                                            # hand-built substitute
+result = pipeline.run_pipeline(REPO_ID, QUESTION, config)
 
-print('--- fused candidates (pre-rerank), in fusion order ---')
-for row in result.stages_json['fusion']:
-    print(row['id'], row['address'], row['score'])
+fusion = result.stages_json['fusion']
+entered_pool = False
+print(f'--- fused candidates (pre-rerank); rerank_top_n = {config.rerank_top_n} ---')
+for rank, row in enumerate(fusion, start=1):
+    in_pool = rank <= config.rerank_top_n
+    if row['address'] == EXPECTED_ADDRESS and in_pool:
+        entered_pool = True
+    print(rank, row['id'], row['address'], row['score'],
+          'IN rerank pool' if in_pool else 'excluded (rank > rerank_top_n)')
+
+print(f'--- did {EXPECTED_ADDRESS} enter the rerank pool? {entered_pool} ---')
 
 print('--- reranked candidates, in rerank order ---')
 for row in result.stages_json['rerank']:
@@ -1008,11 +1123,12 @@ print(result.latency_json['rerank_ms'])
 ```
 This makes **approximately one paid OpenAI embedding request** (the question),
 **zero OpenAI generation requests**, no `answer_question` call, and no query-log
-write — exactly the accounting finding 5 requires. Before interpreting the result:
-**check the "fused candidates" list for `module.vpc_endpoints`** (q020's expected
-answer) — confirm it's actually present in that printed pool before drawing any
-conclusion about whether reranking recovered it (section 1 already corrected the
-assumption that this was already known; this is where it actually gets checked).
+write. The printed `entered_pool` line is the explicit, computed answer to whether
+`module.vpc_endpoints` actually reached the reranker for this question — read it
+**before** interpreting anything about the reranked order below it: if it's
+`False`, the reranker never had a chance to recover this candidate, and the
+regression is a candidate-pool problem, not a reranker-quality problem, for this
+specific question.
 
 **Step 2 — second explicit confirmation, before the full 40-question run**:
 separate from Step 0. `scripts/run_eval.py`'s existing `confirm_cost` gate
@@ -1024,8 +1140,11 @@ separate from Step 0. `scripts/run_eval.py`'s existing `confirm_cost` gate
   wherever a question's fused pool has under 50 unique candidates) — local CPU
   compute, not a paid API cost.
 - **One `prepare()` call** (section 5.6) before the timed loop; its observed
-  duration is recorded in `reranker_json.prepare_ms` and printed, excluded from
-  every question's `rerank_ms`.
+  duration — model load plus one dummy prediction, as a **single combined**
+  number, not separately broken down — is recorded in `reranker_json.prepare_ms`
+  and printed, excluded from every question's `rerank_ms` (section 5.1 is the one
+  place this plan states what is and isn't measured; nothing here claims a
+  separate load-only time or a download-size figure).
 
 **Step 3 — run only the fourth configuration**:
 ```bash
@@ -1060,10 +1179,13 @@ containing one `ConfigResult` with a populated `reranker_json`.
 
 **Step 5 — accept and commit, or fix and re-run**: same deliberate review-then-stage
 workflow as Days 8–11 (`git add` only the one accepted file). Write
-`DAY_12_ANALYSIS.md` alongside it, including the observed model download/load/
-`prepare_ms` timing (section 5.1/5.6 — this is where the honest, *measured* numbers
-that section 5.1 declined to guess in advance actually get recorded) and the
-per-question comparisons above. **Never hand-edit any measured metric.**
+`DAY_12_ANALYSIS.md` alongside it, including the accepted report's
+`reranker_json.prepare_ms` value (the one combined load-plus-dummy-prediction
+number that's actually measured, section 5.1) and the per-question comparisons
+above. **If you also want the on-disk model cache size for the writeup**, measure
+it manually (e.g., `du -sh ~/.cache/huggingface/hub`) and note it in
+`DAY_12_ANALYSIS.md`'s prose — it is not a JSON report field (section 5.1/5.6/11
+are consistent on this point). **Never hand-edit any measured metric.**
 
 ## 10. Scope and process
 
@@ -1076,8 +1198,10 @@ per-question comparisons above. **Never hand-edit any measured metric.**
 - Model cache files are never committed (section 5.1).
 - `.venv/bin/python` is used in every command; no bare `python`/`python3`.
 - `repo_id` is never hardcoded in application code.
-- `scripts/run_eval.py` is not modified (section 6 explains the choice and names
-  the alternative as an open option, not a requirement).
+- `scripts/run_eval.py` gets exactly one modification — the stale `--config`
+  help-text fix (section 6, finding 2). Beyond that one line, it is not otherwise
+  modified; section 12 names automating pre-confirmation cost disclosure in this
+  file as a separate, still-open option, not a requirement.
 
 ## 11. Acceptance criteria
 
@@ -1106,18 +1230,30 @@ Day 12 is complete only when all of the following hold:
 - The result has been inspected (section 9, step 4) using the corrected,
   question-specific comparisons in section 1 — not the prior draft's overstated
   generalization.
+- The smoke test's `entered_pool` check (section 9, step 1) was actually run and
+  read **before** any conclusion was drawn about whether reranking recovered
+  `module.vpc_endpoints` for `q020` — candidate-pool membership is verified, not
+  assumed.
+- `scripts/run_eval.py --help`'s `--config` text no longer says "default: run all
+  three" (section 6, finding 2) — verified by the new `test_run_eval.py` help-text
+  test.
+- `reranker_json.prepare_ms` is the only timing figure the report claims to
+  measure — no code path in this plan claims a separately-measured model-load
+  time or a recorded download size (section 5.1/5.6/9 agree on this consistently).
 - The accepted report and its `DAY_12_ANALYSIS.md` are committed together, in a
   commit separate from the implementation commit(s).
 
 ## 12. Needs sign-off
 
-**One item, newly surfaced by this revision, genuinely open**: section 6 names an
-alternative to the "manual commentary" choice for pre-confirmation cost disclosure
-(having `scripts/run_eval.py` itself print reranker-specific cost information
-before its existing prompt). This plan does not implement that alternative, but it
-is a real, undecided choice between two reasonable designs, not something SPEC.md
-or the existing code settles either way — flag before implementation if you'd
-rather have it automated.
+**One item, genuinely open**: section 6 names an alternative to the "manual
+commentary" choice for pre-confirmation cost disclosure (having
+`scripts/run_eval.py` itself print reranker-specific cost information before its
+existing prompt). This plan does not implement that alternative, but it is a real,
+undecided choice between two reasonable designs, not something SPEC.md or the
+existing code settles either way — flag before implementation if you'd rather have
+it automated. (This is unrelated to, and unaffected by, this revision's one-line
+`--config` help-text fix in the same file — that fix is a correction of stale
+prose, not a design choice, per finding 2.)
 
 Otherwise unchanged from the prior draft: every other decision in section 5 was
 resolvable directly from SPEC.md's text or an existing codebase convention. Two
@@ -1160,52 +1296,116 @@ item.**
   first real model download" is replaced with an unconditional "never" in sections
   5.1/8/11; `warm_up()` is replaced with `prepare()` throughout; the unverified
   "~500MB on disk, comparable RSS" claim is replaced with "expected to be
-  substantial, actually measured during the confirmed `prepare()` step" (section
-  5.1).
+  substantial" plus an explicit statement that only `prepare_ms` (not download size
+  or a separate load-only time) is actually measured and recorded (section 5.1,
+  corrected again this revision — see below).
 - **No section claims "no ambiguity" while an alternative sits unresolved** —
   section 12 names the one genuinely open item (the `scripts/run_eval.py`
   cost-disclosure alternative) explicitly, rather than describing the plan as
   fully closed.
 
+### 13.1 This revision's corrections, individually verified
+
+- **`describe()` no longer imports `sentence_transformers`** — replaced with
+  `importlib.metadata.version("sentence-transformers")` (section 5.6); checked
+  against every other place the plan claims "pytest never imports
+  sentence_transformers" (section 5.1, section 8's `test_rerank.py` bullets,
+  section 11) to confirm none of them still describe a `describe()` that imports
+  the package — none do, after this revision.
+- **`scripts/run_eval.py`'s `--config` help string** — moved from "do not modify"
+  to the Modify list (section 6) with the exact one-line change specified, and a
+  new `test_run_eval.py` help-text test added (section 8) as a regression guard.
+- **The smoke command** — rebuilt to use `dict(ABLATION_CONFIGS)["+ Cross-encoder
+  rerank"]` instead of a hand-built `RetrievalConfig`, and to compute/print
+  explicit `rank <= rerank_top_n` pool membership for every fused candidate,
+  closing the gap where "appears somewhere in the printed list" was being treated
+  as equivalent to "reached the reranker" (section 9, step 1).
+- **`reranker_json`'s claimed contents reconciled across every section that
+  mentions it** — section 5.1 (design), section 5.6 (schema/decision), section 9
+  steps 2/5 (evaluation procedure), and section 11 (acceptance criteria) now all
+  state the same thing: `prepare_ms` is the one measured, recorded timing figure;
+  download size and a separately-measured load-only time are explicitly **not**
+  part of the JSON schema, only optionally noted in `DAY_12_ANALYSIS.md`'s prose.
+- **The stray "new `import time`" file-scope claim for `ripple/evaluation/
+  runner.py`** — removed; `time` is used inside `ripple/retrieval/rerank.py`'s
+  `prepare()`, which already needed its own `import time` as a new file — this was
+  simply misattributed to the wrong file in the prior revision (section 6).
+- **`_resolved_model_revision()`'s `...` placeholder** — replaced with a concrete,
+  fully guarded `getattr`-chain implementation reading
+  `self._model.model.config._commit_hash` (with a `self._model.config
+  ._commit_hash` fallback shape), returning `"unavailable"` on any missing
+  attribute, and returning only a short revision string, never a path (section
+  5.6). Tests specified for both a fake model that exposes this chain and one that
+  doesn't (section 8).
+
 ## 14. Summary
 
-1. **Exact changes made to `IMPLEMENTATION_PLAN.md`**: `RetrievedBlock.embed_text`
-   changed from defaulted to required (section 5.2); `run_benchmark`'s
-   `run_pipeline` call made conditional on `config.use_rerank` to preserve the
-   exact three-argument shape existing tests depend on (section 5.4); every
-   `RetrievalConfig(...)`/`RetrievedBlock(...)` construction site in the test suite
-   individually audited and resolved (sections 4.1/4.2); a `reranker_json`
-   provenance field added to `ConfigResult`/the report schema with `schema_version`
-   bumped to `2` (section 5.6); the smoke test replaced with a retrieval-only,
-   two-confirmation procedure using `pipeline.run_pipeline` directly instead of
-   `scripts/ask.py` (section 9); Day 11's factual claims corrected to the specific,
-   measured per-question facts (section 1); the pytest/model-download
-   contradiction removed (sections 5.1/8/11); `warm_up()` replaced with a real
-   `prepare()` that performs one dummy prediction (section 5.6); the empty-input
-   test strengthened to prove `_get_model()` is unreachable, not just unused
+This section reflects the plan's current, final state after two rounds of review
+corrections (section 13's audit trail has the full history of both rounds).
+
+1. **Exact changes made to `IMPLEMENTATION_PLAN.md` across both correction
+   rounds**: `RetrievedBlock.embed_text` changed from defaulted to required
+   (section 5.2); `run_benchmark`'s `run_pipeline` call made conditional on
+   `config.use_rerank` to preserve the exact three-argument shape existing tests
+   depend on (section 5.4); every `RetrievalConfig(...)`/`RetrievedBlock(...)`
+   construction site in the test suite individually audited and resolved (sections
+   4.1/4.2); a `reranker_json` provenance field added to `ConfigResult`/the report
+   schema with `schema_version` bumped to `2` (section 5.6); the smoke test
+   replaced with a retrieval-only, two-confirmation procedure using the exact
+   `ABLATION_CONFIGS` row and an explicit `rerank_top_n` pool-membership check
+   (section 9); Day 11's factual claims corrected to the specific, measured
+   per-question facts (section 1); the pytest/model-download contradiction removed
+   (sections 5.1/8/11); `warm_up()` replaced with a real `prepare()` (section 5.6);
+   the empty-input test strengthened to prove `_get_model()` is unreachable
    (section 8); model-size claims softened to "expected, to be measured" (section
-   5.1); file scope, test scope, and the audit section all updated to match.
-2. **Corrected file scope**: section 6 — 2 new files, 15 modified files (up from 10
-   in the prior draft, reflecting the newly-identified `embed_text` fixture updates
-   in `test_ask.py`/`test_prompts.py`/`test_generate.py`/`test_fusion.py`), and an
-   explicit decision **not** to modify `scripts/run_eval.py`, with the alternative
-   named as an open option (section 12).
-3. **Corrected test scope**: section 8 — a full audit table for every existing
-   `RetrievalConfig`/`RetrievedBlock` construction, three `run_benchmark` tests
-   explicitly preserved unmodified as a compatibility guarantee, and new tests for
-   `prepare()`/`describe()`, the strengthened empty-input case, and report-schema
-   provenance.
-4. **Corrected smoke/evaluation cost and confirmation order**: two explicit
-   confirmations (before the smoke test, and again before the full run), a
-   retrieval-only smoke command with ~1 embedding request and 0 generation
-   requests, printing fused ranks, reranked ranks/scores, final addresses, and
-   `rerank_ms` (section 9).
-5. **Report schema/provenance additions**: `ConfigResult.reranker_json: dict | None`
-   (model name, `max_length`, installed `sentence-transformers` version, best-effort
-   model revision or `"unavailable"`, `prepare_ms`, `enabled`), `null` for the first
-   three rows; `schema_version` bumped to `2` for newly generated reports; existing
-   `schema_version: 1` reports untouched (section 5.6).
-6. **Remaining decision needing sign-off**: whether `scripts/run_eval.py` should
-   itself print reranker-specific cost information before its existing
-   confirmation prompt, versus relying on this plan's manual smoke-test commentary
-   (section 12) — the only genuinely open item.
+   5.1); `describe()` changed to read the installed package version via
+   `importlib.metadata` instead of importing `sentence_transformers` (section
+   5.6); `_resolved_model_revision()`'s placeholder replaced with a concrete,
+   guarded `getattr`-chain implementation (section 5.6); `scripts/run_eval.py`'s
+   stale `--config` help text corrected (section 6); the `reranker_json`
+   timing claim reconciled to "`prepare_ms` only, no separate load time or
+   download size" everywhere it's mentioned (sections 5.1/5.6/9/11); the
+   misattributed "new `import time`" file-scope note moved off
+   `ripple/evaluation/runner.py` (section 6).
+2. **Final file scope**: section 6 — 2 new files
+   (`ripple/retrieval/rerank.py`, `tests/test_rerank.py`); 16 modified files:
+   `ripple/retrieval/{vector_store,pgvector_store,bm25,pipeline}.py`,
+   `ripple/evaluation/runner.py`, `scripts/run_eval.py` (one-line help-text fix
+   only), and `tests/{test_pipeline,test_runner,test_fusion,test_ask,test_prompts,
+   test_generate,test_pgvector_store,test_bm25,test_run_eval}.py`. Everything else
+   (`SPEC.md`, `ripple/config.py`, `ripple/retrieval/fusion.py`,
+   `ripple/evaluation/{dataset,metrics}.py`, `scripts/{index_repo,ask}.py`, both
+   accepted Day 10/11 reports, `DAY_11_ANALYSIS.md`, and every other test file)
+   stays untouched.
+3. **Final test scope**: section 8 — a full audit table for every existing
+   `RetrievalConfig`/`RetrievedBlock` construction; three `run_benchmark` tests in
+   `test_runner.py` explicitly preserved unmodified as the compatibility
+   guarantee; new tests for `rerank()`'s edge cases (including the strengthened
+   empty-input case), `prepare()`, `describe()` (including both
+   `_resolved_model_revision()` cases and the no-import-of-`sentence_transformers`
+   assertion), report-schema provenance, and a new `scripts/run_eval.py`
+   help-text regression test.
+4. **Final smoke/evaluation cost and confirmation order**: two explicit
+   confirmations (before the smoke test, and again before the full run); the
+   smoke command uses the exact `"+ Cross-encoder rerank"` `ABLATION_CONFIGS` entry
+   (no configuration drift) and prints, per fused candidate, whether its rank falls
+   within `rerank_top_n`, plus an explicit computed answer to whether
+   `module.vpc_endpoints` entered the pool at all — checked before interpreting the
+   reranked results; ~1 paid embedding request, 0 generation requests, no
+   query-log write.
+5. **Report schema/provenance, final form**: `ConfigResult.reranker_json: dict |
+   None` — `model_name`, `max_length`, installed `sentence-transformers` version
+   (via `importlib.metadata`, never importing the package), a best-effort
+   `model_revision` (guarded `getattr` chain on the loaded model's HF config, or
+   `"unavailable"`), `prepare_ms` (the one measured timing figure — load plus one
+   dummy prediction, combined, not broken down further), `enabled`; `null` for the
+   first three rows. `schema_version` bumped to `2` for newly generated reports;
+   the two existing `schema_version: 1` reports untouched. Model cache size and any
+   separate load-only timing are explicitly **not** part of this schema — noted
+   manually in `DAY_12_ANALYSIS.md`'s prose if wanted.
+6. **Remaining decision needing sign-off**: unchanged — whether
+   `scripts/run_eval.py` should itself print reranker-specific cost information
+   before its existing confirmation prompt, versus relying on this plan's manual
+   smoke-test commentary (section 12). This is the only genuinely open item; it is
+   unrelated to the one-line help-text correction this round made to the same
+   file.
