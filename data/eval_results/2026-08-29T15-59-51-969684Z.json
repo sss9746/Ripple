@@ -1,0 +1,1290 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-29T15:59:51.850864Z",
+  "repo_id": 13,
+  "benchmark_path": "data/benchmark.json",
+  "benchmark_sha256": "d4bf21f8de84a99a389198ba6bdf1dea99f0e259ad4add52fc542514d06e0834",
+  "corpus": {
+    "repo_name": "vpc-complete",
+    "source_url": null,
+    "local_path": "/Users/karthik/Ripple/.repos/terraform-aws-vpc/examples/complete",
+    "git_revision": "0a36bd54069c64be2da788b2afb5df0a8e8e7398",
+    "indexed_corpus_sha256": "330178649d690e88812bcfae99fed420f9e176b4b1aaf470574e2935aa284743",
+    "resource_count": 114
+  },
+  "embedding_model": "text-embedding-3-small",
+  "question_count": 40,
+  "results": [
+    {
+      "config_name": "Vector + BM25 + RRF",
+      "config": {
+        "vector_backend": "pgvector",
+        "use_vector": true,
+        "use_bm25": true,
+        "use_rrf": true,
+        "use_rerank": false,
+        "use_graph": false,
+        "use_rewrite": false,
+        "vector_k": 30,
+        "bm25_k": 30,
+        "rrf_k": 60,
+        "rerank_top_n": 50,
+        "final_k": 10,
+        "graph_seed_n": 3,
+        "graph_max_added": 10
+      },
+      "per_question": [
+        {
+          "entry_id": "q001",
+          "category": "lookup",
+          "expected": [
+            "module.vpc"
+          ],
+          "retrieved": [
+            "output.vpc_cidr_block",
+            "locals:main.tf:7",
+            "output.default_vpc_cidr_block",
+            "output.vpc_ipv6_cidr_block",
+            "module.vpc",
+            "module.vpc_endpoints",
+            "output.vpc_main_route_table_id",
+            "output.default_vpc_main_route_table_id",
+            "output.public_subnet_arns",
+            "output.private_subnet_arns"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 0.2,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 4622.945458017057,
+            "bm25_ms": 2018.857500021113,
+            "fusion_ms": 0.22187500144355,
+            "total_ms": 6642.148834012914
+          }
+        },
+        {
+          "entry_id": "q002",
+          "category": "lookup",
+          "expected": [
+            "aws_security_group.rds"
+          ],
+          "retrieved": [
+            "aws_security_group.rds",
+            "module.vpc_endpoints",
+            "module.vpc",
+            "output.default_security_group_id",
+            "output.database_ipv6_egress_route_id",
+            "output.vpc_endpoints",
+            "output.database_nat_gateway_route_ids",
+            "output.vpc_endpoints_security_group_arn",
+            "output.database_internet_gateway_route_id",
+            "output.default_vpc_default_security_group_id"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2611.2893749959767,
+            "bm25_ms": 1956.5530419931747,
+            "fusion_ms": 0.12754101771861315,
+            "total_ms": 4568.003124993993
+          }
+        },
+        {
+          "entry_id": "q003",
+          "category": "lookup",
+          "expected": [
+            "module.vpc_endpoints"
+          ],
+          "retrieved": [
+            "module.vpc_endpoints",
+            "output.vpc_endpoints",
+            "aws_security_group.rds",
+            "data.aws_iam_policy_document.dynamodb_endpoint_policy",
+            "output.vpc_endpoints_security_group_arn",
+            "module.vpc_endpoints_nocreate",
+            "output.vpc_endpoints_security_group_id",
+            "output.vpc_enable_dns_support",
+            "output.default_vpc_arn",
+            "output.default_vpc_enable_dns_support"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2499.2051670269575,
+            "bm25_ms": 1985.065000015311,
+            "fusion_ms": 0.13895900337956846,
+            "total_ms": 4484.45299998275
+          }
+        },
+        {
+          "entry_id": "q004",
+          "category": "lookup",
+          "expected": [
+            "module.vpc_endpoints_nocreate"
+          ],
+          "retrieved": [
+            "module.vpc_endpoints",
+            "module.vpc_endpoints_nocreate",
+            "output.default_vpc_id",
+            "data.aws_iam_policy_document.generic_endpoint_policy",
+            "output.vpc_id",
+            "output.default_vpc_default_security_group_id",
+            "output.vpc_enable_dns_support",
+            "output.default_vpc_arn",
+            "output.vpc_instance_tenancy",
+            "output.default_vpc_instance_tenancy"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 0.5,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 3104.2001659807283,
+            "bm25_ms": 2029.5007090026047,
+            "fusion_ms": 0.13962501543574035,
+            "total_ms": 5133.874291001121
+          }
+        },
+        {
+          "entry_id": "q005",
+          "category": "lookup",
+          "expected": [
+            "data.aws_iam_policy_document.dynamodb_endpoint_policy"
+          ],
+          "retrieved": [
+            "data.aws_iam_policy_document.dynamodb_endpoint_policy",
+            "data.aws_iam_policy_document.generic_endpoint_policy",
+            "module.vpc_endpoints",
+            "output.default_vpc_cidr_block",
+            "output.vpc_cidr_block",
+            "data.aws_availability_zones.available",
+            "aws_security_group.rds",
+            "output.vpc_ipv6_cidr_block",
+            "output.database_network_acl_arn",
+            "output.database_subnets_cidr_blocks"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2507.27362500038,
+            "bm25_ms": 2009.7547500045039,
+            "fusion_ms": 0.16429199604317546,
+            "total_ms": 4517.243333015358
+          }
+        },
+        {
+          "entry_id": "q006",
+          "category": "lookup",
+          "expected": [
+            "output.vpc_id"
+          ],
+          "retrieved": [
+            "output.vpc_id",
+            "output.default_vpc_id",
+            "output.vpc_owner_id",
+            "output.default_vpc_default_network_acl_id",
+            "output.vpc_main_route_table_id",
+            "output.vpc_ipv6_association_id",
+            "output.default_vpc_default_route_table_id",
+            "output.vpc_endpoints_security_group_id",
+            "output.igw_id",
+            "output.default_vpc_main_route_table_id"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2153.060792014003,
+            "bm25_ms": 1985.500459006289,
+            "fusion_ms": 0.13837500591762364,
+            "total_ms": 4138.7618749868125
+          }
+        },
+        {
+          "entry_id": "q007",
+          "category": "lookup",
+          "expected": [
+            "output.nat_public_ips"
+          ],
+          "retrieved": [
+            "output.nat_public_ips",
+            "output.private_nat_gateway_route_ids",
+            "output.database_nat_gateway_route_ids",
+            "output.natgw_ids",
+            "output.nat_ids",
+            "output.public_internet_gateway_route_id",
+            "output.public_internet_gateway_ipv6_route_id",
+            "output.egress_only_internet_gateway_id",
+            "output.public_subnets",
+            "output.public_route_table_ids"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2097.8569999861065,
+            "bm25_ms": 2046.3889169914182,
+            "fusion_ms": 0.139000010676682,
+            "total_ms": 4144.423249992542
+          }
+        },
+        {
+          "entry_id": "q008",
+          "category": "lookup",
+          "expected": [
+            "output.private_subnets"
+          ],
+          "retrieved": [
+            "output.private_subnets",
+            "output.private_nat_gateway_route_ids",
+            "output.private_subnets_cidr_blocks",
+            "output.private_ipv6_egress_route_ids",
+            "output.private_subnets_ipv6_cidr_blocks",
+            "output.private_route_table_ids",
+            "output.public_subnets",
+            "output.elasticache_subnets",
+            "output.outpost_subnets",
+            "output.database_subnets"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2381.946292007342,
+            "bm25_ms": 1965.4235830239486,
+            "fusion_ms": 0.17095901421271265,
+            "total_ms": 4347.593499987852
+          }
+        },
+        {
+          "entry_id": "q009",
+          "category": "relational",
+          "expected": [
+            "module.vpc"
+          ],
+          "retrieved": [
+            "aws_security_group.rds",
+            "output.default_security_group_id",
+            "output.vpc_endpoints_security_group_arn",
+            "module.vpc_endpoints",
+            "data.aws_iam_policy_document.dynamodb_endpoint_policy",
+            "output.default_vpc_default_security_group_id",
+            "data.aws_availability_zones.available",
+            "output.vpc_endpoints_security_group_id",
+            "data.aws_iam_policy_document.generic_endpoint_policy",
+            "output.elasticache_subnet_group"
+          ],
+          "recall_at_5": 0.0,
+          "recall_at_10": 0.0,
+          "reciprocal_rank_value": 0.0,
+          "precision_at_5": 0.0,
+          "latency": {
+            "vector_query_ms": 2128.697582986206,
+            "bm25_ms": 2000.750875013182,
+            "fusion_ms": 0.12633297592401505,
+            "total_ms": 4129.625333007425
+          }
+        },
+        {
+          "entry_id": "q010",
+          "category": "relational",
+          "expected": [
+            "data.aws_availability_zones.available"
+          ],
+          "retrieved": [
+            "locals:main.tf:7",
+            "data.aws_availability_zones.available",
+            "output.default_vpc_cidr_block",
+            "output.vpc_cidr_block",
+            "module.vpc",
+            "output.vpc_ipv6_cidr_block",
+            "output.default_network_acl_id",
+            "output.elasticache_subnets_cidr_blocks",
+            "output.redshift_subnets_cidr_blocks",
+            "output.elasticache_subnets_ipv6_cidr_blocks"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 0.5,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2020.4430839803535,
+            "bm25_ms": 1936.2339170183986,
+            "fusion_ms": 0.1220419944729656,
+            "total_ms": 3956.8474580009934
+          }
+        },
+        {
+          "entry_id": "q011",
+          "category": "relational",
+          "expected": [
+            "module.vpc"
+          ],
+          "retrieved": [
+            "data.aws_iam_policy_document.dynamodb_endpoint_policy",
+            "data.aws_iam_policy_document.generic_endpoint_policy",
+            "module.vpc_endpoints",
+            "output.default_vpc_cidr_block",
+            "output.vpc_cidr_block",
+            "output.vpc_owner_id",
+            "output.vpc_ipv6_cidr_block",
+            "module.vpc",
+            "output.vpc_id",
+            "output.default_vpc_default_network_acl_id"
+          ],
+          "recall_at_5": 0.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 0.125,
+          "precision_at_5": 0.0,
+          "latency": {
+            "vector_query_ms": 2228.3925420197193,
+            "bm25_ms": 1929.1106250020675,
+            "fusion_ms": 0.13070899876765907,
+            "total_ms": 4157.670417014742
+          }
+        },
+        {
+          "entry_id": "q012",
+          "category": "relational",
+          "expected": [
+            "aws_security_group.rds",
+            "data.aws_iam_policy_document.dynamodb_endpoint_policy",
+            "data.aws_iam_policy_document.generic_endpoint_policy",
+            "module.vpc"
+          ],
+          "retrieved": [
+            "module.vpc_endpoints_nocreate",
+            "output.vpc_endpoints",
+            "module.vpc_endpoints",
+            "output.vpc_endpoints_security_group_id",
+            "output.vpc_secondary_cidr_blocks",
+            "output.vpc_endpoints_security_group_arn",
+            "output.outpost_subnets_cidr_blocks",
+            "output.outpost_subnets_ipv6_cidr_blocks",
+            "output.vpc_cidr_block",
+            "output.public_subnets_cidr_blocks"
+          ],
+          "recall_at_5": 0.0,
+          "recall_at_10": 0.0,
+          "reciprocal_rank_value": 0.0,
+          "precision_at_5": 0.0,
+          "latency": {
+            "vector_query_ms": 2187.107459001709,
+            "bm25_ms": 2015.1297499833163,
+            "fusion_ms": 0.15770801110193133,
+            "total_ms": 4202.436624997063
+          }
+        },
+        {
+          "entry_id": "q013",
+          "category": "relational",
+          "expected": [
+            "module.vpc_endpoints"
+          ],
+          "retrieved": [
+            "output.vpc_endpoints_security_group_id",
+            "output.default_vpc_default_security_group_id",
+            "output.vpc_endpoints_security_group_arn",
+            "output.default_security_group_id",
+            "module.vpc_endpoints",
+            "output.vpc_cidr_block",
+            "output.vpc_endpoints",
+            "output.default_vpc_cidr_block",
+            "output.vpc_ipv6_cidr_block",
+            "output.elasticache_subnet_group"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 0.2,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2009.059125004569,
+            "bm25_ms": 1996.9706249830779,
+            "fusion_ms": 0.09154100553132594,
+            "total_ms": 4006.1572920239996
+          }
+        },
+        {
+          "entry_id": "q014",
+          "category": "blast_radius",
+          "expected": [
+            "aws_security_group.rds",
+            "module.vpc_endpoints"
+          ],
+          "retrieved": [
+            "aws_security_group.rds",
+            "output.vpc_endpoints_security_group_arn",
+            "data.aws_availability_zones.available",
+            "data.aws_iam_policy_document.dynamodb_endpoint_policy",
+            "output.default_security_group_id",
+            "module.vpc_endpoints",
+            "output.vpc_endpoints_security_group_id",
+            "data.aws_iam_policy_document.generic_endpoint_policy",
+            "output.default_vpc_default_security_group_id",
+            "output.elasticache_subnet_group"
+          ],
+          "recall_at_5": 0.5,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2085.859791986877,
+            "bm25_ms": 1980.510499997763,
+            "fusion_ms": 0.12991699622943997,
+            "total_ms": 4066.5395830001216
+          }
+        },
+        {
+          "entry_id": "q015",
+          "category": "blast_radius",
+          "expected": [
+            "data.aws_iam_policy_document.dynamodb_endpoint_policy",
+            "module.vpc_endpoints"
+          ],
+          "retrieved": [
+            "data.aws_iam_policy_document.dynamodb_endpoint_policy",
+            "data.aws_iam_policy_document.generic_endpoint_policy",
+            "module.vpc_endpoints",
+            "output.database_network_acl_arn",
+            "output.dhcp_options_id",
+            "output.database_network_acl_id",
+            "output.egress_only_internet_gateway_id",
+            "data.aws_availability_zones.available",
+            "output.vpc_owner_id",
+            "module.vpc_endpoints_nocreate"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.4,
+          "latency": {
+            "vector_query_ms": 2497.114124998916,
+            "bm25_ms": 1985.4073339956813,
+            "fusion_ms": 0.1963340037036687,
+            "total_ms": 4482.771666982444
+          }
+        },
+        {
+          "entry_id": "q016",
+          "category": "blast_radius",
+          "expected": [
+            "module.vpc_endpoints",
+            "output.vpc_endpoints",
+            "output.vpc_endpoints_security_group_arn",
+            "output.vpc_endpoints_security_group_id"
+          ],
+          "retrieved": [
+            "module.vpc_endpoints_nocreate",
+            "output.vpc_endpoints",
+            "module.vpc_endpoints",
+            "output.vpc_endpoints_security_group_id",
+            "output.vpc_id",
+            "output.vpc_endpoints_security_group_arn",
+            "output.default_vpc_id",
+            "output.vpc_arn",
+            "output.vpc_secondary_cidr_blocks",
+            "output.vpc_owner_id"
+          ],
+          "recall_at_5": 0.75,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 0.5,
+          "precision_at_5": 0.6,
+          "latency": {
+            "vector_query_ms": 2080.930083000567,
+            "bm25_ms": 1935.730750003131,
+            "fusion_ms": 0.13737499830313027,
+            "total_ms": 4016.8412499770056
+          }
+        },
+        {
+          "entry_id": "q017",
+          "category": "blast_radius",
+          "expected": [
+            "data.aws_availability_zones.available",
+            "locals:main.tf:7"
+          ],
+          "retrieved": [
+            "data.aws_availability_zones.available",
+            "locals:main.tf:7",
+            "data.aws_iam_policy_document.dynamodb_endpoint_policy",
+            "data.aws_iam_policy_document.generic_endpoint_policy",
+            "aws_security_group.rds",
+            "output.redshift_network_acl_arn",
+            "module.vpc_endpoints",
+            "output.redshift_subnets_cidr_blocks",
+            "output.nat_ids",
+            "output.default_vpc_enable_dns_support"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.4,
+          "latency": {
+            "vector_query_ms": 2493.431792012416,
+            "bm25_ms": 1947.0567500102334,
+            "fusion_ms": 0.10674999793991446,
+            "total_ms": 4440.63783402089
+          }
+        },
+        {
+          "entry_id": "q018",
+          "category": "attribute",
+          "expected": [
+            "module.vpc_endpoints",
+            "module.vpc_endpoints_nocreate"
+          ],
+          "retrieved": [
+            "module.vpc_endpoints_nocreate",
+            "output.private_subnets_ipv6_cidr_blocks",
+            "module.vpc",
+            "output.private_subnets_cidr_blocks",
+            "module.vpc_endpoints",
+            "output.database_subnets_ipv6_cidr_blocks",
+            "output.outpost_subnets_cidr_blocks",
+            "output.vpc_secondary_cidr_blocks",
+            "output.intra_subnets_ipv6_cidr_blocks",
+            "output.public_subnets_cidr_blocks"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.4,
+          "latency": {
+            "vector_query_ms": 2010.316750005586,
+            "bm25_ms": 1933.5859169950709,
+            "fusion_ms": 0.12245800462551415,
+            "total_ms": 3944.0672080090735
+          }
+        },
+        {
+          "entry_id": "q019",
+          "category": "attribute",
+          "expected": [
+            "module.vpc"
+          ],
+          "retrieved": [
+            "output.vpc_enable_dns_hostnames",
+            "output.default_vpc_enable_dns_hostnames",
+            "output.vpc_enable_dns_support",
+            "output.default_vpc_enable_dns_support",
+            "output.vpc_ipv6_cidr_block",
+            "output.vpc_cidr_block",
+            "output.default_vpc_cidr_block",
+            "module.vpc",
+            "module.vpc_endpoints",
+            "output.public_subnets_ipv6_cidr_blocks"
+          ],
+          "recall_at_5": 0.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 0.125,
+          "precision_at_5": 0.0,
+          "latency": {
+            "vector_query_ms": 2125.7888749823906,
+            "bm25_ms": 1935.89012499433,
+            "fusion_ms": 0.12424998567439616,
+            "total_ms": 4061.8486670136917
+          }
+        },
+        {
+          "entry_id": "q020",
+          "category": "attribute",
+          "expected": [
+            "module.vpc_endpoints"
+          ],
+          "retrieved": [
+            "output.private_subnets_ipv6_cidr_blocks",
+            "output.private_subnets_cidr_blocks",
+            "output.vpc_enable_dns_support",
+            "output.vpc_enable_dns_hostnames",
+            "output.database_subnets_ipv6_cidr_blocks",
+            "module.vpc",
+            "output.default_vpc_enable_dns_support",
+            "output.public_subnets_ipv6_cidr_blocks",
+            "output.elasticache_subnets_ipv6_cidr_blocks",
+            "output.default_vpc_enable_dns_hostnames"
+          ],
+          "recall_at_5": 0.0,
+          "recall_at_10": 0.0,
+          "reciprocal_rank_value": 0.0,
+          "precision_at_5": 0.0,
+          "latency": {
+            "vector_query_ms": 2454.2733329872135,
+            "bm25_ms": 1940.3624999977183,
+            "fusion_ms": 0.1439159968867898,
+            "total_ms": 4394.824791990686
+          }
+        },
+        {
+          "entry_id": "q021",
+          "category": "lookup",
+          "expected": [
+            "data.aws_iam_policy_document.generic_endpoint_policy"
+          ],
+          "retrieved": [
+            "data.aws_iam_policy_document.generic_endpoint_policy",
+            "module.vpc_endpoints",
+            "output.default_vpc_cidr_block",
+            "output.vpc_cidr_block",
+            "output.vpc_ipv6_cidr_block",
+            "data.aws_iam_policy_document.dynamodb_endpoint_policy",
+            "output.default_vpc_default_network_acl_id",
+            "output.vpc_ipv6_association_id",
+            "output.default_vpc_id",
+            "output.vpc_secondary_cidr_blocks"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2105.714416014962,
+            "bm25_ms": 1964.5579589996487,
+            "fusion_ms": 0.14195800758898258,
+            "total_ms": 4070.4583339975215
+          }
+        },
+        {
+          "entry_id": "q022",
+          "category": "lookup",
+          "expected": [
+            "output.public_subnets_cidr_blocks"
+          ],
+          "retrieved": [
+            "output.public_subnets_cidr_blocks",
+            "output.public_subnets_ipv6_cidr_blocks",
+            "output.private_subnets_cidr_blocks",
+            "output.database_subnets_cidr_blocks",
+            "output.outpost_subnets_cidr_blocks",
+            "output.redshift_subnets_cidr_blocks",
+            "output.elasticache_subnets_cidr_blocks",
+            "output.intra_subnets_cidr_blocks",
+            "output.vpc_secondary_cidr_blocks",
+            "output.private_subnets_ipv6_cidr_blocks"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2093.3653340034653,
+            "bm25_ms": 1945.246416988084,
+            "fusion_ms": 0.14799999189563096,
+            "total_ms": 4038.812291022623
+          }
+        },
+        {
+          "entry_id": "q023",
+          "category": "lookup",
+          "expected": [
+            "output.database_subnet_group_name"
+          ],
+          "retrieved": [
+            "output.database_subnet_group_name",
+            "output.database_subnet_group",
+            "output.elasticache_subnet_group_name",
+            "output.elasticache_subnet_group",
+            "output.redshift_subnet_group",
+            "output.database_subnet_arns",
+            "output.database_subnets",
+            "output.database_network_acl_id",
+            "output.database_network_acl_arn",
+            "output.database_subnets_cidr_blocks"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2041.5434580063447,
+            "bm25_ms": 1986.8901669979095,
+            "fusion_ms": 0.1385409850627184,
+            "total_ms": 4028.6200830014423
+          }
+        },
+        {
+          "entry_id": "q024",
+          "category": "lookup",
+          "expected": [
+            "output.igw_arn"
+          ],
+          "retrieved": [
+            "output.igw_arn",
+            "output.egress_only_internet_gateway_id",
+            "output.vgw_arn",
+            "output.public_internet_gateway_route_id",
+            "output.igw_id",
+            "output.public_internet_gateway_ipv6_route_id",
+            "output.database_internet_gateway_route_id",
+            "output.outpost_network_acl_arn",
+            "output.vpc_arn",
+            "output.intra_network_acl_arn"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2027.4108329904266,
+            "bm25_ms": 1937.2812919900753,
+            "fusion_ms": 0.15954201808199286,
+            "total_ms": 3964.8981660138816
+          }
+        },
+        {
+          "entry_id": "q025",
+          "category": "lookup",
+          "expected": [
+            "output.dhcp_options_id"
+          ],
+          "retrieved": [
+            "output.dhcp_options_id",
+            "output.vpc_ipv6_association_id",
+            "output.default_vpc_id",
+            "output.igw_id",
+            "output.vpc_id",
+            "output.default_network_acl_id",
+            "output.egress_only_internet_gateway_id",
+            "output.default_route_table_id",
+            "output.default_vpc_default_network_acl_id",
+            "output.outpost_network_acl_id"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2034.206082986202,
+            "bm25_ms": 2008.9327080058865,
+            "fusion_ms": 0.13104200479574502,
+            "total_ms": 4043.3247500041034
+          }
+        },
+        {
+          "entry_id": "q026",
+          "category": "lookup",
+          "expected": [
+            "output.default_vpc_id"
+          ],
+          "retrieved": [
+            "output.default_vpc_default_network_acl_id",
+            "output.default_vpc_id",
+            "output.default_vpc_default_route_table_id",
+            "output.default_vpc_default_security_group_id",
+            "output.default_vpc_main_route_table_id",
+            "output.default_network_acl_id",
+            "output.default_security_group_id",
+            "output.vpc_id",
+            "output.default_vpc_arn",
+            "output.default_route_table_id"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 0.5,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2057.275667000795,
+            "bm25_ms": 1933.8709169824142,
+            "fusion_ms": 0.21875000675208867,
+            "total_ms": 3991.4359579852317
+          }
+        },
+        {
+          "entry_id": "q027",
+          "category": "lookup",
+          "expected": [
+            "output.vpc_endpoints"
+          ],
+          "retrieved": [
+            "output.vpc_endpoints",
+            "output.vpc_endpoints_security_group_id",
+            "output.vpc_id",
+            "output.vpc_secondary_cidr_blocks",
+            "output.vpc_endpoints_security_group_arn",
+            "output.vpc_arn",
+            "output.nat_public_ips",
+            "output.default_vpc_id",
+            "output.vpc_cidr_block",
+            "output.vpc_owner_id"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2115.0872080179397,
+            "bm25_ms": 1934.8325000028126,
+            "fusion_ms": 0.14874999760650098,
+            "total_ms": 4050.1286670041736
+          }
+        },
+        {
+          "entry_id": "q028",
+          "category": "relational",
+          "expected": [
+            "module.vpc"
+          ],
+          "retrieved": [
+            "data.aws_iam_policy_document.generic_endpoint_policy",
+            "module.vpc_endpoints",
+            "data.aws_iam_policy_document.dynamodb_endpoint_policy",
+            "output.default_vpc_cidr_block",
+            "output.vpc_cidr_block",
+            "output.vpc_ipv6_cidr_block",
+            "output.default_security_group_id",
+            "output.default_vpc_default_network_acl_id",
+            "output.default_network_acl_id",
+            "module.vpc_endpoints_nocreate"
+          ],
+          "recall_at_5": 0.0,
+          "recall_at_10": 0.0,
+          "reciprocal_rank_value": 0.0,
+          "precision_at_5": 0.0,
+          "latency": {
+            "vector_query_ms": 2100.487499992596,
+            "bm25_ms": 1936.5077500115149,
+            "fusion_ms": 0.1687500043772161,
+            "total_ms": 4037.241959013045
+          }
+        },
+        {
+          "entry_id": "q029",
+          "category": "relational",
+          "expected": [
+            "module.vpc"
+          ],
+          "retrieved": [
+            "output.natgw_ids",
+            "output.cgw_ids",
+            "output.private_nat_gateway_route_ids",
+            "output.database_nat_gateway_route_ids",
+            "output.nat_ids",
+            "output.default_vpc_cidr_block",
+            "output.vpc_ipv6_cidr_block",
+            "output.private_ipv6_egress_route_ids",
+            "output.vpc_cidr_block",
+            "output.igw_id"
+          ],
+          "recall_at_5": 0.0,
+          "recall_at_10": 0.0,
+          "reciprocal_rank_value": 0.0,
+          "precision_at_5": 0.0,
+          "latency": {
+            "vector_query_ms": 2127.1059999999125,
+            "bm25_ms": 1927.916374988854,
+            "fusion_ms": 0.1423330104444176,
+            "total_ms": 4055.201917013619
+          }
+        },
+        {
+          "entry_id": "q030",
+          "category": "relational",
+          "expected": [
+            "module.vpc"
+          ],
+          "retrieved": [
+            "output.elasticache_subnet_group",
+            "output.elasticache_subnet_group_name",
+            "output.elasticache_subnet_arns",
+            "output.database_subnet_group",
+            "output.redshift_subnet_group",
+            "output.elasticache_subnets",
+            "output.elasticache_subnets_cidr_blocks",
+            "output.elasticache_network_acl_arn",
+            "output.elasticache_network_acl_id",
+            "output.database_subnet_group_name"
+          ],
+          "recall_at_5": 0.0,
+          "recall_at_10": 0.0,
+          "reciprocal_rank_value": 0.0,
+          "precision_at_5": 0.0,
+          "latency": {
+            "vector_query_ms": 2152.25487499265,
+            "bm25_ms": 1944.2567079968285,
+            "fusion_ms": 0.13808297808282077,
+            "total_ms": 4096.6847089875955
+          }
+        },
+        {
+          "entry_id": "q031",
+          "category": "relational",
+          "expected": [
+            "module.vpc_endpoints"
+          ],
+          "retrieved": [
+            "output.vpc_endpoints",
+            "output.vpc_cidr_block",
+            "output.default_vpc_cidr_block",
+            "output.vpc_ipv6_cidr_block",
+            "output.vpc_endpoints_security_group_id",
+            "module.vpc_endpoints",
+            "module.vpc_endpoints_nocreate",
+            "output.vpc_id",
+            "output.vpc_secondary_cidr_blocks",
+            "output.vpc_endpoints_security_group_arn"
+          ],
+          "recall_at_5": 0.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 0.16666666666666666,
+          "precision_at_5": 0.0,
+          "latency": {
+            "vector_query_ms": 2069.987791997846,
+            "bm25_ms": 1967.588416999206,
+            "fusion_ms": 0.14354102313518524,
+            "total_ms": 4037.7678330114577
+          }
+        },
+        {
+          "entry_id": "q032",
+          "category": "relational",
+          "expected": [
+            "module.vpc_endpoints"
+          ],
+          "retrieved": [
+            "output.vpc_endpoints_security_group_arn",
+            "output.vpc_endpoints_security_group_id",
+            "module.vpc_endpoints",
+            "output.vpc_arn",
+            "output.vpc_endpoints",
+            "output.default_vpc_arn",
+            "output.default_vpc_default_security_group_id",
+            "output.default_security_group_id",
+            "output.vpc_cidr_block",
+            "output.default_vpc_cidr_block"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 0.3333333333333333,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2037.1404999750666,
+            "bm25_ms": 2016.1187080084346,
+            "fusion_ms": 0.16266698366962373,
+            "total_ms": 4053.4694580128416
+          }
+        },
+        {
+          "entry_id": "q033",
+          "category": "blast_radius",
+          "expected": [
+            "data.aws_iam_policy_document.generic_endpoint_policy",
+            "module.vpc_endpoints"
+          ],
+          "retrieved": [
+            "data.aws_iam_policy_document.generic_endpoint_policy",
+            "data.aws_iam_policy_document.dynamodb_endpoint_policy",
+            "module.vpc_endpoints",
+            "output.default_vpc_default_network_acl_id",
+            "output.default_vpc_main_route_table_id",
+            "output.egress_only_internet_gateway_id",
+            "output.default_network_acl_id",
+            "output.default_security_group_id",
+            "output.default_vpc_default_security_group_id",
+            "output.dhcp_options_id"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.4,
+          "latency": {
+            "vector_query_ms": 2077.531999995699,
+            "bm25_ms": 1933.939166017808,
+            "fusion_ms": 0.167958001838997,
+            "total_ms": 4011.6946249909233
+          }
+        },
+        {
+          "entry_id": "q034",
+          "category": "blast_radius",
+          "expected": [
+            "module.vpc_endpoints_nocreate"
+          ],
+          "retrieved": [
+            "module.vpc_endpoints_nocreate",
+            "output.vpc_endpoints",
+            "module.vpc_endpoints",
+            "output.vpc_endpoints_security_group_id",
+            "output.default_vpc_id",
+            "output.vpc_id",
+            "output.vpc_enable_dns_support",
+            "output.default_vpc_cidr_block",
+            "output.default_vpc_enable_dns_support",
+            "output.vpc_endpoints_security_group_arn"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2507.016332994681,
+            "bm25_ms": 1951.2205829960294,
+            "fusion_ms": 0.1471659925300628,
+            "total_ms": 4458.41741701588
+          }
+        },
+        {
+          "entry_id": "q035",
+          "category": "blast_radius",
+          "expected": [
+            "output.nat_public_ips"
+          ],
+          "retrieved": [
+            "output.nat_public_ips",
+            "output.nat_ids",
+            "output.private_nat_gateway_route_ids",
+            "output.public_subnets",
+            "output.public_network_acl_id",
+            "output.public_network_acl_arn",
+            "output.natgw_ids",
+            "output.database_nat_gateway_route_ids",
+            "output.public_subnets_cidr_blocks",
+            "output.public_route_table_ids"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2105.7047079957556,
+            "bm25_ms": 2026.2289579841308,
+            "fusion_ms": 0.1550830202177167,
+            "total_ms": 4132.13741601794
+          }
+        },
+        {
+          "entry_id": "q036",
+          "category": "blast_radius",
+          "expected": [
+            "output.dhcp_options_id"
+          ],
+          "retrieved": [
+            "output.dhcp_options_id",
+            "output.default_vpc_id",
+            "output.default_network_acl_id",
+            "output.egress_only_internet_gateway_id",
+            "output.intra_network_acl_id",
+            "output.outpost_network_acl_id",
+            "output.database_network_acl_id",
+            "output.public_network_acl_id",
+            "output.default_route_table_id",
+            "output.vpc_ipv6_association_id"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2085.358291020384,
+            "bm25_ms": 1985.0489159871358,
+            "fusion_ms": 0.1587080187164247,
+            "total_ms": 4070.6082909891848
+          }
+        },
+        {
+          "entry_id": "q037",
+          "category": "attribute",
+          "expected": [
+            "aws_security_group.rds",
+            "module.vpc_endpoints",
+            "output.vpc_cidr_block"
+          ],
+          "retrieved": [
+            "output.vpc_cidr_block",
+            "output.default_vpc_cidr_block",
+            "output.vpc_ipv6_cidr_block",
+            "output.vpc_secondary_cidr_blocks",
+            "output.intra_subnets_ipv6_cidr_blocks",
+            "output.public_subnets_ipv6_cidr_blocks",
+            "output.intra_subnets_cidr_blocks",
+            "output.database_subnets_ipv6_cidr_blocks",
+            "output.database_subnets_cidr_blocks",
+            "output.public_subnets_cidr_blocks"
+          ],
+          "recall_at_5": 0.3333333333333333,
+          "recall_at_10": 0.3333333333333333,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2136.0678329947405,
+            "bm25_ms": 1995.252042019274,
+            "fusion_ms": 0.15025000902824104,
+            "total_ms": 4131.53237500228
+          }
+        },
+        {
+          "entry_id": "q038",
+          "category": "attribute",
+          "expected": [
+            "module.vpc_endpoints",
+            "output.private_subnets"
+          ],
+          "retrieved": [
+            "output.private_subnets",
+            "output.private_subnets_cidr_blocks",
+            "output.private_subnets_ipv6_cidr_blocks",
+            "output.public_subnets_cidr_blocks",
+            "output.vpc_secondary_cidr_blocks",
+            "output.intra_subnets_cidr_blocks",
+            "output.database_subnets_cidr_blocks",
+            "output.private_subnet_arns",
+            "output.outpost_subnets_cidr_blocks",
+            "output.elasticache_subnets_cidr_blocks"
+          ],
+          "recall_at_5": 0.5,
+          "recall_at_10": 0.5,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2122.841167001752,
+            "bm25_ms": 1993.9853340038098,
+            "fusion_ms": 0.14345798990689218,
+            "total_ms": 4117.012208997039
+          }
+        },
+        {
+          "entry_id": "q039",
+          "category": "attribute",
+          "expected": [
+            "module.vpc"
+          ],
+          "retrieved": [
+            "output.private_nat_gateway_route_ids",
+            "output.natgw_ids",
+            "output.nat_ids",
+            "output.database_nat_gateway_route_ids",
+            "output.nat_public_ips",
+            "module.vpc",
+            "output.egress_only_internet_gateway_id",
+            "output.vpc_ipv6_cidr_block",
+            "output.public_internet_gateway_route_id",
+            "output.vpc_cidr_block"
+          ],
+          "recall_at_5": 0.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 0.16666666666666666,
+          "precision_at_5": 0.0,
+          "latency": {
+            "vector_query_ms": 2115.1931659842376,
+            "bm25_ms": 1930.8627079881262,
+            "fusion_ms": 0.10274999658577144,
+            "total_ms": 4046.196459006751
+          }
+        },
+        {
+          "entry_id": "q040",
+          "category": "attribute",
+          "expected": [
+            "module.vpc_endpoints"
+          ],
+          "retrieved": [
+            "module.vpc_endpoints",
+            "output.vpc_cidr_block",
+            "output.default_vpc_cidr_block",
+            "output.vpc_ipv6_cidr_block",
+            "module.vpc",
+            "aws_security_group.rds",
+            "output.vpc_endpoints",
+            "output.vpc_ipv6_association_id",
+            "output.vpc_secondary_cidr_blocks",
+            "output.elasticache_subnets_cidr_blocks"
+          ],
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "reciprocal_rank_value": 1.0,
+          "precision_at_5": 0.2,
+          "latency": {
+            "vector_query_ms": 2140.9578750026412,
+            "bm25_ms": 2005.0672919896897,
+            "fusion_ms": 0.1832089910749346,
+            "total_ms": 4146.258084016154
+          }
+        }
+      ],
+      "aggregate": {
+        "question_count": 40,
+        "recall_at_5": 0.7020833333333333,
+        "recall_at_10": 0.8208333333333333,
+        "mrr": 0.6579166666666667,
+        "precision_at_5": 0.18000000000000002,
+        "mean_latency_ms": 4235.466758377879,
+        "mean_latency_by_stage": {
+          "bm25_ms": 1971.4847136252502,
+          "fusion_ms": 0.1470124516345095,
+          "total_ms": 4235.466758377879,
+          "vector_query_ms": 2263.7860864240793
+        }
+      },
+      "by_category": [
+        {
+          "question_count": 7,
+          "recall_at_5": 0.40476190476190477,
+          "recall_at_10": 0.6904761904761905,
+          "mrr": 0.6130952380952381,
+          "precision_at_5": 0.14285714285714288,
+          "mean_latency_ms": 4120.248542005096,
+          "mean_latency_by_stage": {
+            "bm25_ms": 1962.143702569717,
+            "fusion_ms": 0.13861299625464849,
+            "total_ms": 4120.248542005096,
+            "vector_query_ms": 2157.9198569940804
+          },
+          "category": "attribute"
+        },
+        {
+          "question_count": 8,
+          "recall_at_5": 0.90625,
+          "recall_at_10": 1.0,
+          "mrr": 0.9375,
+          "precision_at_5": 0.325,
+          "mean_latency_ms": 4209.956010374299,
+          "mean_latency_by_stage": {
+            "bm25_ms": 1968.142869623989,
+            "fusion_ms": 0.14991137868491933,
+            "total_ms": 4209.956010374299,
+            "vector_query_ms": 2241.618390500662
+          },
+          "category": "blast_radius"
+        },
+        {
+          "question_count": 15,
+          "recall_at_5": 1.0,
+          "recall_at_10": 1.0,
+          "mrr": 0.88,
+          "precision_at_5": 0.2,
+          "mean_latency_ms": 4410.945297133488,
+          "mean_latency_by_stage": {
+            "bm25_ms": 1980.577061335013,
+            "fusion_ms": 0.15514727177408835,
+            "total_ms": 4410.945297133488,
+            "vector_query_ms": 2430.158724936579
+          },
+          "category": "lookup"
+        },
+        {
+          "question_count": 10,
+          "recall_at_5": 0.3,
+          "recall_at_10": 0.5,
+          "mrr": 0.1325,
+          "precision_at_5": 0.060000000000000005,
+          "mean_latency_ms": 4073.310300108278,
+          "mean_latency_by_stage": {
+            "bm25_ms": 1967.058375000488,
+            "fusion_ms": 0.13837069855071604,
+            "total_ms": 4073.310300108278,
+            "vector_query_ms": 2106.067645995063
+          },
+          "category": "relational"
+        }
+      ]
+    }
+  ]
+}

@@ -40,6 +40,21 @@ def insert_repo(name: str, source_url: str | None, local_path: str) -> int:
     return repo_id
 
 
+def fetch_repo(repo_id: int) -> tuple[str, str | None, str] | None:
+    """Return a repository's name, source URL, and local path if it exists."""
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT name, source_url, local_path
+                FROM repos
+                WHERE id = %s
+                """,
+                (repo_id,),
+            )
+            return cursor.fetchone()
+
+
 class ResourceRowLike(Protocol):
     block_kind: str
     resource_type: str | None

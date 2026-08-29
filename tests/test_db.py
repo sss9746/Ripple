@@ -72,6 +72,29 @@ def test_insert_repo_round_trip() -> None:
         connection.commit()
 
 
+def test_fetch_repo_round_trip_and_missing_id() -> None:
+    try:
+        repo_id = db.insert_repo(
+            name="pytest-fetch-repo",
+            source_url="https://example.com/pytest-fetch-repo.git",
+            local_path="/tmp/pytest-fetch-repo",
+        )
+    except (RuntimeError, psycopg.OperationalError):
+        pytest.skip("database not reachable")
+
+    try:
+        assert db.fetch_repo(repo_id) == (
+            "pytest-fetch-repo",
+            "https://example.com/pytest-fetch-repo.git",
+            "/tmp/pytest-fetch-repo",
+        )
+        assert db.fetch_repo(-1) is None
+    finally:
+        with db.get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("DELETE FROM repos WHERE id = %s", (repo_id,))
+
+
 def test_replace_resources_rolls_back_on_insert_failure() -> None:
     try:
         connection = db.get_connection()
