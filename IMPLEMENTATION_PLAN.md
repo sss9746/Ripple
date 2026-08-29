@@ -937,9 +937,17 @@ no real `sentence_transformers` import anywhere in this file):
   float after; `sentence_transformers_version` equals
   `importlib.metadata.version("sentence-transformers")`'s real return value (safe
   to call directly in the test — it reads installed-package metadata, not the
-  package itself) without `describe()` ever importing `sentence_transformers`
-  (assert `"sentence_transformers" not in sys.modules` after calling `describe()`
-  in a test process that hasn't imported it for any other reason).
+  package itself). **`describe()` never imports `sentence_transformers` — tested
+  order-independently, not via `sys.modules`** (a `sys.modules` check would depend
+  on whether some earlier test or plugin already imported the package in this
+  process, which this project doesn't control): monkeypatch `builtins.__import__`
+  with a wrapper that raises `AssertionError` if called with `name ==
+  "sentence_transformers"` and otherwise delegates to the real `__import__` for
+  every other module (so unrelated imports inside `describe()`, e.g.
+  `importlib.metadata`, are unaffected); call `describe()` under that patch and
+  assert it completes without raising. This proves `describe()` itself doesn't
+  import the package on this call, regardless of what any other test already
+  imported.
 - **`_resolved_model_revision()` — both cases required (finding 6)**: one fake
   model exposing the attribute chain (e.g., a simple object with
   `.model.config._commit_hash = "abc123"`) — assert `describe()["model_revision"]
@@ -1089,7 +1097,16 @@ before printing anything else:
 from ripple.evaluation.runner import ABLATION_CONFIGS
 from ripple.retrieval import pipeline
 
-REPO_ID = ...  # resolved per section 3.1's convention, never hardcoded
+REPO_ID = ...  # never hardcoded -- resolve it independently, e.g.:
+                # from ripple import db
+                # with db.get_connection() as conn, conn.cursor() as cur:
+                #     cur.execute(
+                #         "SELECT id FROM repos WHERE name = 'vpc-complete' "
+                #         "ORDER BY id DESC LIMIT 1"
+                #     )
+                #     print(cur.fetchone())
+                # (ORDER BY id DESC LIMIT 1 because repo names aren't
+                # guaranteed unique -- take the most recent match)
 QUESTION = 'Which blocks contain at least one private_dns_enabled = true setting?'  # q020
 EXPECTED_ADDRESS = 'module.vpc_endpoints'
 
@@ -1368,7 +1385,8 @@ corrections (section 13's audit trail has the full history of both rounds).
    misattributed "new `import time`" file-scope note moved off
    `ripple/evaluation/runner.py` (section 6).
 2. **Final file scope**: section 6 — 2 new files
-   (`ripple/retrieval/rerank.py`, `tests/test_rerank.py`); 16 modified files:
+   (`ripple/retrieval/rerank.py`, `tests/test_rerank.py`); 15 modified files (5
+   application modules, `scripts/run_eval.py`, and 9 test files):
    `ripple/retrieval/{vector_store,pgvector_store,bm25,pipeline}.py`,
    `ripple/evaluation/runner.py`, `scripts/run_eval.py` (one-line help-text fix
    only), and `tests/{test_pipeline,test_runner,test_fusion,test_ask,test_prompts,
