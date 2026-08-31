@@ -6,6 +6,7 @@ from ripple.config import RetrievalConfig
 from ripple.llm.embeddings import EmbeddingProvider, OpenAIEmbeddingProvider
 from ripple.retrieval import fusion
 from ripple.retrieval.bm25 import build_index
+from ripple.retrieval.graph import dependencies, dependents
 from ripple.retrieval.pgvector_store import PgVectorStore
 from ripple.retrieval.rerank import CrossEncoderReranker, Reranker
 from ripple.retrieval.vector_store import RetrievedBlock, VectorStore
@@ -30,6 +31,23 @@ def _serialize(
             "id": block.id,
             "address": block.address,
             "score": block.score,
+        }
+        for block in blocks
+    ]
+
+
+def _serialize_graph(
+    blocks: list[RetrievedBlock],
+) -> list[dict]:
+    return [
+        {
+            "id": block.id,
+            "address": block.address,
+            "score": block.score,
+            "score_status": block.graph_score_status,
+            "relationship": block.graph_relationship,
+            "origin_address": block.graph_origin_address,
+            "ref_text": block.graph_ref_text,
         }
         for block in blocks
     ]
@@ -67,7 +85,7 @@ def _build_config_json(
             "fusion": fusion_will_run,
             "fusion_method": fusion_method,
             "rerank": config.use_rerank,
-            "graph": False,
+            "graph": config.use_graph,
             "rewrite": False,
         },
     }
@@ -169,6 +187,99 @@ def run_pipeline(
             time.perf_counter() - rerank_start
         ) * 1000
         stages_json["rerank"] = _serialize(candidates)
+
+    if config.use_graph:
+        graph_start = time.perf_counter()
+        seed_n = max(config.graph_seed_n, 0)
+        max_added = max(config.graph_max_added, 0)
+
+        seeds = candidates[:seed_n]
+        seed_ids = {block.id for block in seeds}
+        original_position = {
+            block.id: position
+            for position, block in enumerate(candidates)
+        }
+
+        moved_ids: set[int] = set()
+        handled_ids: set[int] = set()
+        graph_actions: list[RetrievedBlock] = []
+        augmented: list[RetrievedBlock] = []
+        action_count = 0
+
+        for position, block in enumerate(candidates):
+            if block.id in moved_ids:
+                continue
+
+            augmented.append(block)
+
+            if position >= seed_n:
+                continue
+
+            insertions_here: list[RetrievedBlock] = []
+
+            for relationship, fetch in (
+                ("dependent", dependents),
+                ("dependency", dependencies),
+            ):
+                if action_count >= max_added:
+                    break
+
+                for neighbor in fetch(block.id):
+                    if action_count >= max_added:
+                        break
+
+                    if (
+                        neighbor.id in handled_ids
+                        or neighbor.id in seed_ids
+                    ):
+                        continue
+
+                    handled_ids.add(neighbor.id)
+                    existing_position = original_position.get(
+                        neighbor.id
+                    )
+
+                    if existing_position is None:
+                        new_block = RetrievedBlock(
+                            id=neighbor.id,
+                            address=neighbor.address,
+                            file_path=neighbor.file_path,
+                            start_line=neighbor.start_line,
+                            end_line=neighbor.end_line,
+                            body=neighbor.body,
+                            embed_text=neighbor.embed_text,
+                            score=None,
+                            graph_relationship=relationship,
+                            graph_origin_address=block.address,
+                            graph_ref_text=neighbor.ref_text,
+                            graph_score_status="unscored",
+                        )
+                    else:
+                        original_block = candidates[
+                            existing_position
+                        ]
+                        new_block = dataclasses.replace(
+                            original_block,
+                            graph_relationship=relationship,
+                            graph_origin_address=block.address,
+                            graph_ref_text=neighbor.ref_text,
+                            graph_score_status="promoted",
+                        )
+                        moved_ids.add(neighbor.id)
+
+                    insertions_here.append(new_block)
+                    graph_actions.append(new_block)
+                    action_count += 1
+
+            augmented.extend(insertions_here)
+
+        candidates = augmented
+        latency_json["graph_ms"] = (
+            time.perf_counter() - graph_start
+        ) * 1000
+        stages_json["graph"] = _serialize_graph(
+            graph_actions
+        )
 
     if config.final_k > 0:
         blocks = candidates[: config.final_k]

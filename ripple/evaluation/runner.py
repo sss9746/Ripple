@@ -81,6 +81,18 @@ ABLATION_CONFIGS: list[tuple[str, RetrievalConfig]] = [
             final_k=10,
         ),
     ),
+    (
+        "+ Graph expansion",
+        RetrievalConfig(
+            use_vector=True,
+            use_bm25=True,
+            use_rrf=True,
+            use_rerank=True,
+            use_graph=True,
+            use_rewrite=False,
+            final_k=10,
+        ),
+    ),
 ]
 
 

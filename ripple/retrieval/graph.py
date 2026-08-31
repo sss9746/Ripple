@@ -13,6 +13,7 @@ class GraphNeighbor:
     start_line: int
     end_line: int
     body: str
+    embed_text: str
     ref_text: str
 
 
@@ -29,12 +30,17 @@ def dependents(resource_id: int) -> list[GraphNeighbor]:
                     resource.start_line,
                     resource.end_line,
                     resource.body,
+                    resource.embed_text,
                     edges.ref_text
                 FROM edges
                 JOIN resources AS resource
                     ON resource.id = edges.source_id
                 WHERE edges.target_id = %s
-                ORDER BY resource.address
+                ORDER BY
+                    resource.address,
+                    edges.ref_text,
+                    resource.id,
+                    edges.id
                 """,
                 (resource_id,),
             )
@@ -56,12 +62,17 @@ def dependencies(resource_id: int) -> list[GraphNeighbor]:
                     resource.start_line,
                     resource.end_line,
                     resource.body,
+                    resource.embed_text,
                     edges.ref_text
                 FROM edges
                 JOIN resources AS resource
                     ON resource.id = edges.target_id
                 WHERE edges.source_id = %s
-                ORDER BY resource.address
+                ORDER BY
+                    resource.address,
+                    edges.ref_text,
+                    resource.id,
+                    edges.id
                 """,
                 (resource_id,),
             )

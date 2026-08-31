@@ -11,7 +11,11 @@ class RetrievedBlock:
     end_line: int
     body: str
     embed_text: str
-    score: float
+    score: float | None
+    graph_relationship: str | None = None
+    graph_origin_address: str | None = None
+    graph_ref_text: str | None = None
+    graph_score_status: str | None = None
 
 
 class VectorStore(Protocol):

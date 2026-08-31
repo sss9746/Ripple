@@ -173,18 +173,24 @@ def test_ablation_configs_are_explicit_and_support_recall_at_10() -> None:
         "Vector + BM25",
         "Vector + BM25 + RRF",
         "+ Cross-encoder rerank",
+        "+ Graph expansion",
     ]
 
     for index, (_name, config) in enumerate(runner.ABLATION_CONFIGS):
         assert config.final_k >= 10
-        assert config.use_rerank is (index == 3)
-        assert config.use_graph is False
+        assert config.use_rerank is (index in (3, 4))
+        assert config.use_graph is (index == 4)
         assert config.use_rewrite is False
 
     rerank_config = runner.ABLATION_CONFIGS[3][1]
     assert rerank_config.use_vector is True
     assert rerank_config.use_bm25 is True
     assert rerank_config.use_rrf is True
+
+    graph_config = runner.ABLATION_CONFIGS[4][1]
+    assert graph_config.use_vector is True
+    assert graph_config.use_bm25 is True
+    assert graph_config.use_rrf is True
 
 
 def test_run_benchmark_reuses_one_prepared_reranker(

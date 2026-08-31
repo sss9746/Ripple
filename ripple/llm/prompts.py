@@ -11,12 +11,30 @@ Rules:
 """
 
 
+_GRAPH_RELATIONSHIP_LABELS = {
+    "dependent": "Depends on",
+    "dependency": "Referenced by",
+}
+
+
 def format_context(blocks: list[RetrievedBlock]) -> str:
-    sections = [
-        f"[{index}] {block.address}\n"
-        f"    {block.file_path}:{block.start_line}-{block.end_line}\n"
-        f"    {block.body}"
-        for index, block in enumerate(blocks, start=1)
-    ]
+    sections = []
+
+    for index, block in enumerate(blocks, start=1):
+        lines = [
+            f"[{index}] {block.address}",
+            f"    {block.file_path}:{block.start_line}-{block.end_line}",
+        ]
+
+        if block.graph_relationship is not None:
+            label = _GRAPH_RELATIONSHIP_LABELS[
+                block.graph_relationship
+            ]
+            lines.append(
+                f"    {label}: {block.graph_origin_address}"
+            )
+
+        lines.append(f"    {block.body}")
+        sections.append("\n".join(lines))
 
     return "\n\n".join(sections)

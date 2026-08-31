@@ -19,6 +19,41 @@ class _FakeEmbeddingProvider:
         return [[0.0] * 1536 for _ in texts]
 
 
+class _RecordingCursor:
+    def __init__(self, queries: list[str]) -> None:
+        self.queries = queries
+
+    def __enter__(self) -> "_RecordingCursor":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def execute(
+        self,
+        query: str,
+        params: tuple[int],
+    ) -> None:
+        self.queries.append(query)
+
+    def fetchall(self) -> list[tuple]:
+        return []
+
+
+class _RecordingConnection:
+    def __init__(self, queries: list[str]) -> None:
+        self.queries = queries
+
+    def __enter__(self) -> "_RecordingConnection":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def cursor(self) -> _RecordingCursor:
+        return _RecordingCursor(self.queries)
+
+
 @pytest.fixture(scope="module")
 def resource_ids() -> Iterator[dict[str, int]]:
     try:
@@ -66,6 +101,10 @@ def test_dependencies_returns_referenced_block(
     assert neighbors[0].ref_text == "aws_vpc.main.id"
     assert neighbors[0].file_path == "main.tf"
     assert neighbors[0].body.startswith('resource "aws_vpc" "main"')
+    assert neighbors[0].embed_text.startswith(
+        "aws_vpc.main\nFile: main.tf\nType: aws_vpc"
+    )
+    assert neighbors[0].embed_text != neighbors[0].body
 
 
 def test_dependents_returns_referencing_blocks_in_stable_order(
@@ -87,9 +126,100 @@ def test_dependents_returns_referencing_blocks_in_stable_order(
     assert second_result == first_result
 
 
+def test_graph_queries_order_duplicate_edges_by_reference_text(
+    resource_ids: dict[str, int],
+) -> None:
+    subnet_id = resource_ids["aws_subnet.public"]
+    vpc_id = resource_ids["aws_vpc.main"]
+    inserted_edge_ids: list[int] = []
+
+    try:
+        with db.get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT repo_id FROM resources WHERE id = %s",
+                    (vpc_id,),
+                )
+                repo_id = cursor.fetchone()[0]
+
+                for ref_text in (
+                    "aws_vpc.main.alpha",
+                    "aws_vpc.main.zeta",
+                ):
+                    cursor.execute(
+                        """
+                        INSERT INTO edges
+                            (repo_id, source_id, target_id, ref_text)
+                        VALUES (%s, %s, %s, %s)
+                        RETURNING id
+                        """,
+                        (repo_id, subnet_id, vpc_id, ref_text),
+                    )
+                    inserted_edge_ids.append(cursor.fetchone()[0])
+
+        expected_ref_texts = [
+            "aws_vpc.main.alpha",
+            "aws_vpc.main.id",
+            "aws_vpc.main.zeta",
+        ]
+
+        for _attempt in range(2):
+            dependent_refs = [
+                neighbor.ref_text
+                for neighbor in graph.dependents(vpc_id)
+                if neighbor.id == subnet_id
+            ]
+            dependency_refs = [
+                neighbor.ref_text
+                for neighbor in graph.dependencies(subnet_id)
+                if neighbor.id == vpc_id
+            ]
+
+            assert dependent_refs == expected_ref_texts
+            assert dependency_refs == expected_ref_texts
+    finally:
+        if inserted_edge_ids:
+            with db.get_connection() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "DELETE FROM edges WHERE id = ANY(%s::int[])",
+                        (inserted_edge_ids,),
+                    )
+
+
 def test_dependencies_returns_empty_list_when_block_has_none(
     resource_ids: dict[str, int],
 ) -> None:
     ami_id = resource_ids["data.aws_ami.ubuntu"]
 
     assert graph.dependencies(ami_id) == []
+
+
+def test_graph_queries_use_total_deterministic_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queries: list[str] = []
+
+    monkeypatch.setattr(
+        graph.db,
+        "get_connection",
+        lambda: _RecordingConnection(queries),
+    )
+
+    assert graph.dependents(1) == []
+    assert graph.dependencies(1) == []
+
+    normalized_queries = [
+        " ".join(query.split())
+        for query in queries
+    ]
+    expected_order = (
+        "ORDER BY resource.address, edges.ref_text, "
+        "resource.id, edges.id"
+    )
+
+    assert len(normalized_queries) == 2
+    assert all(
+        expected_order in query
+        for query in normalized_queries
+    )
