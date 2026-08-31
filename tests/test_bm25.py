@@ -111,7 +111,10 @@ def bm25_test_repositories() -> Iterator[_BM25TestRepositories]:
 def _build_test_index(
     entries: list[tuple[str, str]],
 ) -> BM25Index:
-    tokenized_corpus = [tokenize(text) for _address, text in entries]
+    tokenized_corpus = [
+        tokenize(embed_text)
+        for _address, embed_text in entries
+    ]
     documents = [
         BM25Document(
             id=index,
@@ -119,10 +122,11 @@ def _build_test_index(
             file_path="main.tf",
             start_line=1,
             end_line=1,
-            body=text,
+            body=f"body for {address}",
+            embed_text=embed_text,
             tokens=frozenset(tokenized_corpus[index]),
         )
-        for index, (address, text) in enumerate(entries)
+        for index, (address, embed_text) in enumerate(entries)
     ]
     return BM25Index(documents, BM25Okapi(tokenized_corpus))
 
@@ -283,6 +287,13 @@ def test_build_index_retrieves_exact_address_from_database(
     bm25_test_repositories: _BM25TestRepositories,
 ) -> None:
     bm25_index = build_index(bm25_test_repositories.reference_repo_id)
+    expected_rows = db.fetch_bm25_documents(
+        bm25_test_repositories.reference_repo_id
+    )
+    expected_embed_text_by_address = {
+        row[1]: row[6]
+        for row in expected_rows
+    }
 
     results = bm25_index.query("aws_vpc.main", k=5)
 
@@ -290,6 +301,10 @@ def test_build_index_retrieves_exact_address_from_database(
     assert results[0].id == (
         bm25_test_repositories.reference_ids_by_address["aws_vpc.main"]
     )
+    assert results[0].embed_text == (
+        expected_embed_text_by_address["aws_vpc.main"]
+    )
+    assert results[0].embed_text != results[0].body
 
 
 def test_build_index_keeps_repository_results_isolated(

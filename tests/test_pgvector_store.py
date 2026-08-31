@@ -102,6 +102,8 @@ def test_pgvector_store_query_limit_null_filter_and_delete() -> None:
         ]
         assert results[0].score == pytest.approx(1.0)
         assert results[1].score == pytest.approx(-1.0)
+        assert results[0].embed_text == "aws_instance.close"
+        assert results[0].embed_text != results[0].body
 
         store.upsert(
             repo_id,

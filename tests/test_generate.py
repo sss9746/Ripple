@@ -43,6 +43,7 @@ def test_answer_question_sends_grounded_request_and_returns_output() -> None:
         start_line=1,
         end_line=10,
         body='resource "aws_vpc" "main" {}',
+        embed_text="aws_vpc.main",
         score=0.95,
     )
 

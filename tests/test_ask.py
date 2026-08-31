@@ -19,6 +19,7 @@ def _block() -> RetrievedBlock:
         start_line=1,
         end_line=10,
         body='resource "aws_vpc" "main" {}',
+        embed_text="aws_vpc.main",
         score=0.0325,
     )
 

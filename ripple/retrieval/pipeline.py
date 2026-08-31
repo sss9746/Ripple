@@ -7,6 +7,7 @@ from ripple.llm.embeddings import EmbeddingProvider, OpenAIEmbeddingProvider
 from ripple.retrieval import fusion
 from ripple.retrieval.bm25 import build_index
 from ripple.retrieval.pgvector_store import PgVectorStore
+from ripple.retrieval.rerank import CrossEncoderReranker, Reranker
 from ripple.retrieval.vector_store import RetrievedBlock, VectorStore
 
 
@@ -65,7 +66,7 @@ def _build_config_json(
             "bm25": config.use_bm25,
             "fusion": fusion_will_run,
             "fusion_method": fusion_method,
-            "rerank": False,
+            "rerank": config.use_rerank,
             "graph": False,
             "rewrite": False,
         },
@@ -77,6 +78,7 @@ def run_pipeline(
     question: str,
     config: RetrievalConfig,
     embedder: EmbeddingProvider | None = None,
+    reranker: Reranker | None = None,
 ) -> PipelineResult:
     total_start = time.perf_counter()
 
@@ -144,6 +146,29 @@ def run_pipeline(
 
     else:
         candidates = []
+
+    if config.use_rerank:
+        rerank_start = time.perf_counter()
+
+        if config.rerank_top_n > 0:
+            rerank_candidates = candidates[: config.rerank_top_n]
+        else:
+            rerank_candidates = []
+
+        active_reranker = (
+            reranker
+            if reranker is not None
+            else CrossEncoderReranker()
+        )
+        candidates = active_reranker.rerank(
+            question,
+            rerank_candidates,
+        )
+
+        latency_json["rerank_ms"] = (
+            time.perf_counter() - rerank_start
+        ) * 1000
+        stages_json["rerank"] = _serialize(candidates)
 
     if config.final_k > 0:
         blocks = candidates[: config.final_k]

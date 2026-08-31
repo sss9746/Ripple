@@ -10,7 +10,11 @@ def _block(
     start_line: int,
     end_line: int,
     body: str,
+    embed_text: str | None = None,
 ) -> RetrievedBlock:
+    if embed_text is None:
+        embed_text = address
+
     return RetrievedBlock(
         id=id,
         address=address,
@@ -18,6 +22,7 @@ def _block(
         start_line=start_line,
         end_line=end_line,
         body=body,
+        embed_text=embed_text,
         score=0.9,
     )
 

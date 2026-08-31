@@ -13,6 +13,7 @@ def _block(
     block_id: int,
     address: str,
     score: float,
+    embed_text: str = "embed text",
 ) -> RetrievedBlock:
     return RetrievedBlock(
         id=block_id,
@@ -21,6 +22,7 @@ def _block(
         start_line=1,
         end_line=5,
         body="resource body",
+        embed_text=embed_text,
         score=score,
     )
 
@@ -70,6 +72,22 @@ class _FakeBM25Index:
         return self.blocks if k > 0 else []
 
 
+class _FakeReranker:
+    def __init__(self, *, reverse: bool = False) -> None:
+        self.reverse = reverse
+        self.calls: list[tuple[str, list[RetrievedBlock]]] = []
+
+    def rerank(
+        self,
+        question: str,
+        candidates: list[RetrievedBlock],
+    ) -> list[RetrievedBlock]:
+        self.calls.append((question, candidates))
+        if self.reverse:
+            return list(reversed(candidates))
+        return candidates
+
+
 def _install_vector_store(
     monkeypatch: pytest.MonkeyPatch,
     blocks: list[RetrievedBlock],
@@ -109,7 +127,11 @@ def test_run_pipeline_vector_only(
     result = pipeline.run_pipeline(
         repo_id=3,
         question=QUESTION,
-        config=RetrievalConfig(use_bm25=False, final_k=8),
+        config=RetrievalConfig(
+            use_bm25=False,
+            use_rerank=False,
+            final_k=8,
+        ),
         embedder=embedder,
     )
 
@@ -135,7 +157,11 @@ def test_run_pipeline_bm25_only_without_openai_key(
     result = pipeline.run_pipeline(
         repo_id=4,
         question=QUESTION,
-        config=RetrievalConfig(use_vector=False, final_k=8),
+        config=RetrievalConfig(
+            use_vector=False,
+            use_rerank=False,
+            final_k=8,
+        ),
     )
 
     assert result.blocks == bm25_blocks
@@ -162,7 +188,11 @@ def test_run_pipeline_fuses_vector_and_bm25_results(
     result = pipeline.run_pipeline(
         repo_id=3,
         question=QUESTION,
-        config=RetrievalConfig(final_k=3, rrf_k=60),
+        config=RetrievalConfig(
+            use_rerank=False,
+            final_k=3,
+            rrf_k=60,
+        ),
         embedder=_FakeEmbeddingProvider(),
     )
 
@@ -201,7 +231,11 @@ def test_run_pipeline_concatenates_when_rrf_is_disabled(
     result = pipeline.run_pipeline(
         repo_id=3,
         question=QUESTION,
-        config=RetrievalConfig(use_rrf=False, final_k=3),
+        config=RetrievalConfig(
+            use_rrf=False,
+            use_rerank=False,
+            final_k=3,
+        ),
         embedder=_FakeEmbeddingProvider(),
     )
 
@@ -220,7 +254,11 @@ def test_run_pipeline_with_both_retrievers_disabled(
     result = pipeline.run_pipeline(
         repo_id=3,
         question=QUESTION,
-        config=RetrievalConfig(use_vector=False, use_bm25=False),
+        config=RetrievalConfig(
+            use_vector=False,
+            use_bm25=False,
+            use_rerank=False,
+        ),
     )
 
     assert result.blocks == []
@@ -233,12 +271,14 @@ def test_config_json_separates_requested_and_executed_stages(
 ) -> None:
     _install_vector_store(monkeypatch, [])
     config = RetrievalConfig(use_bm25=False, use_rerank=True)
+    reranker = _FakeReranker()
 
     result = pipeline.run_pipeline(
         repo_id=3,
         question=QUESTION,
         config=config,
         embedder=_FakeEmbeddingProvider(),
+        reranker=reranker,
     )
 
     assert result.config_json["requested"]["use_rerank"] is True
@@ -247,7 +287,7 @@ def test_config_json_separates_requested_and_executed_stages(
         "bm25": False,
         "fusion": False,
         "fusion_method": None,
-        "rerank": False,
+        "rerank": True,
         "graph": False,
         "rewrite": False,
     }
@@ -268,7 +308,10 @@ def test_config_json_records_executed_fusion_method(
     result = pipeline.run_pipeline(
         repo_id=3,
         question=QUESTION,
-        config=RetrievalConfig(use_rrf=use_rrf),
+        config=RetrievalConfig(
+            use_rrf=use_rrf,
+            use_rerank=False,
+        ),
         embedder=_FakeEmbeddingProvider(),
     )
 
@@ -289,6 +332,7 @@ def test_unsupported_vector_backend_fails_before_external_calls(
             config=RetrievalConfig(
                 vector_backend="pinecone",
                 use_bm25=False,
+                use_rerank=False,
             ),
         )
 
@@ -307,6 +351,7 @@ def test_unused_unsupported_vector_backend_does_not_raise(
             vector_backend="pinecone",
             use_vector=False,
             use_bm25=False,
+            use_rerank=False,
         ),
     )
 
@@ -329,6 +374,7 @@ def test_nonpositive_final_k_returns_no_final_blocks(
         question=QUESTION,
         config=RetrievalConfig(
             use_vector=False,
+            use_rerank=False,
             final_k=final_k,
         ),
     )
@@ -351,6 +397,7 @@ def test_nonpositive_vector_k_skips_embedding_and_query(
         question=QUESTION,
         config=RetrievalConfig(
             use_bm25=False,
+            use_rerank=False,
             vector_k=vector_k,
         ),
     )
@@ -374,6 +421,7 @@ def test_nonpositive_bm25_k_returns_no_bm25_results(
         question=QUESTION,
         config=RetrievalConfig(
             use_vector=False,
+            use_rerank=False,
             bm25_k=bm25_k,
         ),
     )
@@ -392,7 +440,10 @@ def test_negative_rrf_k_raises_when_rrf_runs(
         pipeline.run_pipeline(
             repo_id=3,
             question=QUESTION,
-            config=RetrievalConfig(rrf_k=-1),
+            config=RetrievalConfig(
+                use_rerank=False,
+                rrf_k=-1,
+            ),
             embedder=_FakeEmbeddingProvider(),
         )
 
@@ -406,7 +457,11 @@ def test_negative_rrf_k_is_ignored_when_rrf_is_disabled(
     result = pipeline.run_pipeline(
         repo_id=3,
         question=QUESTION,
-        config=RetrievalConfig(rrf_k=-1, use_rrf=False),
+        config=RetrievalConfig(
+            rrf_k=-1,
+            use_rrf=False,
+            use_rerank=False,
+        ),
         embedder=_FakeEmbeddingProvider(),
     )
 
@@ -431,6 +486,7 @@ def test_negative_rrf_k_is_ignored_with_only_one_retriever(
         config=RetrievalConfig(
             use_vector=use_vector,
             use_bm25=use_bm25,
+            use_rerank=False,
             rrf_k=-1,
         ),
         embedder=_FakeEmbeddingProvider(),
@@ -456,7 +512,10 @@ def test_final_stage_matches_truncated_pipeline_blocks(
     result = pipeline.run_pipeline(
         repo_id=3,
         question=QUESTION,
-        config=RetrievalConfig(final_k=2),
+        config=RetrievalConfig(
+            use_rerank=False,
+            final_k=2,
+        ),
         embedder=_FakeEmbeddingProvider(),
     )
 
@@ -465,3 +524,145 @@ def test_final_stage_matches_truncated_pipeline_blocks(
     assert len(result.stages_json["vector"]) == 2
     assert len(result.stages_json["bm25"]) == 2
     assert len(result.stages_json["fusion"]) == 3
+
+
+def test_disabled_rerank_never_calls_reranker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vector_blocks = [_block(1, "aws_vpc.main", 0.95)]
+    _install_vector_store(monkeypatch, vector_blocks)
+    monkeypatch.setattr(pipeline, "build_index", _unexpected_call)
+    reranker = _FakeReranker()
+
+    result = pipeline.run_pipeline(
+        repo_id=3,
+        question=QUESTION,
+        config=RetrievalConfig(
+            use_bm25=False,
+            use_rerank=False,
+        ),
+        embedder=_FakeEmbeddingProvider(),
+        reranker=reranker,
+    )
+
+    assert reranker.calls == []
+    assert result.blocks == vector_blocks
+    assert "rerank" not in result.stages_json
+    assert "rerank_ms" not in result.latency_json
+
+
+def test_rerank_uses_fused_top_n_before_final_k(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vector_blocks = [
+        _block(1, "example.a", 0.9),
+        _block(2, "example.b", 0.8),
+        _block(3, "example.c", 0.7),
+    ]
+    bm25_blocks = [_block(4, "example.d", 8.0)]
+    _install_vector_store(monkeypatch, vector_blocks)
+    _install_bm25_index(monkeypatch, bm25_blocks)
+    reranker = _FakeReranker(reverse=True)
+
+    result = pipeline.run_pipeline(
+        repo_id=3,
+        question=QUESTION,
+        config=RetrievalConfig(
+            use_rrf=False,
+            use_rerank=True,
+            rerank_top_n=3,
+            final_k=1,
+        ),
+        embedder=_FakeEmbeddingProvider(),
+        reranker=reranker,
+    )
+
+    assert len(reranker.calls) == 1
+    assert reranker.calls[0][0] == QUESTION
+    assert [block.id for block in reranker.calls[0][1]] == [1, 4, 2]
+    assert [row["id"] for row in result.stages_json["rerank"]] == [
+        2,
+        4,
+        1,
+    ]
+    assert [block.id for block in result.blocks] == [2]
+    assert result.config_json["executed"]["rerank"] is True
+    assert "rerank_ms" in result.latency_json
+
+
+def test_enabled_rerank_runs_with_vector_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vector_blocks = [_block(1, "aws_vpc.main", 0.95)]
+    _install_vector_store(monkeypatch, vector_blocks)
+    monkeypatch.setattr(pipeline, "build_index", _unexpected_call)
+    reranker = _FakeReranker()
+
+    result = pipeline.run_pipeline(
+        repo_id=3,
+        question=QUESTION,
+        config=RetrievalConfig(
+            use_bm25=False,
+            use_rerank=True,
+        ),
+        embedder=_FakeEmbeddingProvider(),
+        reranker=reranker,
+    )
+
+    assert len(reranker.calls) == 1
+    assert reranker.calls[0][1] == vector_blocks
+    assert result.stages_json["rerank"] == _serialized(vector_blocks)
+
+
+def test_enabled_rerank_records_empty_stage_for_no_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_vector_store(monkeypatch, [])
+    monkeypatch.setattr(pipeline, "build_index", _unexpected_call)
+    reranker = _FakeReranker()
+
+    result = pipeline.run_pipeline(
+        repo_id=3,
+        question=QUESTION,
+        config=RetrievalConfig(
+            use_bm25=False,
+            use_rerank=True,
+        ),
+        embedder=_FakeEmbeddingProvider(),
+        reranker=reranker,
+    )
+
+    assert reranker.calls == [(QUESTION, [])]
+    assert result.stages_json["rerank"] == []
+    assert result.stages_json["final"] == []
+    assert result.config_json["executed"]["rerank"] is True
+    assert "rerank_ms" in result.latency_json
+
+
+@pytest.mark.parametrize("rerank_top_n", [0, -1])
+def test_nonpositive_rerank_top_n_passes_empty_pool(
+    monkeypatch: pytest.MonkeyPatch,
+    rerank_top_n: int,
+) -> None:
+    _install_vector_store(
+        monkeypatch,
+        [_block(1, "aws_vpc.main", 0.95)],
+    )
+    monkeypatch.setattr(pipeline, "build_index", _unexpected_call)
+    reranker = _FakeReranker()
+
+    result = pipeline.run_pipeline(
+        repo_id=3,
+        question=QUESTION,
+        config=RetrievalConfig(
+            use_bm25=False,
+            use_rerank=True,
+            rerank_top_n=rerank_top_n,
+        ),
+        embedder=_FakeEmbeddingProvider(),
+        reranker=reranker,
+    )
+
+    assert reranker.calls == [(QUESTION, [])]
+    assert result.blocks == []
+    assert result.stages_json["rerank"] == []

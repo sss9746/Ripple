@@ -16,6 +16,7 @@ from ripple.evaluation.metrics import (
 )
 from ripple.llm.embeddings import EMBEDDING_MODEL
 from ripple.retrieval import pipeline
+from ripple.retrieval.rerank import CrossEncoderReranker
 
 
 GIT_REVISION_UNAVAILABLE = "unavailable"
@@ -28,6 +29,7 @@ class ConfigResult:
     per_question: list[QuestionResult]
     aggregate: AggregateMetrics
     by_category: list[CategoryMetrics]
+    reranker_json: dict | None = None
 
 
 ABLATION_CONFIGS: list[tuple[str, RetrievalConfig]] = [
@@ -62,6 +64,18 @@ ABLATION_CONFIGS: list[tuple[str, RetrievalConfig]] = [
             use_bm25=True,
             use_rrf=True,
             use_rerank=False,
+            use_graph=False,
+            use_rewrite=False,
+            final_k=10,
+        ),
+    ),
+    (
+        "+ Cross-encoder rerank",
+        RetrievalConfig(
+            use_vector=True,
+            use_bm25=True,
+            use_rrf=True,
+            use_rerank=True,
             use_graph=False,
             use_rewrite=False,
             final_k=10,
@@ -118,7 +132,7 @@ def build_report(
     )
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.now(timezone.utc)
         .isoformat(timespec="microseconds")
         .replace("+00:00", "Z"),
@@ -146,14 +160,36 @@ def run_benchmark(
     config_name: str,
 ) -> ConfigResult:
     """Run and score every benchmark question under one retrieval config."""
+    reranker: CrossEncoderReranker | None = None
+    reranker_json: dict | None = None
+
+    if config.use_rerank:
+        reranker = CrossEncoderReranker()
+        reranker.prepare()
+        reranker_json = reranker.describe()
+        print(
+            f"[{config_name}] reranker prepared in "
+            f"{reranker.prepare_ms:.0f}ms "
+            "(one-time; excluded from question latency)"
+        )
+
     per_question: list[QuestionResult] = []
 
     for entry in entries:
-        pipeline_result = pipeline.run_pipeline(
-            repo_id,
-            entry.question,
-            config,
-        )
+        if config.use_rerank:
+            pipeline_result = pipeline.run_pipeline(
+                repo_id,
+                entry.question,
+                config,
+                reranker=reranker,
+            )
+        else:
+            pipeline_result = pipeline.run_pipeline(
+                repo_id,
+                entry.question,
+                config,
+            )
+
         retrieved = [block.address for block in pipeline_result.blocks]
         per_question.append(
             score_question(
@@ -169,4 +205,5 @@ def run_benchmark(
         per_question=per_question,
         aggregate=aggregate(per_question),
         by_category=aggregate_by_category(per_question),
+        reranker_json=reranker_json,
     )

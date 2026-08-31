@@ -8,6 +8,7 @@ def _block(
     block_id: int,
     address: str,
     score: float,
+    embed_text: str = "embed text",
 ) -> RetrievedBlock:
     return RetrievedBlock(
         id=block_id,
@@ -16,6 +17,7 @@ def _block(
         start_line=1,
         end_line=1,
         body="resource body",
+        embed_text=embed_text,
         score=score,
     )
 

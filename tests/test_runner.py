@@ -17,7 +17,14 @@ from ripple.retrieval.pipeline import PipelineResult
 from ripple.retrieval.vector_store import RetrievedBlock
 
 
-def retrieved_block(block_id: int, address: str) -> RetrievedBlock:
+def retrieved_block(
+    block_id: int,
+    address: str,
+    embed_text: str | None = None,
+) -> RetrievedBlock:
+    if embed_text is None:
+        embed_text = f"embed text for {address}"
+
     return RetrievedBlock(
         id=block_id,
         address=address,
@@ -25,6 +32,7 @@ def retrieved_block(block_id: int, address: str) -> RetrievedBlock:
         start_line=block_id,
         end_line=block_id + 2,
         body=f"body for {address}",
+        embed_text=embed_text,
         score=1.0 / block_id,
     )
 
@@ -164,13 +172,141 @@ def test_ablation_configs_are_explicit_and_support_recall_at_10() -> None:
         "Vector only",
         "Vector + BM25",
         "Vector + BM25 + RRF",
+        "+ Cross-encoder rerank",
     ]
 
-    for _name, config in runner.ABLATION_CONFIGS:
+    for index, (_name, config) in enumerate(runner.ABLATION_CONFIGS):
         assert config.final_k >= 10
-        assert config.use_rerank is False
+        assert config.use_rerank is (index == 3)
         assert config.use_graph is False
         assert config.use_rewrite is False
+
+    rerank_config = runner.ABLATION_CONFIGS[3][1]
+    assert rerank_config.use_vector is True
+    assert rerank_config.use_bm25 is True
+    assert rerank_config.use_rrf is True
+
+
+def test_run_benchmark_reuses_one_prepared_reranker(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    instances: list[object] = []
+
+    class FakeReranker:
+        def __init__(self) -> None:
+            self.prepare_calls = 0
+            self.prepare_ms = 12.5
+            instances.append(self)
+
+        def prepare(self) -> None:
+            self.prepare_calls += 1
+
+        def describe(self) -> dict:
+            return {
+                "model_name": "fake-reranker",
+                "prepare_ms": self.prepare_ms,
+            }
+
+    received_rerankers: list[object] = []
+
+    def fake_run_pipeline(
+        repo_id: int,
+        question: str,
+        config: RetrievalConfig,
+        *,
+        reranker: object,
+    ) -> PipelineResult:
+        received_rerankers.append(reranker)
+        return pipeline_result(
+            [retrieved_block(1, "module.vpc")],
+            {"rerank_ms": 2.0, "total_ms": 3.0},
+        )
+
+    monkeypatch.setattr(runner, "CrossEncoderReranker", FakeReranker)
+    monkeypatch.setattr(
+        runner.pipeline,
+        "run_pipeline",
+        fake_run_pipeline,
+    )
+    entries = [
+        BenchmarkEntry(
+            id="q001",
+            question="What creates the VPC?",
+            expected=["module.vpc"],
+            category="lookup",
+        ),
+        BenchmarkEntry(
+            id="q002",
+            question="Which module manages networking?",
+            expected=["module.vpc"],
+            category="lookup",
+        ),
+    ]
+
+    result = runner.run_benchmark(
+        repo_id=42,
+        entries=entries,
+        config=runner.ABLATION_CONFIGS[3][1],
+        config_name="+ Cross-encoder rerank",
+    )
+
+    assert len(instances) == 1
+    assert instances[0].prepare_calls == 1
+    assert received_rerankers == [instances[0], instances[0]]
+    assert result.reranker_json == {
+        "model_name": "fake-reranker",
+        "prepare_ms": 12.5,
+    }
+    assert capsys.readouterr().out.count("reranker prepared") == 1
+
+
+def test_run_benchmark_without_rerank_preserves_three_argument_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_constructed() -> None:
+        raise AssertionError("disabled reranker must not be constructed")
+
+    calls: list[tuple[int, str, RetrievalConfig]] = []
+
+    def fake_run_pipeline(
+        repo_id: int,
+        question: str,
+        config: RetrievalConfig,
+    ) -> PipelineResult:
+        calls.append((repo_id, question, config))
+        return pipeline_result(
+            [retrieved_block(1, "module.vpc")],
+            {"total_ms": 1.0},
+        )
+
+    monkeypatch.setattr(
+        runner,
+        "CrossEncoderReranker",
+        fail_if_constructed,
+    )
+    monkeypatch.setattr(
+        runner.pipeline,
+        "run_pipeline",
+        fake_run_pipeline,
+    )
+    entry = BenchmarkEntry(
+        id="q001",
+        question="What creates the VPC?",
+        expected=["module.vpc"],
+        category="lookup",
+    )
+    config = runner.ABLATION_CONFIGS[0][1]
+
+    result = runner.run_benchmark(
+        repo_id=42,
+        entries=[entry],
+        config=config,
+        config_name="Vector only",
+    )
+
+    assert calls == [(42, entry.question, config)]
+    assert result.reranker_json is None
 
 
 def test_run_benchmark_never_generates_an_answer(
@@ -312,6 +448,22 @@ def test_build_report_includes_provenance_results_and_no_secrets(
         aggregate=aggregate([question]),
         by_category=aggregate_by_category([question]),
     )
+    reranker_json = {
+        "model_name": "BAAI/bge-reranker-base",
+        "max_length": 512,
+        "sentence_transformers_version": "6.0.0",
+        "model_revision": "model-abc123",
+        "prepare_ms": 12.5,
+        "enabled": True,
+    }
+    rerank_config_result = runner.ConfigResult(
+        config_name="+ Cross-encoder rerank",
+        config=runner.ABLATION_CONFIGS[3][1],
+        per_question=[question],
+        aggregate=aggregate([question]),
+        by_category=aggregate_by_category([question]),
+        reranker_json=reranker_json,
+    )
     monkeypatch.setattr(
         runner.db,
         "fetch_repo",
@@ -338,10 +490,10 @@ def test_build_report_includes_provenance_results_and_no_secrets(
         repo_id=42,
         benchmark_path="data/benchmark.json",
         benchmark_sha256="benchmark-hash",
-        results=[config_result],
+        results=[config_result, rerank_config_result],
     )
 
-    assert report["schema_version"] == 1
+    assert report["schema_version"] == 2
     assert report["generated_at"].endswith("Z")
     assert report["repo_id"] == 42
     assert report["benchmark_path"] == "data/benchmark.json"
@@ -354,6 +506,11 @@ def test_build_report_includes_provenance_results_and_no_secrets(
     assert len(report["corpus"]["indexed_corpus_sha256"]) == 64
     assert report["results"][0]["config_name"] == "Vector only"
     assert report["results"][0]["config"]["final_k"] == 10
+    assert report["results"][0]["reranker_json"] is None
+    assert report["results"][1]["config_name"] == (
+        "+ Cross-encoder rerank"
+    )
+    assert report["results"][1]["reranker_json"] == reranker_json
     assert report["results"][0]["per_question"][0]["latency"] == {
         "vector_query_ms": 10.0,
         "total_ms": 12.0,

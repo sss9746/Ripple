@@ -10,6 +10,7 @@ class RetrievedBlock:
     start_line: int
     end_line: int
     body: str
+    embed_text: str
     score: float
 
 

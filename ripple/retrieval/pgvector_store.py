@@ -28,7 +28,8 @@ class PgVectorStore:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT id, address, file_path, start_line, end_line, body,
+                    SELECT id, address, file_path, start_line, end_line,
+                           body, embed_text,
                            1 - (embedding <=> %s) AS score
                     FROM resources
                     WHERE repo_id = %s
@@ -48,7 +49,8 @@ class PgVectorStore:
                 start_line=row[3],
                 end_line=row[4],
                 body=row[5],
-                score=row[6],
+                embed_text=row[6],
+                score=row[7],
             )
             for row in rows
         ]

@@ -34,6 +34,7 @@ class BM25Document:
     start_line: int
     end_line: int
     body: str
+    embed_text: str
     tokens: frozenset[str]
 
 
@@ -89,6 +90,7 @@ class BM25Index:
                 start_line=self._documents[index].start_line,
                 end_line=self._documents[index].end_line,
                 body=self._documents[index].body,
+                embed_text=self._documents[index].embed_text,
                 score=float(scores[index]),
             )
             for index in ranked_indexes[:k]
@@ -112,6 +114,7 @@ def build_index(repo_id: int) -> BM25Index:
             start_line=row[3],
             end_line=row[4],
             body=row[5],
+            embed_text=row[6],
             tokens=frozenset(tokenized_corpus[index]),
         )
         for index, row in enumerate(rows)

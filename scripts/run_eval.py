@@ -59,7 +59,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--config",
         choices=CONFIG_NAMES,
-        help="run one retrieval configuration (default: run all three)",
+        help=(
+            "run one retrieval configuration "
+            "(default: run all configured rows)"
+        ),
     )
     parser.add_argument(
         "--yes",

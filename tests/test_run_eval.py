@@ -77,6 +77,19 @@ def test_confirm_cost_skip_does_not_prompt(
     assert "approximately 40 embedding requests" in capsys.readouterr().out
 
 
+def test_config_help_does_not_hardcode_old_row_count(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as error:
+        run_eval.parse_args(["--help"])
+
+    assert error.value.code == 0
+    output = capsys.readouterr().out
+    normalized_output = " ".join(output.split())
+    assert "all three" not in output
+    assert "default: run all configured rows" in normalized_output
+
+
 def test_load_validated_benchmark_checks_selected_repo(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -377,7 +390,7 @@ def test_main_decline_stops_before_running_benchmark(
         )
 
 
-def test_main_runs_all_three_configs_when_config_is_omitted(
+def test_main_runs_all_configured_rows_when_config_is_omitted(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
