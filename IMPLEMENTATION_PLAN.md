@@ -9,11 +9,24 @@ in section 12 for your review, never silently guessed past.
 **Only this file is modified in this planning cycle.** No application code, tests,
 or other files change until a step from section 6 is implemented.
 
-This plan replaces the Day 12 plan, which is done (section 1 is a short
-completed-baseline summary). It covers **Day 13 only** — graph expansion — per
-SPEC section 11's own day boundary ("Day 13 — Graph expansion... Done when: row
-five exists"). Day 15 (query rewriting), Pinecone, and RRF tuning stay out of
-scope.
+This is a **revision** of the prior Day 13 plan, correcting a second round of
+review findings that caught a real, evaluation-breaking algorithm bug: the
+proposed `known_ids`-based dedup would have skipped promoting any graph neighbor
+that already existed anywhere in the up-to-50-item reranked candidate pool,
+including at rank 11–50 — meaning the `q011` smoke test the plan itself proposed
+could fail even when `module.vpc` genuinely is a direct dependency, because a
+neighbor sitting at rank 30 would never be moved next to its seed and would still
+be cut by `final_k=10`. This revision replaces "skip if present anywhere" with a
+three-case promote/add/leave-alone algorithm (section 5.4/5.7), corrects a score-
+misattribution problem (a graph-only addition was inheriting its seed's reranker
+score, which the model never actually assigned to it — section 5.5), tightens
+graph query ordering to a genuine total order (section 5.3), corrects the plan's
+own stated test baseline to match what was actually verified and by whom (section
+1), and adds a required blast-radius verification alongside `q011`'s relational
+one (section 9).
+
+This plan replaces the prior Day 13 plan (section 1 is a short completed-baseline
+summary for Day 12). It covers **Day 13 only** — graph expansion.
 
 **Collaboration routine, unchanged:**
 1. Explain each step in plain language before it happens.
@@ -52,12 +65,31 @@ scope.
 - **`q011` is a named, accepted regression from Day 12**: `"What block does the
   DynamoDB endpoint policy directly depend on for its VPC ID?"` (relational,
   expected `["module.vpc"]`) went from a partial hit under RRF to a **complete
-  miss** under reranking — `module.vpc` moved from rank 8 to outside the top 10.
-  `module.vpc` is a **direct dependency** of the DynamoDB endpoint policy block,
-  which is exactly the edge `graph.dependencies()` exists to surface. This plan's
-  smoke test (section 9) uses this question specifically.
-- Full suite: **213 tests passing** (194 Days 1–11 baseline + 19 Day 12), verified
-  fresh this cycle. This is Day 13's baseline.
+  miss** under reranking — `module.vpc` moved from rank 8 (pre-rerank) to
+  somewhere outside the top 10 after reranking, though it remains **within** the
+  up-to-50-item reranked candidate pool (it was never dropped by retrieval itself
+  — reranking only reordered it). This plan's smoke test (section 9) uses this
+  question specifically, and section 5.4/5.7's corrected algorithm is what makes
+  recovering it actually possible (the prior draft's algorithm could not have).
+- **Corrected test baseline, stated honestly rather than asserted as one number
+  (finding 4 of this revision)**: `.venv/bin/python -m pytest -q` currently
+  **collects 213 tests**. Two different, both-legitimate results exist for this
+  baseline, from two different environments:
+  - **This session's own verification, with a reachable database**: 213 passed,
+    0 skipped, 0 failed (run fresh during Day 12's acceptance review, this
+    conversation).
+  - **The accepted Day 12 commit's own recorded acceptance run** (`DAY_12_
+    ANALYSIS.md`, whichever environment Codex ran it in): **197 passed, 16
+    environment-dependent integration tests skipped, 0 failed** — the 16 skips
+    are the DB-dependent, skip-if-unreachable tests (`test_db.py`, `test_bm25.py`,
+    `test_graph.py`, `test_pgvector_store.py`, and the new Day 12 integration
+    test), correctly skipping when that environment had no reachable database.
+  Both are legitimate, zero-failure results; they differ only in database
+  reachability, not in code correctness. **This plan does not claim "213 passing"
+  as an unconditional fact** — whoever runs Day 13's acceptance suite should
+  state which of these two shapes they got, and should specifically **aim for
+  the DB-enabled shape** (213 passed, 0 skipped) so the new Day 13 database
+  integration test (section 8) actually runs and is not silently skipped.
 
 ## 2. Objective
 
@@ -99,8 +131,8 @@ query rewriting, RRF tuning, Pinecone work, or any change to the cross-encoder.
       <body>
   ```
   This is the only worked example SPEC gives of relationship rendering. Section
-  5.5 below resolves the exact direction-to-label mapping this example only
-  partially specifies (it shows one direction; this plan needs both).
+  5.5 resolves the exact direction-to-label mapping this example only partially
+  specifies (it shows one direction; this plan needs both).
 - **Section 9.11 (RetrievalConfig)**: `use_graph: bool = True`, `graph_seed_n:
   int = 3`, `graph_max_added: int = 10` — already exactly present in
   `ripple/config.py` (section 4 confirms). **`use_graph` defaults to `True`** —
@@ -114,7 +146,9 @@ query rewriting, RRF tuning, Pinecone work, or any change to the cross-encoder.
 - **Section 11, Day 13**, quoted: `"Wire graph.py into the pipeline behind
   use_graph, with the limits from section 9.8. Verify on a blast-radius question
   that dependents appear in the final context. Done when: row five exists, and
-  the per-category breakdown shows where it helped."`
+  the per-category breakdown shows where it helped."` — section 9 of this plan
+  now requires exactly this blast-radius verification explicitly, not just the
+  relational `q011` check.
 - **Section 12 (Risk register)**: `"Graph expansion shows no gain | Usually means
   the benchmark is all lookup questions. Check category mix on Day 9."` — not a
   concern here: the benchmark's category mix (15/10/8/7) was built specifically so
@@ -129,12 +163,13 @@ start_line, end_line, body, ref_text`. **No `embed_text`, no `score`.**
 i.e., blocks that **depend on** the given resource. `dependencies(resource_id)`
 returns blocks the given resource's body references (`WHERE edges.source_id =
 %s`, joined to the referenced/`target_id` block) — i.e., the blocks the given
-resource itself **depends on**. Both queries already `ORDER BY resource.address` —
-deterministic. Neither function is called from `pipeline.py` today.
+resource itself **depends on**. Both queries currently `ORDER BY
+resource.address` only — **not a total order** (section 5.3 fixes this).
+Neither function is called from `pipeline.py` today.
 
 **`ripple/retrieval/vector_store.py`** — `RetrievedBlock` has `id, address,
-file_path, start_line, end_line, body, embed_text, score` — all required, no
-graph-relationship fields.
+file_path, start_line, end_line, body, embed_text, score` — `score: float`,
+required, no graph-relationship fields.
 
 **`ripple/retrieval/pipeline.py`** — builds `candidates` through vector/bm25/
 fusion/rerank exactly as Day 12 left it, then does `blocks = candidates[:
@@ -152,7 +187,7 @@ line has never been implemented, for any block, graph-sourced or not.
 
 **`ripple/evaluation/runner.py`** — `ABLATION_CONFIGS` has exactly the four Day
 8–12 rows. `run_benchmark`/`build_report` are generic over `ConfigResult` and
-need no structural change for a fifth row (section 5.6 explains why graph needs
+need no structural change for a fifth row (section 5.9 explains why graph needs
 no new report-schema field, unlike reranking's `reranker_json`).
 
 **`scripts/run_eval.py`** — confirmed still fully generic over `ABLATION_CONFIGS`'
@@ -161,17 +196,13 @@ length (unchanged since Day 12). **No changes needed.**
 ### 4.1 The `use_graph` default-to-`True` problem — audited across every existing `RetrievalConfig(...)` in `tests/test_pipeline.py`
 
 This is the exact same class of defect Day 12's review caught for `use_rerank`,
-now present for `use_graph`, discovered by reading the file fresh rather than
-assuming Day 12's fixes already covered it: **`RetrievalConfig.use_graph`
-defaults to `True`, and every single `RetrievalConfig(...)` construction in
-`tests/test_pipeline.py` today — all 21 of them, including the ones Day 12 fixed
-for `use_rerank` — sets `use_bm25`/`use_rerank`/etc. explicitly but **never sets
-`use_graph`**. Once graph expansion is wired in, every one of these tests would
-start executing the new graph stage, and — for the majority of them, whose
-candidate lists are non-empty — would attempt a **real, unmocked
-`graph.dependents`/`dependencies` call against whatever database
-`ripple.db.get_connection()` resolves to** in that test process. This must not
-happen in a pure unit-test file.
+now present for `use_graph`: **`RetrievalConfig.use_graph` defaults to `True`,
+and every single `RetrievalConfig(...)` construction in `tests/test_pipeline.py`
+today — all 21 of them — never sets `use_graph`.** Once graph expansion is wired
+in, every one of these tests would start executing the new graph stage, and —
+for the majority of them, whose candidate lists are non-empty — would attempt a
+**real, unmocked `graph.dependents`/`dependencies` call against whatever
+database `ripple.db.get_connection()` resolves to** in that test process.
 
 | Test | Line | Candidates non-empty at graph stage? | Verdict |
 |---|---|---|---|
@@ -180,7 +211,7 @@ happen in a pure unit-test file.
 | `test_run_pipeline_fuses_vector_and_bm25_results` | 191 | yes | **must add `use_graph=False`** |
 | `test_run_pipeline_concatenates_when_rrf_is_disabled` | 234 | yes | **must add `use_graph=False`** |
 | `test_run_pipeline_with_both_retrievers_disabled` | 257 | empty | **must add `use_graph=False`** (exact-key-set assertions) |
-| `test_config_json_separates_requested_and_executed_stages` | 273 | empty | **must add `use_graph=False`** — this test already asserts `executed["graph"] is False`; once `executed.graph` becomes config-driven (section 5.4), that assertion is only still true if the config actually disables it |
+| `test_config_json_separates_requested_and_executed_stages` | 273 | empty | **must add `use_graph=False`** — asserts `executed["graph"] is False`; once `executed.graph` becomes config-driven (section 5.7), that's only still true if the config disables it |
 | `test_config_json_records_executed_fusion_method` (×2 params) | 311 | empty | **must add `use_graph=False`** |
 | `test_unsupported_vector_backend_fails_before_external_calls` | 332 | never reached (raises earlier) | **must add `use_graph=False`** for audit consistency |
 | `test_unused_unsupported_vector_backend_does_not_raise` | 350 | empty | **must add `use_graph=False`** |
@@ -197,134 +228,181 @@ happen in a pure unit-test file.
 | `test_enabled_rerank_records_empty_stage_for_no_candidates` | 627 | empty | **must add `use_graph=False`** |
 | `test_nonpositive_rerank_top_n_passes_empty_pool` | 657 | empty | **must add `use_graph=False`** |
 
-**Net result: all 21 existing sites get `use_graph=False` added — zero exceptions,
-since none of them is a graph-specific test.** The new graph tests (section 8)
-are the only places `use_graph=True` appears in this file, and every one of
-those injects fake `dependents`/`dependencies` functions (section 5.7).
+**Net result: all 21 existing sites get `use_graph=False` added — zero
+exceptions.** The new graph tests (section 8) are the only places
+`use_graph=True` appears in this file, and every one injects fake
+`dependents`/`dependencies` functions.
 
 ### 4.2 `tests/test_runner.py`'s existing assertion that will need updating
 
 `test_ablation_configs_are_explicit_and_support_recall_at_10` currently asserts
 `config.use_graph is False` **unconditionally, for every row** — this must
 become conditional on row index once the fifth row sets `use_graph=True`
-(section 5.6/8).
+(section 5.9/8).
 
 ## 5. Design decisions
 
-### 5.1 Pipeline ordering — resolved decisively (flagged for your review, section 12)
+### 5.1 Pipeline ordering — resolved and now confirmed (no longer a sign-off item)
 
 **Graph expansion runs after reranking (or after fusion/retrieval, if reranking
 is disabled) and *before* `final_k` truncation — graph-discovered blocks
-therefore compete for slots inside `final_k`, they are not appended after it.**
-This is the single most consequential interpretive call in this plan, because
-SPEC 9.8 doesn't say which of the two options finding 1 named is correct, and
-the two options produce **measurably different evaluation results**:
+therefore compete for slots inside `final_k`; they are not appended after it.
+You have approved this decision explicitly.** The reasoning, unchanged: if
+graph-discovered blocks were appended *after* an already-`final_k`-truncated
+(10-item, for evaluation) base list, they would occupy positions 11+ in
+`result.blocks`, and SPEC's own `recall_at_k` formula (`set(retrieved[:k])`)
+means a block at position 11+ can never appear in `retrieved[:10]` or
+`retrieved[:5]` — making graph expansion structurally incapable of ever
+affecting a Recall@5/Recall@10 number, contradicting SPEC's Day 13 "Done when"
+and the risk register's expectation of a measurable gain.
 
-- **Rejected alternative — "`final_k` base results plus graph additions appended
-  after"**: if graph-discovered blocks were appended *after* an already-`final_k`
-  -truncated (10-item, for evaluation) base list, they would occupy positions 11+
-  in `result.blocks`. SPEC's own `recall_at_k` formula is `set(retrieved[:k])` —
-  a block at position 11 or later **can never appear in `retrieved[:10]`**, let
-  alone `retrieved[:5]`. Under this alternative, graph expansion could still
-  change the rendered *prompt context* (more blocks shown to the LLM) but would
-  be **structurally incapable of ever changing a single Recall@5 or Recall@10
-  number**, for any question, ever — which would make the fifth ablation row's
-  entire evaluative purpose moot, contradicting SPEC's own Day 13 "Done when: ...
-  the per-category breakdown shows where it helped" and the risk register's
-  explicit expectation that graph expansion *can* show a gain.
-- **Chosen design**: after the rerank stage (or fusion/retrieval if reranking is
-  off) produces its ranked `candidates` list, graph expansion seeds from the
-  first `graph_seed_n` entries of *that* list (SPEC's literal "top N results...
-  after reranking") and **inserts** each seed's newly-discovered, deduplicated
-  neighbors immediately after that seed's own position in the list (section
-  5.4's exact algorithm). `final_k` truncation is then applied, unchanged in its
-  own logic, to this graph-augmented list — exactly where it already runs today,
-  just one stage later. Because insertions happen right next to an already
-  high-ranked seed (rank ≤ `graph_seed_n`, i.e. ≤ 3 by default), a graph addition
-  has a real, by-construction chance of surviving into the top 5 or top 10,
-  which is what makes it possible for graph expansion to move a Recall@5/
-  Recall@10 number at all.
-- **Consequence, stated plainly**: this is a genuine trade, not a free addition —
-  inserting a graph-discovered block ahead of a lower-ranked retrieval candidate
-  can push that candidate below `final_k` and out of the result entirely. SPEC's
-  own ablation methodology exists precisely to measure trades like this one; the
-  per-category breakdown (section 9) is where you see whether the trade was
-  worth it for `blast_radius`/`relational` at the cost of anything else.
-- **Context construction**: `result.blocks` is still exactly the list sent to
-  `format_context` — capped at `final_k` (10 for evaluation), same as every
-  prior day. Graph expansion never causes more than `final_k` blocks to reach
-  the prompt.
+**What changes this revision is *how* blocks compete for those slots**
+(sections 5.4/5.7) — the prior draft's naive "skip if present anywhere in the
+top 50" dedup rule technically kept this ordering decision but implemented it in
+a way that could never actually promote a real, relevant, lower-ranked
+candidate — the exact bug this revision fixes. The ordering decision itself
+(graph before `final_k`) is unchanged and confirmed.
+
+**Consequence, stated plainly, unchanged**: this is a genuine trade, not a free
+addition — promoting or inserting a graph-discovered block ahead of a
+lower-ranked retrieval candidate can push that candidate below `final_k` and out
+of the result entirely. The per-category breakdown (section 9) is where you see
+whether the trade was worth it.
+
+**Context construction**: `result.blocks` is still exactly the list sent to
+`format_context` — capped at `final_k` (10 for evaluation). Graph expansion
+never causes more than `final_k` blocks to reach the prompt.
 
 ### 5.2 Seeds and limits
 
 - **Seeds**: the first `graph_seed_n` entries of the candidate list at the point
   graph expansion runs (post-rerank, pre-`final_k`), in that list's existing
-  rank order — a strict prefix, not a re-sort.
-- **`graph_seed_n <= 0`**: no seeds, no expansion. Guarded the same way as every
-  other non-positive-limit case in this pipeline (`final_k`, `vector_k`,
-  `bm25_k`, `rerank_top_n`): `seed_n = max(config.graph_seed_n, 0)`, and
-  `candidates[:0] == []` — no negative-slice reinterpretation risk.
-- **`graph_max_added <= 0`**: no additions, regardless of how many seeds or
-  neighbors exist. `max_added = max(config.graph_max_added, 0)`; the insertion
-  loop's `len(graph_additions) < max_added` guard is `False` from the start.
-- **Depth is exactly one, structurally — not just by convention**: the seed loop
-  iterates over the **original, unmodified** pre-graph `candidates` list; newly
-  discovered neighbor blocks are appended only to a separate `augmented` output
-  list and are **never** iterated over as new seeds. There is no recursive call,
-  no loop over `graph_additions`, and no code path that could reach a
-  depth-two neighbor. Section 8's dedicated test proves this by asserting
-  `dependents`/`dependencies` are called **only** with the original seeds'
-  `id`s, never with any newly-discovered neighbor's `id`.
-- **`graph_max_added` is a global cap across all seeds and both directions
-  combined**, not a per-seed or per-direction budget — checked before starting
-  each direction's neighbor loop and again before adding each individual
-  neighbor, so the cap is exact, never overshot.
+  rank order — a strict prefix, not a re-sort, captured as an **immutable
+  snapshot** (`seeds = candidates[:seed_n]`) before any promotion/insertion
+  begins. This snapshot, and the `seed_ids` set derived from it, never change
+  during the expansion pass — satisfying "seed selection must still use an
+  immutable snapshot of the original top `graph_seed_n` candidates" exactly.
+- **`graph_seed_n <= 0`**: no seeds, no expansion. `seed_n = max(config.
+  graph_seed_n, 0)`; `candidates[:0] == []` — no negative-slice reinterpretation
+  risk.
+- **`graph_max_added <= 0`**: no promotions and no additions, regardless of how
+  many seeds or neighbors exist. `max_added = max(config.graph_max_added, 0)`;
+  the shared `action_count < max_added` guard (section 5.7) is `False` from the
+  start.
+- **Depth is exactly one, structurally**: the seed loop iterates over the
+  **original, unmodified** pre-graph `candidates` list and the **immutable**
+  `seeds`/`seed_ids` snapshot; neither a freshly-added block nor a promoted
+  block is ever added to `seed_ids` or iterated over as a new seed. There is no
+  recursive call and no code path that could reach a depth-two neighbor. Section
+  8's dedicated test proves `dependents`/`dependencies` are called **only** with
+  the original seeds' `id`s.
+- **`graph_max_added` is a single, global cap covering both promotions and
+  fresh additions together** — an explicit, tested decision (section 5.4),
+  not left ambiguous.
 
-### 5.3 Both edge directions, and a deterministic order
+### 5.3 Both edge directions, and a genuinely total deterministic order
 
 For each seed, **both** `graph.dependents(seed.id)` and
 `graph.dependencies(seed.id)` are checked — **dependents first, then
-dependencies**, matching the literal order SPEC 9.8's own SQL comments are
-written in. Seeds are processed in the candidate list's existing rank order
-(deterministic, since reranking's own tie-break is already deterministic).
-Within one direction, `graph.py`'s existing `ORDER BY resource.address` makes
-neighbor order deterministic too. **No new randomness is introduced anywhere in
-this stage** — the entire expansion is a pure function of `candidates`'
-(already-deterministic) order plus the database's current content.
+dependencies**, matching SPEC 9.8's own SQL comment order. Seeds are processed
+in the candidate list's existing rank order.
 
-### 5.4 Deduplication — exact rule, resolved
+**Corrected this revision**: `graph.py`'s two queries change their `ORDER BY`
+from `resource.address` alone to **`resource.address, edges.ref_text,
+resource.id`** — a genuine total order. `resource.address` alone is not
+sufficient: if the same resource pair were ever connected by more than one edge
+row with different `ref_text` values (e.g. a data anomaly, a future relaxation
+of Day 4's one-edge-per-pair dedup rule, or a manually inserted test fixture —
+section 8 deliberately constructs exactly this scenario to prove the ordering
+holds), two rows would tie on `resource.address` and their relative order would
+be database-implementation-defined, not deterministic. Adding `edges.ref_text`
+breaks that tie, and `resource.id` is added as a final, always-unique tiebreaker
+so the order is total even in a hypothetical case where both `address` and
+`ref_text` also happened to match. **No new randomness is introduced anywhere
+in this stage** — the entire expansion is a pure function of `candidates`'
+(already-deterministic) order plus this now-genuinely-total database order.
 
-- **Against all base retrieval results**: before expansion starts, `known_ids =
-  {block.id for block in candidates}` — the *complete* pre-graph candidate list,
-  not just the seeds and not just what will survive `final_k`. Any neighbor
-  whose `id` is already in `known_ids` is skipped.
-- **Against neighbors reached through multiple seeds, directions, or edges**: a
-  single `added_ids: set[int]` accumulates across the *entire* expansion stage
-  (all seeds, both directions) — once a neighbor is added, it is never added
-  again, regardless of how many other seeds or directions would also have
-  discovered it.
-- **Multiple relationship explanations are not preserved — the first discovery
-  wins, explicitly, not by accident.** If the same block would be reachable as
-  both a dependent of seed A and a dependency of seed B (or via both directions
-  of the same seed, for a bidirectional reference), only whichever occurrence is
-  reached first in the deterministic traversal order (seed rank order, then
-  dependents-before-dependencies, section 5.3) is added, carrying *that*
-  occurrence's relationship/origin/`ref_text`. This is a simple, fully
-  deterministic rule, chosen over merging multiple explanations onto one block
-  because SPEC 9.8 describes each added block as carrying "their relationship
-  and the block they came from" (singular), not a list of relationships.
-- **Self-loops** are already impossible by construction — Day 4's reference
-  extraction explicitly excludes `source_id == target_id` edges (SPEC 9.2), so
-  neither `dependents` nor `dependencies` can ever return the seed itself.
-- Tested deterministically (section 8): running the same expansion twice against
-  the same fake/real data produces byte-identical output, and a neighbor
-  reachable via two different paths appears exactly once, with the
-  first-discovered relationship.
+### 5.4 Deduplication and promotion — the exact three-case rule, replacing the prior "skip if present" bug
 
-### 5.5 Graph provenance — `RetrievedBlock`, not a separate type
+**The prior draft's bug, precisely**: it computed `known_ids = {block.id for
+block in candidates}` once (the *entire* up-to-50-item reranked pool) and
+skipped *any* discovered neighbor whose `id` was already in that set —
+regardless of *where* in the pool it was. A neighbor sitting at reranked rank 30
+is "already retrieved" in the sense that dedup cares about (it was already found
+by earlier stages), but it is *not* going anywhere near `final_k=10` on its own
+— and the prior algorithm had no mechanism to move it there. This is why `q011`
+could fail the smoke test even when `module.vpc` is a real, correct dependency:
+if it happened to already be present somewhere past rank 10 in the reranked
+pool, it would be silently skipped, never promoted, and cut by `final_k` exactly
+as if graph expansion had never run.
 
-**Three new trailing, defaulted fields on `RetrievedBlock`** — not a separate
-result/provenance type, and not an overload of `score`:
+**Corrected rule — three cases, not one**, evaluated for every neighbor
+discovered from a seed, in traversal order (section 5.3), against the
+**immutable** pre-graph `candidates` snapshot and its position index
+(`original_position: dict[id, int]`, built once before expansion starts):
+
+1. **Absent from `candidates` entirely** (`original_position.get(neighbor.id) is
+   None`) → **add** it fresh, immediately after the seed, with graph provenance
+   attached and `graph_score_status="unscored"` (section 5.5 — it was never
+   independently scored).
+2. **Present, and it is itself one of the immutable seeds**
+   (`neighbor.id in seed_ids`) → **leave it completely untouched**: no move, no
+   provenance, no duplicate, not counted toward `graph_max_added`. This is the
+   *only* case in which a discovered neighbor can already be "ranked earlier
+   than the graph insertion position" — since `seeds = candidates[:seed_n]` is a
+   prefix of a fully rank-ordered list, **every** non-seed candidate is,
+   definitionally, ranked worse than **every** seed; there is no other
+   configuration in which an existing candidate could already outrank the
+   insertion point. Excluding seeds from promotion also avoids a block
+   simultaneously being both an independent seed *and* a labeled "dependent of
+   another seed" — two conflated identities this plan avoids on purpose.
+3. **Present, and it is not a seed** (`original_position.get(neighbor.id)` is a
+   real, non-seed position) → **promote** it: locate the original block object
+   at that position, `dataclasses.replace(...)` it with the graph-provenance
+   fields set and `graph_score_status="promoted"` (its own `score` field is left
+   completely unchanged — section 5.5), remove its old occurrence (tracked via
+   `moved_ids`, checked at the top of the main loop so its original slot is
+   skipped rather than duplicated), and insert the replacement immediately after
+   the seed, exactly like a fresh addition.
+
+**First discovery wins, across seeds and directions, unchanged in spirit from
+the prior draft**: a single `handled_ids: set[int]` accumulates across the
+*entire* expansion stage; once a neighbor `id` has been decided (added,
+promoted, or found to be a seed), it is never reconsidered by a later seed or
+direction. If the same block is reachable as both a dependent of seed A and a
+dependency of seed B, only the first-reached occurrence's relationship/origin/
+`ref_text` is recorded — this is unchanged from the prior draft's rule, now
+explicitly tested (section 8) with **duplicate neighbor rows carrying different
+`ref_text` values**, to prove which provenance wins under the new total
+`ORDER BY` (section 5.3).
+
+**`graph_max_added` counts promotions and additions identically, on one shared
+counter — an explicit choice, not left ambiguous**: SPEC 9.8 frames the limit as
+"at most 10 added blocks total," and a promotion is just as much a
+graph-driven change to the result (it moves a block's position and attaches
+provenance) as a fresh addition is. Counting them separately would let
+promotions bypass the cap entirely — e.g. relocating 50 low-ranked blocks "for
+free" while 10 more fresh additions are also allowed — which would let graph
+expansion touch far more of the result than SPEC's stated ceiling intends.
+Section 8 has a dedicated test proving the shared cap is exact (a mix of
+promotions and additions that together hit `graph_max_added` and no more).
+
+**Preserve exactly one output occurrence per resource id**: guaranteed by
+construction — a promoted candidate is removed from its old slot (`moved_ids`)
+and appears exactly once at its new slot; a fresh addition appears exactly once
+at its insertion slot; an untouched candidate (including every excluded seed)
+appears exactly once at its original slot. No id can appear twice in
+`augmented`.
+
+**Self-loops** remain already impossible by construction — Day 4's reference
+extraction explicitly excludes `source_id == target_id` edges (SPEC 9.2).
+
+### 5.5 Graph provenance and honest score representation — corrected this revision
+
+**Four new trailing fields on `RetrievedBlock`** (one more than the prior
+draft), and **`score`'s type widens to `float | None`** — still a required
+field (every constructor still passes it explicitly; only its accepted value
+type grows to include `None`), not a separate result/provenance type:
 
 ```python
 @dataclass
@@ -336,146 +414,183 @@ class RetrievedBlock:
     end_line: int
     body: str
     embed_text: str
-    score: float
-    graph_relationship: str | None = None   # "dependent" | "dependency" | None
-    graph_origin_address: str | None = None # the seed address this came from
-    graph_ref_text: str | None = None       # the literal reference text
+    score: float | None                       # widened this revision
+    graph_relationship: str | None = None     # "dependent" | "dependency" | None
+    graph_origin_address: str | None = None   # the seed address this came from
+    graph_ref_text: str | None = None         # the literal reference text
+    graph_score_status: str | None = None     # "promoted" | "unscored" | None
 ```
 
-**Why a separate type was rejected**: `pipeline.py`'s candidate list, `fusion.py`,
-`format_context`, and every existing test fixture all operate on
-`list[RetrievedBlock]` uniformly. Introducing a second type (e.g. a
-`GraphAddition` wrapper) would force `format_context`, `answer_question`, and
-every consumer of `result.blocks` to branch on type — exactly the kind of
-special-casing this project's `VectorStore`/`Reranker` interfaces have
-consistently avoided. Three **optional** fields, defaulted to `None`, cost
-nothing: every existing `RetrievedBlock(...)` construction across the entire
-repository (production and all 8 test files touched by Day 12's `embed_text`
-change) continues to work completely unmodified — **zero fixture changes
-required anywhere except the new graph-specific tests themselves**, a
-meaningfully smaller blast radius than Day 12's `embed_text` change, precisely
-*because* these three fields are genuinely optional (a block either came from
-graph expansion or it didn't) where `embed_text` was not (every block has real
-text, always).
+**The prior draft's problem, precisely**: a freshly-added graph-only block
+inherited its *seed's* reranker score unchanged. That score was never computed
+against the added block at all — the cross-encoder scored the seed's
+`(question, seed.embed_text)` pair, not `(question, neighbor.embed_text)`.
+Displaying that number next to the neighbor in `stages_json`/`result.blocks`
+could be misread as "the model rated this block's relevance at 0.94," which is
+false — the model never saw this block.
 
-**Why `score` is never overloaded**: a graph-added block was never independently
-scored by any retrieval or reranking process — assigning it a fabricated score
-computed to *mean* something about its graph relationship would be exactly the
-"silently overload the reranker score with graph meaning" this plan must avoid.
-Instead, **a graph-added block inherits its originating seed's own score
-unchanged** — a simple, honest placeholder ("as relevant as the seed that
-produced it," not an independently computed rank), while the *actual* graph
-semantics live entirely in the three new dedicated fields above, never in
-`score`. This also means graph additions sort/display sensibly if anything ever
-re-sorts by `.score` (e.g. debugging tooling), without any risk of `score` being
-misread as an "expansion confidence" number it was never designed to be.
+**Corrected representation — chosen and documented, per case**:
+- **A promoted existing candidate keeps its own original score, unchanged** —
+  it *was* independently scored (by vector search, BM25, and/or the
+  cross-encoder, whichever stages ran), and that score remains an honest,
+  real measurement of relevance. `graph_score_status="promoted"` records that
+  this block's position/provenance were touched by graph expansion, without
+  implying its score was.
+- **A genuinely new graph-only block gets `score=None` and
+  `graph_score_status="unscored"`** — an explicit, typed statement that no
+  retrieval or reranking stage ever scored this block, rather than a plausible-
+  looking fabricated number. This was chosen over an unscored-but-still-a-float
+  sentinel (e.g. `float("nan")`, rejected because `NaN` is not valid strict
+  JSON and some parsers reject it, unlike `null`) specifically because `None`
+  serializes to JSON `null` — a value every JSON consumer already understands as
+  "absent," with zero risk of being misread as a real number.
+- **`stages_json` distinguishes the two explicitly**: `_serialize_graph`
+  (section 5.7) emits both `"score"` (the real value, possibly `null`) and a
+  separate `"score_status"` key (`"promoted"` or `"unscored"`) for every entry
+  in the graph stage's audit trail — a reader never has to guess which kind of
+  score they're looking at.
 
-**Direction → prompt-label mapping, derived from the two example strings the
-Day 13 request itself supplies** (SPEC 9.10's own example shows only one
-direction, so the request's two examples — `"Referenced by: aws_instance.node"`
-and `"Depends on: module.vpc"` — are what pin down the second):
-- A block found via **`dependents(seed)`** (the block's body references the
-  seed — the block *depends on* the seed) → `graph_relationship = "dependent"`
-  → rendered as **`"Depends on: {seed_address}"`**.
-- A block found via **`dependencies(seed)`** (the seed's body references the
-  block — the block *is referenced by* the seed) → `graph_relationship =
-  "dependency"` → rendered as **`"Referenced by: {seed_address}"`**.
+**Downstream type/serialization effects, inspected before choosing (not
+assumed)**:
+- `fusion.py` and `rerank.py`'s sort keys (`-block.score` / `(-block.score,
+  block.address)`) never encounter a graph-added block — both stages run
+  *before* graph expansion in the pipeline, and a `None`-scored block is never
+  constructed until after both have already finished. No change needed to
+  either file, and no risk of `-None` raising `TypeError`.
+- `ripple/evaluation/metrics.py`'s `score_question`/`aggregate` and
+  `runner.py`'s `run_benchmark` never read `.score` at all — only `.address` (to
+  build `retrieved`) and `.latency` are consumed for scoring. `score=None` on a
+  graph-only block has **zero** effect on any Recall/Precision/MRR computation.
+- `dataclasses.asdict(...)` and `json.dump(...)` both serialize `None` to `null`
+  natively — no change needed to `build_report`, `write_report`, or
+  `scripts/run_eval.py` for this.
+- No existing test in `test_pipeline.py`, `test_fusion.py`, `test_rerank.py`, or
+  `test_runner.py` asserts `isinstance(block.score, float)` or otherwise rejects
+  `None` — confirmed by the same fresh read that produced section 4's audit;
+  every existing assertion compares `.score` against a concrete float value on
+  blocks that are never graph-touched, so widening the type is invisible to
+  them.
 
-`ref_text` is retained on the block (and in `stages_json`, section 5.7) for
-auditability but is **not** rendered in the prompt line itself — SPEC 9.10's
-example line doesn't show it either (`"Referenced by: aws_instance.node"`, no
-literal reference text appended), and the block's own unmodified `body` already
-contains the real reference text where it actually occurs in the source.
+**Why a separate provenance type was still rejected** (unchanged reasoning):
+`pipeline.py`'s candidate list, `fusion.py`, `format_context`, and every
+existing test fixture all operate on `list[RetrievedBlock]` uniformly; a second
+type would force every consumer to branch on type. Four **optional** fields
+(three unchanged from the prior draft, one new) and one widened-but-still-
+required field cost nothing to every existing `RetrievedBlock(...)` construction
+across the repository — zero fixture changes required anywhere except the new
+graph-specific tests.
+
+**Direction → prompt-label mapping, unchanged from the prior draft, derived from
+the two example strings the original Day 13 request supplied**:
+- A block found via **`dependents(seed)`** (the block depends on/references the
+  seed) → `graph_relationship = "dependent"` → rendered as **`"Depends on:
+  {seed_address}"`**.
+- A block found via **`dependencies(seed)`** (the seed references the block) →
+  `graph_relationship = "dependency"` → rendered as **`"Referenced by:
+  {seed_address}"`**.
+
+`ref_text` is retained on the block and in `stages_json` for auditability but is
+not rendered in the prompt line itself, matching SPEC 9.10's own example exactly.
 
 ### 5.6 `GraphNeighbor` gets a real `embed_text`, deliberately — not a placeholder
 
-**Resolved, not left as a placeholder**: `GraphNeighbor` gains one new field,
-`embed_text: str` (required, no default — this dataclass is internal-only,
-constructed in exactly two places in `graph.py` itself), populated from a real
-`resources.embed_text` column read, exactly the way `BM25Document.embed_text`
-was resolved on Day 12. `graph.py`'s two `SELECT` statements add
-`resource.embed_text` to their column lists (positioned right after `body`, so
-`GraphNeighbor(*row)`'s existing positional construction keeps working
-unchanged once the dataclass's field order matches: `id, address, file_path,
-start_line, end_line, body, embed_text, ref_text` — `ref_text` moves to last
-position to match). **Why not default it to `body`, as a cheaper shortcut**: a
-graph-added block's `embed_text` is never actually consumed by any embedding or
-reranking computation in this pipeline (graph expansion runs *after* reranking,
-and added blocks are never re-embedded or re-scored) — so reusing `body` here
-would be *inert* today, unlike Day 12's problem where a missing `embed_text`
-silently corrupted a value the reranker actually read. Even so, this plan uses
-the real database value rather than a stand-in, for one concrete reason: it
-keeps the invariant "`RetrievedBlock.embed_text` is always a genuine embed_text
-value, never a body substitute" true **everywhere**, with no carved-out
-exception a future change could trip over if graph-added blocks are ever fed
-into an embedding-or-reranking step later (e.g., a future re-ranking pass over
-the *expanded* context). `GraphNeighbor` does **not** gain a `score` field —
-`score` is a `RetrievedBlock`-only concept; the caller (`pipeline.py`) supplies
-it when converting a `GraphNeighbor` into a `RetrievedBlock` (section 5.5).
+Unchanged from the prior draft: `GraphNeighbor` gains one new required field,
+`embed_text: str`, populated from a real `resources.embed_text` column read in
+both `dependents`/`dependencies`' `SELECT` statements (positioned right after
+`body`, with `ref_text` moved last to match: `id, address, file_path,
+start_line, end_line, body, embed_text, ref_text`). `GraphNeighbor` does **not**
+gain a `score` field — `score` (and now `graph_score_status`) are
+`RetrievedBlock`-only concepts, populated by `pipeline.py` when converting a
+`GraphNeighbor` into a `RetrievedBlock` (section 5.5/5.7).
 
-### 5.7 Pipeline integration — the exact algorithm
+### 5.7 Pipeline integration — the exact algorithm, corrected
 
 `pipeline.py` imports `dependents`/`dependencies` directly from
 `ripple.retrieval.graph`, matching the existing `build_index` import-and-
-monkeypatch convention exactly — tests patch `pipeline.dependents`/
-`pipeline.dependencies`, the same pattern already used for `pipeline.
-build_index`. No new injectable class is introduced for graph (unlike the
-reranker's `CrossEncoderReranker`): `graph.dependents`/`dependencies` are cheap,
-stateless, per-call database reads with no model to load and no reuse-across-
-questions cost to amortize — module-level monkeypatching is sufficient and
-consistent with `build_index`'s own already-accepted, documented
-rebuild-per-call precedent (Day 12's cost/runtime section).
+monkeypatch convention — tests patch `pipeline.dependents`/`pipeline.
+dependencies`. No new injectable class is introduced for graph: `dependents`/
+`dependencies` are cheap, stateless, per-call database reads with no model to
+load and no reuse-across-questions cost, unlike the reranker.
 
 Inserted between the existing rerank block and the existing `final_k`
-truncation — **`final_k`'s own line of code moves down one block, but its logic
-is completely unchanged**:
+truncation — **`final_k`'s own line of code moves down one block, its logic
+unchanged**:
 
 ```python
 if config.use_graph:
     graph_start = time.perf_counter()
     seed_n = max(config.graph_seed_n, 0)
     max_added = max(config.graph_max_added, 0)
-    known_ids = {block.id for block in candidates}
-    added_ids: set[int] = set()
+    seeds = candidates[:seed_n]                 # immutable snapshot
+    seed_ids = {block.id for block in seeds}
+    original_position = {
+        block.id: position for position, block in enumerate(candidates)
+    }
+
+    moved_ids: set[int] = set()     # promoted ids -- skip re-emitting their old slot
+    handled_ids: set[int] = set()   # every id already decided this stage
+    graph_actions: list[RetrievedBlock] = []   # promotions + additions, in order
     augmented: list[RetrievedBlock] = []
-    graph_additions: list[RetrievedBlock] = []
+    action_count = 0
 
     for position, block in enumerate(candidates):
+        if block.id in moved_ids:
+            continue                            # already relocated; no duplicate
         augmented.append(block)
-        if position >= seed_n or len(graph_additions) >= max_added:
-            continue
 
+        if position >= seed_n:
+            continue                            # immutable seed set, fixed above
+
+        insertions_here: list[RetrievedBlock] = []
         for relationship, fetch in (
             ("dependent", dependents),
             ("dependency", dependencies),
         ):
-            if len(graph_additions) >= max_added:
+            if action_count >= max_added:
                 break
             for neighbor in fetch(block.id):
-                if len(graph_additions) >= max_added:
+                if action_count >= max_added:
                     break
-                if neighbor.id in known_ids or neighbor.id in added_ids:
-                    continue
-                added_ids.add(neighbor.id)
-                new_block = RetrievedBlock(
-                    id=neighbor.id,
-                    address=neighbor.address,
-                    file_path=neighbor.file_path,
-                    start_line=neighbor.start_line,
-                    end_line=neighbor.end_line,
-                    body=neighbor.body,
-                    embed_text=neighbor.embed_text,
-                    score=block.score,
-                    graph_relationship=relationship,
-                    graph_origin_address=block.address,
-                    graph_ref_text=neighbor.ref_text,
-                )
-                augmented.append(new_block)
-                graph_additions.append(new_block)
+                if neighbor.id in handled_ids or neighbor.id in seed_ids:
+                    continue   # first discovery wins; never move/relabel a seed
+                handled_ids.add(neighbor.id)
+
+                existing_position = original_position.get(neighbor.id)
+                if existing_position is None:
+                    new_block = RetrievedBlock(
+                        id=neighbor.id,
+                        address=neighbor.address,
+                        file_path=neighbor.file_path,
+                        start_line=neighbor.start_line,
+                        end_line=neighbor.end_line,
+                        body=neighbor.body,
+                        embed_text=neighbor.embed_text,
+                        score=None,
+                        graph_relationship=relationship,
+                        graph_origin_address=block.address,
+                        graph_ref_text=neighbor.ref_text,
+                        graph_score_status="unscored",
+                    )
+                else:
+                    original_block = candidates[existing_position]
+                    new_block = dataclasses.replace(
+                        original_block,
+                        graph_relationship=relationship,
+                        graph_origin_address=block.address,
+                        graph_ref_text=neighbor.ref_text,
+                        graph_score_status="promoted",
+                    )
+                    moved_ids.add(neighbor.id)
+
+                insertions_here.append(new_block)
+                graph_actions.append(new_block)
+                action_count += 1
+
+        augmented.extend(insertions_here)
 
     candidates = augmented
     latency_json["graph_ms"] = (time.perf_counter() - graph_start) * 1000
-    stages_json["graph"] = _serialize_graph(graph_additions)
+    stages_json["graph"] = _serialize_graph(graph_actions)
 
 if config.final_k > 0:
     blocks = candidates[: config.final_k]
@@ -483,9 +598,15 @@ else:
     blocks = []
 ```
 
-`_serialize_graph` (new, alongside the existing `_serialize`) emits the richer
-shape finding 5/7 requires — every field needed to audit *why* a block was
-added, not just its id/address/score:
+Note that `existing_position`, once the `neighbor.id in seed_ids` check has
+already passed, can only ever be `None` (absent) or a genuine non-seed position
+— never a position earlier than the current seed's own position — which is
+exactly section 5.4's proof that seed-exclusion is the *complete* resolution of
+"already ranked earlier than the insertion point." No separate position
+comparison is needed beyond the seed-membership check.
+
+`_serialize_graph` (new, alongside the existing `_serialize`) now includes
+`score_status` alongside every other provenance field:
 
 ```python
 def _serialize_graph(blocks: list[RetrievedBlock]) -> list[dict]:
@@ -494,6 +615,7 @@ def _serialize_graph(blocks: list[RetrievedBlock]) -> list[dict]:
             "id": block.id,
             "address": block.address,
             "score": block.score,
+            "score_status": block.graph_score_status,
             "relationship": block.graph_relationship,
             "origin_address": block.graph_origin_address,
             "ref_text": block.graph_ref_text,
@@ -502,33 +624,26 @@ def _serialize_graph(blocks: list[RetrievedBlock]) -> list[dict]:
     ]
 ```
 
-`stages_json["graph"]` holds **only the newly-added blocks** (not the whole
-augmented list) — parallel to how "fusion" holds the fused candidates and
-"final" separately holds what actually survived truncation; "graph" is
-specifically an audit trail of *this stage's own contribution*.
+`stages_json["graph"]` holds **only the blocks the graph stage touched**
+(promotions and fresh additions, `graph_actions`) — not the whole augmented
+list — parallel to how "fusion" holds the fused candidates and "final"
+separately holds what actually survived truncation.
 
 **`_build_config_json`'s `"executed"` dict**: `"graph": False` (hardcoded)
-becomes `"graph": config.use_graph` — the same config-driven pattern already
-established for vector/bm25/fusion/rerank. An enabled graph stage with zero
-seeds or zero discovered neighbors still shows `executed.graph: true` and
-`stages_json["graph"]: []` — consistent with how `use_rerank=True` with an
-empty candidate pool already behaves (Day 12).
+becomes `"graph": config.use_graph`, matching the existing config-driven
+pattern. An enabled graph stage with zero seeds or zero discovered neighbors
+still shows `executed.graph: true` and `stages_json["graph"]: []`.
 
-**When `use_graph=False`** (all four pre-existing
-`ABLATION_CONFIGS` rows, section 4.2): the new block is skipped entirely — no
-`dependents`/`dependencies` call, no `graph_ms` key, no `stages_json["graph"]`
-key, and **`final_k` truncation runs against the exact same `candidates` it
-always has** (the graph block is a complete no-op when disabled, so moving
-`final_k`'s code position doesn't change its *behavior* for any config that
-disables graph — which, after section 4.1's fixes, is every existing test).
+**When `use_graph=False`** (all four pre-existing `ABLATION_CONFIGS` rows): the
+new block is skipped entirely — no `dependents`/`dependencies` call, no
+`graph_ms` key, no `stages_json["graph"]` key, and `final_k` truncation runs
+against the exact same `candidates` it always has.
 
-**`run_pipeline`'s signature is unchanged** — no new parameter. Graph expansion
-needs no per-call injection point for production use (unlike the reranker),
-since `dependents`/`dependencies` have no state or cost worth sharing across
-questions; tests inject fakes via monkeypatching the module-level names instead
-(section 8).
+**`run_pipeline`'s signature is unchanged** — no new parameter.
 
 ### 5.8 Prompt integration
+
+Unchanged from the prior draft:
 
 ```python
 _GRAPH_RELATIONSHIP_LABELS = {
@@ -551,22 +666,18 @@ def format_context(blocks: list[RetrievedBlock]) -> str:
     return "\n\n".join(sections)
 ```
 
-**Existing formatting for ordinary (non-graph) blocks is byte-for-byte
-unchanged**: when `graph_relationship is None` (true for every block
-`format_context` has ever been called with until this cycle), the new
-conditional line is skipped entirely and the output is identical to today's —
-verified by section 8's requirement that every existing `test_prompts.py`
-assertion keeps passing unmodified.
+`format_context` never reads `.score`/`.graph_score_status` at all, so
+section 5.5's score-representation change has no effect on prompt rendering —
+confirmed by re-reading this function this cycle. Existing formatting for
+ordinary (non-graph) blocks is byte-for-byte unchanged (`graph_relationship is
+None` skips the new line entirely).
 
 ### 5.9 No new report-schema field is needed for graph (unlike reranking)
 
-Reranking needed `reranker_json` because it introduced an **external model**
-with its own version/revision that `RetrievalConfig` alone couldn't describe.
-Graph expansion introduces no external resource: it's SQL against the same
-already-indexed, already-fingerprinted corpus (`indexed_corpus_sha256`,
-established Day 10). `dataclasses.asdict(result.config)` already includes
-`use_graph`/`graph_seed_n`/`graph_max_added` for every row. **No new
-`ConfigResult` field, no `schema_version` bump** — the report stays
+Unchanged: `dataclasses.asdict(result.config)` already includes `use_graph`/
+`graph_seed_n`/`graph_max_added` for every row; graph expansion introduces no
+external, independently-versioned resource the way the reranker did. No new
+`ConfigResult` field, no `schema_version` bump — the report stays
 `schema_version: 2`.
 
 ## 6. Exact file scope
@@ -575,31 +686,31 @@ established Day 10). `dataclasses.asdict(result.config)` already includes
 
 **Modify:**
 - `ripple/retrieval/graph.py` — add `GraphNeighbor.embed_text: str` (required);
-  add `resource.embed_text` to both `SELECT` statements, positioned so
-  `GraphNeighbor(*row)`'s existing positional construction still matches field
-  order (section 5.6).
-- `ripple/retrieval/vector_store.py` — add three trailing, defaulted
-  `RetrievedBlock` fields: `graph_relationship`, `graph_origin_address`,
-  `graph_ref_text` (section 5.5).
-- `ripple/retrieval/pipeline.py` — new graph stage inserted between rerank and
-  `final_k` truncation; `_serialize_graph` helper; `executed.graph` becomes
-  `config.use_graph`; import `dependents`/`dependencies` from
-  `ripple.retrieval.graph` (section 5.7).
+  add `resource.embed_text` to both `SELECT` statements; change both
+  `ORDER BY` clauses to `resource.address, edges.ref_text, resource.id`
+  (section 5.3/5.6).
+- `ripple/retrieval/vector_store.py` — widen `RetrievedBlock.score` to `float |
+  None`; add four trailing, defaulted fields: `graph_relationship`,
+  `graph_origin_address`, `graph_ref_text`, `graph_score_status` (section 5.5).
+- `ripple/retrieval/pipeline.py` — new graph stage (promote/add/leave-alone
+  algorithm) inserted between rerank and `final_k` truncation;
+  `_serialize_graph` helper; `executed.graph` becomes `config.use_graph`; import
+  `dependents`/`dependencies` from `ripple.retrieval.graph` (section 5.7).
 - `ripple/llm/prompts.py` — `format_context` renders the relationship line for
   graph-sourced blocks only (section 5.8).
 - `ripple/evaluation/runner.py` — add the fifth `ABLATION_CONFIGS` row (section
-  5.9's "no other runner.py change needed" — confirmed, not assumed, by reading
-  `run_benchmark`/`build_report` this cycle, section 4).
-- `tests/test_graph.py` — add an assertion that `embed_text` round-trips through
-  `dependents`/`dependencies` against the real reference fixture, distinct from
-  `body` (section 8).
-- `tests/test_pipeline.py` — **audit-driven changes only**: add `use_graph=False`
-  to all 21 existing sites (section 4.1's table); add the new graph-expansion
-  tests (section 8).
+  5.9 — confirmed no other change needed by reading `run_benchmark`/
+  `build_report` this cycle).
+- `tests/test_graph.py` — add an assertion that `embed_text` round-trips
+  through `dependents`/`dependencies` against the real reference fixture,
+  distinct from `body`; add a total-order determinism test using manually
+  inserted duplicate edge rows with different `ref_text` (section 8).
+- `tests/test_pipeline.py` — **audit-driven changes**: add `use_graph=False` to
+  all 21 existing sites (section 4.1's table); add the new graph-expansion,
+  promotion, and score-status tests (section 8).
 - `tests/test_prompts.py` — add `graph_relationship`/`graph_origin_address`
-  parameters to the `_block` helper (defaulted to `None`, so all existing calls
-  are unaffected); add new tests for both relationship directions and for
-  repository-content safety (section 8).
+  parameters to the `_block` helper (defaulted to `None`); add new tests for
+  both relationship directions and for repository-content safety (section 8).
 - `tests/test_runner.py` — update `test_ablation_configs_are_explicit_and_
   support_recall_at_10` for five rows (section 4.2).
 
@@ -636,106 +747,98 @@ class GraphNeighbor:
 # both dependents() and dependencies(): SELECT list becomes
 # resource.id, resource.address, resource.file_path, resource.start_line,
 # resource.end_line, resource.body, resource.embed_text, edges.ref_text
-# (ORDER BY resource.address unchanged)
+# ORDER BY resource.address, edges.ref_text, resource.id   -- genuinely total
 ```
 
 ## 8. Tests — exact files and assertions
 
 **`tests/test_pipeline.py`**:
-- All 21 sites from section 4.1's table get `use_graph=False` — **no behavioral
-  change to any existing assertion**, only the `RetrievalConfig(...)`
-  construction.
-- New fakes, matching the file's existing style: `_FakeGraphNeighbor` factory
-  (or reuse `graph.GraphNeighbor` directly, since it's a plain dataclass) and
-  `_install_graph(monkeypatch, dependents_by_id, dependencies_by_id)` installing
-  `pipeline.dependents`/`pipeline.dependencies` as lookups into two dicts,
-  recording every call made.
-- Disabled toggle never calls the graph functions: inject fake `dependents`/
-  `dependencies` that raise if called at all; run with `use_graph=False` and
-  non-empty candidates; assert no error.
-- Seeds are exactly the first `graph_seed_n` candidates: 5 fake candidates,
-  `graph_seed_n=2`; assert `dependents`/`dependencies` were called with only the
-  first two candidates' `id`s, never the third, fourth, or fifth.
-- Both directions checked, dependents before dependencies: one seed, fake
-  `dependents` returning one neighbor and fake `dependencies` returning a
-  different neighbor; assert both appear in `stages_json["graph"]` with the
-  correct `relationship` value each, and that `dependents` was recorded as
-  called before `dependencies` for that seed.
-- **Depth stays exactly one**: assert `dependents`/`dependencies` are called
-  **only** with the original seed `id`s — a newly-discovered neighbor's `id`
-  must never appear as an argument to either fake, even when the fake would
-  return further neighbors if it were (checked by having the fakes assert-fail
-  if invoked with an id outside the known seed set).
-- Deduplication against base results: a fake neighbor whose `id` matches an
-  existing (non-seed) candidate is not added; assert it's absent from
-  `stages_json["graph"]`.
-- Deduplication across seeds/directions: two different seeds' fake neighbor
-  lookups both return the same neighbor `id`; assert it appears exactly once,
-  carrying the **first** seed's relationship/origin (not the second's) —
-  proving "first discovery wins," not a merge.
-- Global cap: `graph_max_added=2`, three seeds each with two available fake
-  neighbors; assert exactly 2 blocks appear in `stages_json["graph"]`, not 6.
-- `graph_seed_n <= 0` and `graph_max_added <= 0`, parametrized `[0, -1]` each:
-  no expansion, `stages_json["graph"] == []`, fake `dependents`/`dependencies`
-  never called.
-- Empty candidate list with `use_graph=True`: `stages_json["graph"] == []`,
-  `executed.graph is True`, `graph_ms` present, no fake call attempted (nothing
-  to seed from).
-- **Graph competes inside `final_k` (section 5.1's resolved design)**: a
-  constructed scenario where a fake neighbor, inserted next to a top-ranked
-  seed, pushes a real, lower-ranked candidate below the `final_k` cutoff; assert
-  the neighbor **is** present in `result.blocks` and the pushed-out candidate is
-  **not** — the direct test proving graph additions can actually change what
-  `recall_at_k` sees, not just what's in the prompt.
-- Score inheritance: assert an added block's `.score` equals its originating
-  seed's `.score` exactly (section 5.5).
-- Provenance fields: assert `graph_relationship`/`graph_origin_address`/
-  `graph_ref_text` are set correctly on every added block, and are `None` on
-  every non-graph block (including the seeds themselves).
+- All 21 sites from section 4.1's table get `use_graph=False` — no behavioral
+  change to any existing assertion.
+- New fakes: `_install_graph(monkeypatch, dependents_by_id, dependencies_by_id)`
+  installing `pipeline.dependents`/`pipeline.dependencies` as lookups into two
+  dicts (`id -> list[graph.GraphNeighbor]`), recording every call made, and
+  raising if called with an id outside an explicitly-declared "allowed" set (for
+  the depth-one test below).
+- Disabled toggle never calls the graph functions.
+- Seeds are exactly the first `graph_seed_n` candidates.
+- Both directions checked, dependents before dependencies.
+- **Depth stays exactly one**: fakes raise if called with any id outside the
+  original seed set; assert no failure, and separately assert a scenario where
+  a fake neighbor's own `id` is deliberately also present in the fakes'
+  lookup tables (as if it were a valid seed) is never queried, proving newly
+  discovered blocks are never used as seeds regardless of whether fake data
+  *would* answer for them.
+- **Promotion — the corrected algorithm's core new test**: a fake candidate
+  list of more than `final_k` items where the seed's fake `dependents` result
+  includes the `id` of a candidate sitting at **rank 11–50** (i.e., a rank that
+  would be cut by `final_k=10` without intervention); assert that candidate
+  **is** present in `result.blocks`, appears immediately after its seed,
+  carries `graph_relationship`/`graph_origin_address`/`graph_ref_text`, has
+  `graph_score_status == "promoted"`, and — critically — **its `.score` is its
+  own original value, not the seed's**. This is the direct regression test for
+  the bug this revision fixes, and the direct proof that `q011`'s smoke-test
+  reasoning (section 9) is actually achievable by this algorithm.
+- **Non-demotion**: a fake neighbor lookup that returns the `id` of *another
+  seed* (a candidate at a position within the original top `graph_seed_n`);
+  assert that seed is **not** moved, gains **no** graph-provenance fields, is
+  **not** counted toward `graph_max_added`, and appears at its original
+  position, unchanged.
+- **Score representation, both cases in one test file** (finding 2): the
+  promotion test above covers "promoted keeps its own score"; a second test
+  covers a genuinely new (absent-from-candidates) fake neighbor — assert its
+  `.score is None` and `graph_score_status == "unscored"`, and that
+  `stages_json["graph"]`'s corresponding entry has `"score": None,
+  "score_status": "unscored"` while a promoted entry in the same stage's output
+  has a real float `"score"` and `"score_status": "promoted"`.
+- Deduplication against base results and across seeds/directions, **including a
+  duplicate-`ref_text` case** (finding 3): two fake neighbor rows for the same
+  `id` with different `ref_text`, returned in a deliberately-scrambled order by
+  the fakes; assert only one occurrence survives, carrying the provenance from
+  whichever fake call happened first in the deterministic seed/direction
+  traversal order (section 5.3) — not from whichever row the fake's own
+  internal list ordering would have picked if the fakes didn't already return
+  data in the real, total-order-respecting shape.
+- **Global cap counts promotions and additions together** (finding 1's explicit
+  requirement): a scenario with two seeds, one whose discovered neighbor would
+  be a promotion and one whose discovered neighbor would be a fresh addition,
+  `graph_max_added=1`; assert exactly one of the two graph actions happens
+  (whichever is discovered first in traversal order), never both.
+- `graph_seed_n <= 0` and `graph_max_added <= 0`, parametrized `[0, -1]` each.
+- Empty candidate list with `use_graph=True`.
+- **Graph competes inside `final_k`**: unchanged intent from the prior draft,
+  now exercised via the promotion test above (a promoted rank-30 candidate
+  surviving into `result.blocks` *is* the proof).
 - `stages_json["graph"]`/`graph_ms`/`executed.graph` present only when
   `use_graph=True`.
-- **Supabase integration test** (new, DB-dependent, skip-if-unreachable, same
-  convention as `test_graph.py`/`test_bm25.py`): index the existing
-  `reference_repo` fixture for real; run `pipeline.run_pipeline` with
+- **Supabase integration test** (DB-dependent, skip-if-unreachable): index the
+  real `reference_repo` fixture; run `pipeline.run_pipeline` with
   `use_vector=False, use_bm25=True, use_rerank=False, use_graph=True`, a
-  question that puts `aws_vpc.main` at BM25 rank 1 (e.g. the address itself);
-  assert the **real** `graph.dependents` result (`aws_security_group.worker`,
-  `aws_subnet.public` — both already proven to reference `aws_vpc.main` in
-  `test_graph.py`) appears in `stages_json["graph"]` with `relationship ==
-  "dependent"`, `origin_address == "aws_vpc.main"`, and the correct real
-  `ref_text`. This exercises the real database and real `graph.py`, and makes
-  **no** OpenAI call (`use_vector=False`) and no real reranker call
-  (`use_rerank=False`).
+  question that puts `aws_vpc.main` at BM25 rank 1; assert the real
+  `graph.dependents` result (`aws_security_group.worker`, `aws_subnet.public`)
+  appears in `stages_json["graph"]` with `relationship == "dependent"`,
+  `origin_address == "aws_vpc.main"`, correct real `ref_text`, and
+  `score_status == "unscored"` (since neither neighbor was already present in
+  the BM25-only candidate list). Makes no OpenAI call and no reranker call.
 
-**`tests/test_prompts.py`**:
-- `_block` helper gains `graph_relationship: str | None = None`,
-  `graph_origin_address: str | None = None` parameters, passed through to
-  `RetrievedBlock`. Every existing call site is unaffected by the new defaults.
-- **Existing tests unmodified**: `test_format_context_preserves_order_and_
-  citation_shape` continues to pass exactly as written (no relationship line for
-  ordinary blocks).
-- New: a block with `graph_relationship="dependent"` renders `"Depends on:
-  {graph_origin_address}"` on its own line, in the position between the
-  file/line citation and the body.
-- New: a block with `graph_relationship="dependency"` renders `"Referenced by:
-  {graph_origin_address}"`.
-- New: a mixed list (some ordinary, some graph-sourced) renders the relationship
-  line **only** on the graph-sourced entries, at their correct index.
-- New: repository-content safety — a graph-added block whose `body` or
-  `graph_origin_address` contains text resembling an instruction (mirroring
-  this project's existing prompt-injection posture, hard constraint 6) is
-  rendered as inert data, not specially interpreted; `format_context` performs
-  no interpretation of block content at all, so this is a straightforward
-  regression test that such content passes through unmodified as plain text
-  inside the rendered section, never executed or treated as a directive by the
-  formatter itself.
+**`tests/test_graph.py`**:
+- Add an assertion that `neighbors[0].embed_text` equals the real `embed_text`
+  column value for that resource, distinct from `body`.
+- **New determinism test with duplicate edges** (finding 3): using a
+  throwaway repo/resources setup (matching this project's ad hoc fixture
+  pattern), directly `INSERT` two edge rows connecting the same `(source_id,
+  target_id)` pair with two different `ref_text` values (bypassing the
+  indexer's own one-edge-per-pair dedup, to exercise the SQL ordering itself
+  rather than assuming the indexer never produces this); assert
+  `dependents`/`dependencies` return both rows in the exact order predicted by
+  `ORDER BY resource.address, edges.ref_text, resource.id` (i.e., ordered by
+  `ref_text` since `address` ties), and that running the query twice produces
+  byte-identical results both times.
 
-**`tests/test_graph.py`**: add an assertion (to an existing or new test using
-the already-indexed `resource_ids` fixture) that `neighbors[0].embed_text`
-equals the real `embed_text` column value for that resource, fetched
-independently in the test (e.g. via `db.fetch_resource_bodies` plus a direct
-`embed_text` column read, or a small ad hoc query) — and that it differs from
-`body`, making this a real, discriminating check.
+**`tests/test_prompts.py`**: unchanged from the prior draft — `_block` helper
+gains `graph_relationship`/`graph_origin_address` parameters (defaulted to
+`None`); existing tests stay unmodified; new tests for both relationship
+directions, a mixed ordinary/graph-sourced list, and repository-content safety.
 
 **`tests/test_runner.py`**: update `test_ablation_configs_are_explicit_and_
 support_recall_at_10` — five names ending in `"+ Graph expansion"`; `final_k >=
@@ -750,25 +853,29 @@ support_recall_at_10` — five names ending in `"+ Graph expansion"`; `final_k >
 .venv/bin/python -m pytest -q tests/test_runner.py
 ```
 
-**Full suite** (this command never downloads/constructs the real reranker
-model, and every new graph test either injects fakes or is a DB-only,
-skip-if-unreachable integration test — no OpenAI call, paid or otherwise, is
-introduced by any test in this plan):
+**Full suite** (no test in this plan downloads/constructs the real reranker
+model or makes an OpenAI call; every graph test either injects fakes or is a
+DB-only, skip-if-unreachable integration test):
 ```bash
 .venv/bin/python -m pytest -q
 ```
-Expected: **213 (Days 1–12 baseline) + every new Day 13 test above, all
-passing, zero regressions.**
+Expected, stated honestly per section 1's corrected baseline: **213 collected
+(the Days 1–12 baseline) plus every new Day 13 test, all passing.** Report the
+actual passed/skipped split for whichever environment ran it — aim for the
+DB-enabled shape (0 skipped) so the new graph integration tests actually run.
 
 ## 9. Real Day 13 evaluation
 
 **Step 0 — first explicit confirmation, before any spending of any kind**: get
-explicit go-ahead before Step 1 — this is a manual, human-run procedure. The
-smoke test below makes one real OpenAI embedding request; nothing runs before
-confirmation.
+explicit go-ahead before Step 1. The smoke test below makes **two** real OpenAI
+embedding requests (one per question checked); nothing runs before confirmation.
 
-**Step 1 — relational smoke test, using `q011` (section 1's named Day 12
-regression)**:
+**Step 1 — two smoke checks, relational (`q011`) and blast-radius (`q014`) —
+both required (finding 5)**: SPEC's own Day 13 "Done when" explicitly calls out
+verifying dependents for a blast-radius question, not just dependencies for a
+relational one; `q011` alone is not sufficient evidence that the `dependents`
+direction works against real data. Both checks share one script:
+
 ```bash
 .venv/bin/python -c "
 from ripple.evaluation.runner import ABLATION_CONFIGS
@@ -782,65 +889,82 @@ REPO_ID = ...  # never hardcoded -- resolve independently, e.g.:
                 #         \"ORDER BY id DESC LIMIT 1\"
                 #     )
                 #     print(cur.fetchone())
-QUESTION = 'What block does the DynamoDB endpoint policy directly depend on for its VPC ID?'  # q011
-EXPECTED_ADDRESS = 'module.vpc'
-
 config = dict(ABLATION_CONFIGS)['+ Graph expansion']
-result = pipeline.run_pipeline(REPO_ID, QUESTION, config)
 
-print('--- graph additions ---')
-for row in result.stages_json['graph']:
-    print(row)
+CHECKS = [
+    (
+        'q011 (relational, dependencies)',
+        'What block does the DynamoDB endpoint policy directly depend on for its VPC ID?',
+        'module.vpc',
+    ),
+    (
+        'q014 (blast_radius, dependents)',
+        'What is directly affected if aws_security_group.rds is removed?',
+        'module.vpc_endpoints',
+    ),
+]
 
-print('--- final addresses ---')
-print([b.address for b in result.blocks])
-
-found = EXPECTED_ADDRESS in [b.address for b in result.blocks]
-print(f'--- did {EXPECTED_ADDRESS} reach the final context? {found} ---')
-
-print('--- graph_ms ---')
-print(result.latency_json['graph_ms'])
+for label, question, expected_address in CHECKS:
+    result = pipeline.run_pipeline(REPO_ID, question, config)
+    print(f'=== {label} ===')
+    print('--- graph actions ---')
+    for row in result.stages_json['graph']:
+        print(row)
+    addresses = [b.address for b in result.blocks]
+    print('--- final addresses ---')
+    print(addresses)
+    print(f'--- did {expected_address} reach the final context? '
+          f'{expected_address in addresses} ---')
+    print(f'--- graph_ms: {result.latency_json[\"graph_ms\"]} ---')
+    print()
 "
 ```
-Confirm the printed `stages_json["graph"]` rows show `module.vpc` with
-`"relationship": "dependency"` and the correct `origin_address`/`ref_text`
-before treating this as evidence of a fix — this is the direct, real-database
-proof that a graph neighbor entered the final context with provenance, per
-SPEC's own Day 13 "Done when" criterion.
+
+For **`q011`**, confirm `stages_json["graph"]` shows `module.vpc` with
+`"relationship": "dependency"`, the correct `origin_address`/`ref_text`, and
+either `"score_status": "promoted"` (with its own real score, if it was already
+present in the reranked pool — the expected case per section 1) or
+`"unscored"` (if retrieval had dropped it entirely) — either is valid evidence
+of a fix, but the two mean different things and should be reported accurately,
+not conflated.
+
+For **`q014`**, confirm `stages_json["graph"]` shows a real, correctly-labeled
+`"dependent"` entry (`module.vpc_endpoints`, or whichever address the real
+database returns) with the correct `origin_address`/`ref_text` — this is
+required **even if** `q014`'s aggregate Recall@10 doesn't change (Day 12's
+report already shows `q014` scoring `1.0` under reranking alone); the point of
+this check is proving the `dependents` direction works correctly against real
+data with real provenance, independent of whether it moves an aggregate number
+that was already at its ceiling.
 
 **Step 2 — second explicit confirmation, before the full 40-question run**:
 state plainly beforehand: ~40 paid OpenAI embedding requests (unchanged), zero
-generation requests, and additional **local** database read latency for graph
-expansion (no new paid cost — `graph.dependents`/`dependencies` are plain SQL
-reads against the already-indexed corpus).
+generation requests, additional local database read latency for graph
+expansion (no new paid cost).
 
 **Step 3 — run only the fifth configuration**:
 ```bash
 .venv/bin/python scripts/run_eval.py --repo-id <resolved-repo-id> \
   --config "+ Graph expansion"
 ```
-Produces one new timestamped, `schema_version: 2` JSON report containing one
-`ConfigResult`.
 
 **Step 4 — inspect before accepting**:
 - Compare aggregate Recall@5/Recall@10/MRR/`mean_latency_ms` against the Day 12
   table (section 1).
-- **Specifically re-check `relational` and `blast_radius` category breakdowns**
-  against Day 12's row, and **specifically re-check `q011`** — did `module.vpc`
-  return to the final context, and did `recall_at_10` for that question recover?
-- Investigate anything surprising before accepting — a suspicious number is a
-  bug to find, not a footnote. In particular: if `lookup`/`attribute` category
-  recall *drops* relative to Day 12, that's evidence graph additions are
-  displacing good candidates out of `final_k` (section 5.1's named trade) —
-  worth explaining explicitly, not silently accepting.
+- Specifically re-check `relational` and `blast_radius` category breakdowns,
+  and specifically re-check `q011`'s own recall values.
+- Investigate anything surprising before accepting — if `lookup`/`attribute`
+  category recall drops relative to Day 12, that's evidence graph
+  additions/promotions are displacing good candidates out of `final_k` — worth
+  explaining explicitly.
 
 **Step 5 — accept and commit, or fix and re-run**: same deliberate
 review-then-stage workflow as every prior day. Write `DAY_13_ANALYSIS.md`
 alongside the accepted report: aggregate metrics, per-category metrics, `q011`'s
-specific before/after, `graph_ms`, and an honest account of any category that
-regressed. **Never hand-edit any measured metric.** Commit the accepted report
-and analysis **separately** from the implementation commit(s), matching every
-prior day's convention.
+specific before/after, the `q014` blast-radius provenance check's outcome,
+`graph_ms`, and an honest account of any category that regressed. **Never
+hand-edit any measured metric.** Commit the accepted report and analysis
+separately from the implementation commit(s).
 
 ## 10. Scope and process
 
@@ -849,90 +973,101 @@ prior day's convention.
   not modified.
 - **Not implemented this cycle**: query rewriting (Day 15), RRF tuning, Pinecone
   work. The cross-encoder itself is not retrained, retuned, or reconfigured —
-  `rerank.py` is untouched (section 6).
+  `rerank.py` is untouched.
 - No credentials are ever exposed, printed, logged, or committed. No Hugging
-  Face cache files are ever committed — unaffected by this cycle, since graph
-  expansion touches no model.
+  Face cache files are ever committed.
 - `repo_id` is never hardcoded in application code.
 
 ## 11. Acceptance criteria
 
 Day 13 is complete only when all of the following hold:
-- Graph expansion works behind `use_graph`, with the exact semantics in section
-  5.1–5.8.
+- Graph expansion works behind `use_graph`, with the exact promote/add/
+  leave-alone semantics in section 5.4/5.7.
 - Disabled (`use_graph=False`) behavior is provably unchanged: every
   pre-existing test in `test_pipeline.py`, `test_prompts.py`, and
-  `test_runner.py` passes with only the audited `use_graph=False` additions —
-  no assertion values changed except the one (`test_config_json_separates_
-  requested_and_executed_stages`) whose expectation depends on the now-dynamic
-  `executed.graph`.
-- Depth stays exactly one, provably — the dedicated test in section 8 confirms
-  no neighbor `id` is ever used as a seed.
-- `graph_ms`, `stages_json["graph"]` (with relationship/origin/`ref_text` on
-  every added block), and `executed.graph` are all correct and consistent with
-  the design in section 5.7.
+  `test_runner.py` passes with only the audited `use_graph=False` additions.
+- Depth stays exactly one, provably.
+- A candidate ranked 11–50 in the reranked pool **can** be promoted into
+  `final_k` when a seed's real dependency/dependent edge points at it — proven
+  by a dedicated test (section 8), not just asserted in prose.
+- An already-higher-ranked candidate (specifically: another seed) is never
+  demoted, duplicated, or relabeled.
+- `graph_max_added` counts promotions and additions on one shared counter,
+  exactly, proven by a dedicated test.
+- **No graph-added block's score is misattributed to the reranker**: a
+  genuinely new block has `score=None`/`graph_score_status="unscored"`; a
+  promoted block retains its own original score with
+  `graph_score_status="promoted"`; `stages_json["graph"]` shows both explicitly.
+- Both `graph.py` queries have a genuinely total deterministic order, proven by
+  a dedicated duplicate-edge test.
+- `graph_ms`, `stages_json["graph"]`, and `executed.graph` are all correct.
 - `format_context` renders both relationship directions correctly and leaves
   ordinary-block formatting untouched.
-- `.venv/bin/python -m pytest -q` is fully green: 213 baseline + every new Day
-  13 test.
+- `.venv/bin/python -m pytest -q` is green, with the actual passed/skipped
+  counts reported honestly for the environment it ran in (section 1) — not
+  asserted as a single unconditional number.
 - The fifth real ablation row exists in one committed, `schema_version: 2` JSON
   report.
-- The smoke test (section 9, step 1) was actually run and its `stages_json
-  ["graph"]` output inspected before the full evaluation — `q011`'s recovery (or
-  lack of it) is confirmed with real data, not assumed.
-- The result has been inspected (section 9, step 4), including an honest account
-  of any category that regressed as a result of graph additions displacing
-  other candidates.
+- **Both** smoke checks (section 9, step 1 — `q011` relational and `q014`
+  blast-radius) were actually run and their `stages_json["graph"]` output
+  inspected before the full evaluation.
+- The result has been inspected (section 9, step 4), including an honest
+  account of any category that regressed.
 - The accepted report and its `DAY_13_ANALYSIS.md` are committed together, in a
   commit separate from the implementation commit(s).
 
 ## 12. Needs sign-off
 
-**One item, genuinely open, and the most consequential design decision in this
-plan**: section 5.1's resolution that graph-discovered blocks are inserted
-*before* `final_k` truncation and therefore compete for slots inside it, rather
-than being appended after an already-`final_k`-truncated base result. This
-plan's reasoning is that the rejected alternative would make graph expansion
-structurally incapable of ever affecting a Recall@5/Recall@10 number, which
-contradicts SPEC's own stated expectation that graph expansion can show a
-measurable gain — but SPEC 9.8 does not state this ordering explicitly, so this
-is this plan's interpretation, not a quoted requirement. **If you want the
-alternative (graph additions shown in context but never scored), say so before
-implementation begins** — it changes section 5.1, 5.7's algorithm, and several
-of section 8's tests.
+**None.** The one item flagged in the prior draft — whether graph-discovered
+blocks compete for slots inside `final_k` — is now explicitly approved
+(section 5.1) and is no longer open. Every decision introduced or corrected by
+this revision (the three-case promotion algorithm, promotions counting toward
+`graph_max_added`, the `score`/`score_status` representation, the total
+`ORDER BY`) was something this round's review explicitly instructed be chosen
+and documented, not deferred back for a decision — each is resolved above with
+its reasoning stated in full. If any of these specific choices don't match your
+intent, say so before implementation; none of them is presented as the only
+possible design, but all are presented as this plan's actual, decided answer.
 
-No other item requires sign-off: every other decision in section 5 was either
-directly stated by SPEC 9.8/9.10 or resolved from the two example strings the
-Day 13 request itself supplied (section 5.5's direction-to-label mapping), or
-follows an established codebase convention (module-level monkeypatching for
-stateless functions, optional trailing fields for provenance, real-value
-resolution over placeholders per Day 12's `embed_text` precedent).
+## 13. Audit — re-verified against every item named for re-audit
 
-## 13. Audit — verified against the actual repository
-
-- **`RetrievalConfig.use_graph` defaults to `True`, exactly like `use_rerank`
-  did on Day 12** — every one of the 21 existing `RetrievalConfig(...)` sites in
-  `tests/test_pipeline.py` audited individually (section 4.1); all 21 need
-  `use_graph=False`, zero exceptions, because none is a graph-specific test.
-- **`GraphNeighbor`/`RetrievedBlock` mismatch resolved deliberately, not with a
-  placeholder** — `GraphNeighbor` gains a real, database-sourced `embed_text`
-  (section 5.6); `RetrievedBlock` gains three optional provenance fields, never
-  overloading `score` (section 5.5).
-- **Depth-one enforced structurally**, not just documented — the algorithm has
-  no code path that iterates over newly-added blocks as seeds (section 5.7),
-  and section 8 has a dedicated test proving it.
-- **`format_context`'s existing behavior for ordinary blocks is unchanged** —
-  verified by requiring every current `test_prompts.py` assertion to keep
-  passing unmodified (section 8).
-- **`scripts/run_eval.py` needs no changes** — confirmed by re-reading it this
-  cycle (section 4), not assumed from Day 12's finding that it was already
-  generic.
-- **No new report-schema field or `schema_version` bump** — confirmed by reading
-  `build_report`'s current implementation this cycle (section 4/5.9); unlike
-  reranking, graph expansion introduces no external, independently-versioned
-  resource.
-- **The one genuine ambiguity in this plan (final_k ordering) is named
-  explicitly** in section 12, not silently resolved and hidden.
+- **Pipeline ordering**: unchanged and now confirmed, not just proposed —
+  graph runs after rerank/fusion and before `final_k` (section 5.1).
+- **Immutable seed selection**: `seeds`/`seed_ids` are captured once, before
+  any promotion or insertion, and never mutated during the pass (section 5.2/
+  5.7) — re-verified against the corrected algorithm's actual code this
+  revision, not just asserted.
+- **One-hop enforcement**: the seed loop iterates only the original
+  `candidates`/`seeds` snapshot; no promoted or added block is ever eligible to
+  seed further expansion (section 5.2/5.7); tested directly (section 8).
+- **Deduplication**: `handled_ids` (first-discovery-wins, across seeds/
+  directions) plus `seed_ids` exclusion (section 5.4) — re-derived from
+  scratch this revision to replace the prior draft's single, insufficient
+  `known_ids` check.
+- **Promotion of existing low-ranked candidates**: the core fix this revision
+  makes — a candidate at reranked rank 11–50 is now actually relocatable next
+  to its seed, not just checked-and-skipped (section 5.4/5.7), with a dedicated
+  test proving it and proving the `q011` scenario is achievable.
+- **Truthful score provenance**: promoted blocks keep their own real score;
+  new blocks are explicitly `None`/`"unscored"`; nothing inherits a seed's
+  reranker score for a block the model never scored (section 5.5), with
+  downstream serialization/type effects inspected and confirmed safe before
+  choosing this design, not after.
+- **Deterministic ordering**: both `graph.py` queries now order by
+  `resource.address, edges.ref_text, resource.id` — a genuine total order —
+  tested with manually-inserted duplicate edges, not assumed safe because the
+  indexer "shouldn't" produce them (section 5.3/8).
+- **Graph caps**: `graph_max_added` is a single shared counter across
+  promotions and additions, an explicit, tested choice (section 5.2/5.4/8).
+- **`q011` recovery logic**: directly re-checked against the corrected
+  algorithm — `module.vpc` sitting at reranked rank 11–50 is now the case the
+  promotion branch (case 3, section 5.4) exists to handle; the smoke test
+  (section 9) reports whether the real data confirms it, and reports
+  `promoted` vs. `unscored` honestly rather than assuming which applies.
+- **Real dependent/blast-radius verification**: `q014` is now a required
+  second smoke check (section 9), verifying a real `dependents`-direction
+  provenance entry with correct origin/`ref_text` independently of whether the
+  aggregate blast-radius metric moves.
 
 ## 14. Summary
 
@@ -940,18 +1075,21 @@ resolution over placeholders per Day 12's `embed_text` precedent).
 2. **Files to modify**: `ripple/retrieval/graph.py`, `ripple/retrieval/
    vector_store.py`, `ripple/retrieval/pipeline.py`, `ripple/llm/prompts.py`,
    `ripple/evaluation/runner.py`, `tests/test_graph.py`, `tests/test_pipeline.py`,
-   `tests/test_prompts.py`, `tests/test_runner.py` — 9 files total.
-3. **Tests to add/update**: a full audit-driven pass over all 21
-   `RetrievalConfig(...)` sites in `test_pipeline.py` (no assertion changes) plus
-   roughly a dozen new graph-specific tests there (including one real-database
-   integration test); new direction/safety tests in `test_prompts.py`; one new
-   assertion in `test_graph.py`; one updated assertion in `test_runner.py`.
+   `tests/test_prompts.py`, `tests/test_runner.py` — 9 files total, unchanged in
+   count from the prior draft.
+3. **Tests to add/update**: the same audit-driven `use_graph=False` pass over
+   all 21 `test_pipeline.py` sites, plus a larger set of new graph tests than
+   the prior draft — specifically new promotion, non-demotion, score-status
+   (both cases), shared-cap, and duplicate-`ref_text`-determinism tests, on top
+   of the seed/direction/depth/dedup/integration tests already planned; a new
+   determinism test in `test_graph.py` using manually-inserted duplicate edges;
+   direction/safety tests in `test_prompts.py` unchanged; one updated assertion
+   in `test_runner.py`.
 4. **Paid/local compute expected**: ~40 OpenAI embedding requests for the full
-   evaluation run (unchanged from every prior config), 0 generation requests,
-   additional local database read latency for graph expansion (no new paid
-   cost, no model, no download).
-5. **Remaining decision needing sign-off**: whether graph-discovered blocks
-   should compete for slots inside `final_k` (this plan's resolved design,
-   section 5.1) or be appended after an already-truncated base result (which
-   this plan argues would make graph expansion invisible to Recall@5/Recall@10
-   entirely) — section 12.
+   evaluation run (unchanged), plus 2 for the two required smoke checks; 0
+   generation requests; additional local database read latency for graph
+   expansion (no new paid cost, no model, no download).
+5. **Remaining ambiguity requiring your decision**: none. The prior draft's one
+   open item (`final_k` competition) is now approved and closed; every other
+   choice this revision introduces was explicitly requested to be chosen and
+   documented by this round of review, and is resolved above with reasoning.
