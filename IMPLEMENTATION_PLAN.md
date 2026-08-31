@@ -43,6 +43,29 @@ sets `bm25_k=1` explicitly so that's guaranteed by construction, not assumed
 each of its two questions; it now prepares one instance and shares it across
 both (section 9).
 
+**A fourth round of review found two further corrections, all applied here**:
+the duplicate-edge determinism test (round 3's fix) asked for an assertion that
+cannot be made — `GraphNeighbor` does not select `edges.id`, so two duplicate
+edge rows sharing the same `(source_id, target_id, ref_text)` produce two
+*completely identical* `GraphNeighbor` objects, and no test can tell which
+returned object corresponds to which `edges.id` in order to assert their
+relative order. Section 8's determinism test is corrected to keep the
+real-database, different-`ref_text` case (whose order **is** observable) and to
+verify the `edges.id` tiebreaker with a separate, focused query-construction
+test that captures and inspects the literal SQL text `dependents`/
+`dependencies` execute, rather than trying to distinguish indistinguishable
+returned rows. Separately, `q016`'s explanation overstated what its promotion
+demonstrates: the accepted Day 12 report places
+`output.vpc_endpoints_security_group_arn` at rank 4, and evaluation's
+`final_k=10` — so it is already inside the final context before graph
+expansion ever runs. `q016` verifies dependents-direction lookup, promotion
+(repositioning next to its seed with correct provenance) and preserved score
+for an **already-in-final_k** candidate; it does not demonstrate recovering a
+candidate from beyond `final_k`. That recovery scenario remains `q011`'s job
+(`module.vpc` genuinely fell outside the Day 12 top 10) and the dedicated rank
+11–50 promotion unit test (section 8). Section 9's `q016` narrative, the
+acceptance criteria, the audit, and the summary are all corrected accordingly.
+
 This plan replaces the prior Day 13 plan (section 1 is a short completed-baseline
 summary for Day 12). It covers **Day 13 only** — graph expansion.
 
@@ -729,8 +752,11 @@ external, independently-versioned resource the way the reranker did. No new
   `build_report` this cycle).
 - `tests/test_graph.py` — add an assertion that `embed_text` round-trips
   through `dependents`/`dependencies` against the real reference fixture,
-  distinct from `body`; add a total-order determinism test using manually
-  inserted duplicate edge rows with different `ref_text` (section 8).
+  distinct from `body`; add a real-database determinism test using manually
+  inserted duplicate edge rows with different `ref_text` (observable order);
+  add a separate, DB-free query-construction test asserting the literal
+  `ORDER BY` clause `dependents`/`dependencies` execute includes `edges.id` as
+  the fourth column (section 8).
 - `tests/test_pipeline.py` — **audit-driven changes**: add `use_graph=False` to
   all 21 existing sites (section 4.1's table); add the new graph-expansion,
   promotion, and score-status tests (section 8).
@@ -863,28 +889,49 @@ class GraphNeighbor:
 **`tests/test_graph.py`**:
 - Add an assertion that `neighbors[0].embed_text` equals the real `embed_text`
   column value for that resource, distinct from `body`.
-- **New determinism test with duplicate edges — strengthened this revision
-  (finding 2)**: `resource.address, edges.ref_text, resource.id` alone can
-  still tie: two edge rows connecting the **same** `(source_id, target_id)`
-  pair with the **same** `ref_text` also share the same `resource.id` (it's the
-  same joined resource row both times), so all three columns tie and the order
-  between them is still database-implementation-defined. **Corrected**: both
-  `ORDER BY` clauses become `resource.address, edges.ref_text, resource.id,
-  edges.id` — `edges.id` (the edge row's own primary key, always unique) is the
-  final, guaranteed tiebreaker; `GraphNeighbor` itself does **not** need to
-  expose `edges.id` as a field — it's used only inside `ORDER BY`, never
-  selected or returned. Using a throwaway repo/resources setup, directly
-  `INSERT` **two separate sets** of duplicate edge rows connecting the same
-  `(source_id, target_id)` pair (bypassing the indexer's own one-edge-per-pair
-  dedup): (a) two rows with **different** `ref_text` values, and (b) two rows
-  with **identical** `ref_text` values (differing only in their own `edges.id`,
-  which is whatever the database assigns on insert — the test reads it back
-  after inserting, rather than assuming a specific value). Assert:
-  `dependents`/`dependencies` return case (a)'s two rows ordered by `ref_text`
-  (the third column breaks the tie); return case (b)'s two rows ordered by
-  their actual `edges.id` values (the fourth column breaks the tie that
-  `ref_text` alone could not); and running either query twice produces
-  byte-identical results both times.
+- **Determinism test, corrected this (fourth) revision — the identical-`ref_text`
+  case is not observable through returned objects, so it is no longer tested
+  that way (finding 1)**: the prior draft asked for an assertion that two
+  duplicate edge rows sharing the same `(source_id, target_id)` pair **and**
+  the same `ref_text` would be returned "ordered by their actual `edges.id`
+  values." That assertion is impossible as written: `GraphNeighbor` does not
+  select or expose `edges.id` (section 5.6 — deliberately, since it has no
+  production use beyond `ORDER BY`), so two such rows produce two **completely
+  identical** `GraphNeighbor` objects — same `id`, `address`, `ref_text`,
+  everything. There is no field on the returned object a test could inspect to
+  determine which row came from which `edges.id`, so no test can assert "the
+  first returned object corresponds to the lower `edges.id`." This revision
+  splits the coverage into two tests, neither of which makes that impossible
+  claim:
+  - **Real-database test, unchanged in spirit, `ref_text` case only**: using a
+    throwaway repo/resources setup, directly `INSERT` two duplicate edge rows
+    connecting the same `(source_id, target_id)` pair with **different**
+    `ref_text` values (bypassing the indexer's own one-edge-per-pair dedup).
+    This case's order **is** observable — `ref_text` differs between the two
+    returned objects — so the test asserts `dependents`/`dependencies` return
+    them ordered by `ref_text`, and that running the query twice produces
+    byte-identical results both times.
+  - **New, DB-free query-construction test for the `edges.id` tiebreaker**:
+    monkeypatch `graph.db.get_connection` to a fake context manager whose fake
+    cursor's `execute(query, params)` records the literal `query` string
+    (instead of touching a real database) and whose `fetchall()` returns `[]`.
+    Call `dependents(...)` and `dependencies(...)`, then assert the captured
+    SQL text, after normalizing internal whitespace, contains the exact clause
+    `ORDER BY resource.address, edges.ref_text, resource.id, edges.id`. This
+    directly verifies the production `ORDER BY` clause — including the
+    `edges.id` tiebreaker — without depending on a real database or on
+    distinguishing rows that are, by construction, indistinguishable once
+    returned. `GraphNeighbor` is not changed to expose `edges.id`; nothing
+    about this test requires it to.
+  - **What is and isn't proven, stated honestly**: two edge rows with
+    identical `(source_id, target_id, ref_text)` remain genuinely
+    indistinguishable at the `GraphNeighbor` level — swapping their relative
+    order in the result changes nothing observable, since both objects carry
+    identical field values. The `edges.id` tiebreaker exists purely so the
+    database itself does not have to make an implementation-defined choice
+    (e.g. for consistent pagination or repeated-call stability at the SQL
+    level); its presence in the executed query is what the query-construction
+    test verifies, not a difference in the Python-level return value.
 
 **`tests/test_prompts.py`**: unchanged from the prior draft — `_block` helper
 gains `graph_relationship`/`graph_origin_address` parameters (defaulted to
@@ -1012,7 +1059,28 @@ present in the reranked pool — the expected case per section 1) or
 of a fix, but the two mean different things and should be reported accurately,
 not conflated.
 
-For **`q016`**, confirm `stages_json["graph"]` shows
+**What `q016` demonstrates — corrected this (fourth) revision to state this
+accurately**: `output.vpc_endpoints_security_group_arn` sits at rank 4 in the
+accepted Day 12 report, and evaluation uses `final_k=10` — so this candidate is
+already inside the final context *before* graph expansion ever runs. `q016`
+therefore does **not** demonstrate recovering a candidate from beyond
+`final_k` (that is `q011`'s job — `module.vpc` genuinely fell outside the Day
+12 top 10 — and the dedicated rank 11–50 promotion unit test in section 8).
+What `q016` verifies, precisely:
+- the real `dependents`-direction lookup runs against real data and finds a
+  real dependent;
+- **promotion**, in the sense section 5.4 defines it: the candidate is
+  relocated from its original position (rank 4) to immediately after its seed
+  (`module.vpc_endpoints`), with graph provenance attached — not that it moves
+  from outside the final context to inside it;
+- its **own original reranker score is preserved**, not overwritten or
+  replaced with the seed's score;
+- correct `relationship`/`origin_address`/`ref_text`/`score_status`
+  provenance; and
+- **no duplication** — it appears exactly once in `result.blocks`, at its new
+  (post-seed) position, not also at its old one.
+
+Confirm `stages_json["graph"]` shows
 `output.vpc_endpoints_security_group_arn` with:
 - `"relationship": "dependent"`;
 - `"origin_address": "module.vpc_endpoints"`;
@@ -1021,9 +1089,10 @@ For **`q016`**, confirm `stages_json["graph"]` shows
   a fresh `"unscored"` result here would indicate the real database's ranking
   no longer matches Day 12's accepted report, worth investigating before
   proceeding, not silently accepted);
-- its **own original reranker score preserved**, not overwritten;
-- and that it actually reaches `result.blocks` (the promotion moved it inside
-  `final_k`).
+- its own original reranker score preserved, not overwritten;
+- and that it still appears exactly once in `result.blocks` (it was already
+  going to be inside `final_k`; the check here is correct repositioning and
+  no duplication, not entry into the final context).
 
 **Step 2 — second explicit confirmation, before the full 40-question run**:
 state plainly beforehand: ~40 paid OpenAI embedding requests (unchanged), zero
@@ -1087,8 +1156,13 @@ Day 13 is complete only when all of the following hold:
   genuinely new block has `score=None`/`graph_score_status="unscored"`; a
   promoted block retains its own original score with
   `graph_score_status="promoted"`; `stages_json["graph"]` shows both explicitly.
-- Both `graph.py` queries have a genuinely total deterministic order, proven by
-  a dedicated duplicate-edge test.
+- Both `graph.py` queries have a genuinely total deterministic order: proven
+  for the observable, different-`ref_text` case by a real-database duplicate-
+  edge test, and for the `edges.id` tiebreaker by a dedicated query-
+  construction test asserting the literal executed `ORDER BY` clause (the
+  identical-`ref_text` case is not separately asserted at the returned-object
+  level, since such rows are behaviorally indistinguishable once returned —
+  section 8).
 - `graph_ms`, `stages_json["graph"]`, and `executed.graph` are all correct.
 - `format_context` renders both relationship directions correctly and leaves
   ordinary-block formatting untouched.
@@ -1145,11 +1219,19 @@ possible design, but all are presented as this plan's actual, decided answer.
   choosing this design, not after.
 - **Deterministic ordering**: both `graph.py` queries now order by
   `resource.address, edges.ref_text, resource.id, edges.id` — a genuine total
-  order, `edges.id` added this revision after confirming `resource.id` alone
-  still ties for edges connecting the same pair with identical `ref_text` —
-  tested with manually-inserted duplicate edges covering **both** the
-  different-`ref_text` and identical-`ref_text` cases, not assumed safe because
-  the indexer "shouldn't" produce them (section 5.3/8).
+  order, `edges.id` added after confirming `resource.id` alone still ties for
+  edges connecting the same pair with identical `ref_text`. Corrected this
+  (fourth) revision: the identical-`ref_text` case cannot be tested by
+  asserting the *returned objects'* order, because `GraphNeighbor` does not
+  expose `edges.id` and two such rows are therefore returned as completely
+  identical objects — no test can tell which object came from which edge row.
+  Coverage is split accordingly: a real-database test with manually-inserted
+  duplicate edges of **different** `ref_text` proves that (observable) case
+  end-to-end; a separate, DB-free query-construction test captures the literal
+  SQL `dependents`/`dependencies` execute and asserts the `ORDER BY` clause
+  itself includes `edges.id` as the fourth column — proving the tiebreaker is
+  genuinely present in the executed query without depending on being able to
+  distinguish indistinguishable return values (section 5.3/8).
 - **Graph caps**: `graph_max_added` is a single shared counter across
   promotions and additions, an explicit, tested choice (section 5.2/5.4/8).
 - **`q011` recovery logic**: directly re-checked against the corrected
@@ -1162,10 +1244,19 @@ possible design, but all are presented as this plan's actual, decided answer.
   seed-exclusion rule — its two top candidates are both immutable seeds, so
   its expected dependent could never legitimately appear in
   `stages_json["graph"]`) is the required second smoke check (section 9),
-  verifying a real `dependents`-direction **promotion** — `origin_address`,
-  `ref_text`, `score_status == "promoted"`, and its preserved original score —
+  verifying a real `dependents`-direction **promotion** — repositioning next
+  to its seed with correct `origin_address`/`ref_text`/`score_status ==
+  "promoted"` provenance, its preserved original score, and no duplication —
   for a candidate confirmed (against the accepted Day 12 report) to sit at
   rank 4, outside `graph_seed_n=3` and therefore eligible for promotion.
+  **Corrected this (fourth) revision: `q016` is not a recovery-from-outside-
+  `final_k` demonstration** — rank 4 is already inside `final_k=10`, so this
+  candidate was always going to reach `result.blocks` even without graph
+  expansion. The recovery scenario (a candidate genuinely displaced beyond
+  `final_k` by reranking, then brought back by promotion) is real, but `q016`
+  is not evidence of it; `q011` is (`module.vpc` genuinely fell outside the
+  Day 12 top 10), backed by the dedicated rank 11–50 promotion unit test
+  (section 8) for the general case.
 
 ## 14. Summary
 
@@ -1180,10 +1271,16 @@ possible design, but all are presented as this plan's actual, decided answer.
    (both cases), and shared-cap tests as before, now joined by: the BM25-only
    integration test corrected to set `bm25_k=1` explicitly and assert the
    single base result before checking for genuinely-new (`"unscored"`) graph
-   additions (finding 3); and `test_graph.py`'s determinism test extended to
-   cover **both** duplicate-edges-with-different-`ref_text` and
-   duplicate-edges-with-identical-`ref_text` (the latter needing `edges.id` as
-   the actual tiebreaker, finding 2). Direction/safety tests in
+   additions (round 3, finding 3); and `test_graph.py`'s determinism coverage
+   corrected this (fourth) revision into **two** tests — a real-database test
+   with duplicate edges of different `ref_text` (their order is observable and
+   asserted directly), and a separate, DB-free query-construction test that
+   captures the literal SQL `dependents`/`dependencies` execute and asserts the
+   `ORDER BY` clause includes `edges.id` as the fourth column. The prior
+   draft's plan to assert identical-`ref_text` duplicate rows' *returned*
+   order was dropped as impossible: `GraphNeighbor` doesn't expose `edges.id`,
+   so such rows come back as completely identical objects with nothing to
+   distinguish their order by (round 4, finding 1). Direction/safety tests in
    `test_prompts.py` unchanged; one updated assertion in `test_runner.py`.
 4. **Paid/local compute expected, corrected this revision**: ~40 OpenAI
    embedding requests for the full evaluation run (unchanged), plus 2 for the
@@ -1198,4 +1295,12 @@ possible design, but all are presented as this plan's actual, decided answer.
    remains approved and closed; the `q014` → `q016` substitution, the
    `edges.id` tiebreaker, the deterministic `bm25_k=1` integration test, and
    the shared-reranker smoke script are all corrections to match the plan's
-   own already-approved design, not new open design choices.
+   own already-approved design, not new open design choices. The two
+   fourth-round corrections are the same kind of fix, not new choices: the
+   determinism test now asserts only what is actually observable (returned
+   order for different-`ref_text` rows; the literal `ORDER BY` SQL text for the
+   `edges.id` tiebreaker), and `q016`'s narrative now states precisely what its
+   promotion demonstrates — repositioning and provenance for an
+   already-in-`final_k` candidate — without implying a recovery-from-beyond-
+   `final_k` outcome that only `q011` and the rank 11–50 unit test actually
+   demonstrate.
