@@ -25,6 +25,24 @@ own stated test baseline to match what was actually verified and by whom (sectio
 1), and adds a required blast-radius verification alongside `q011`'s relational
 one (section 9).
 
+**A third round of review found four further corrections, all applied here**:
+the blast-radius smoke question was `q014`, whose own top two candidates
+(`aws_security_group.rds`, `module.vpc_endpoints`) are both immutable
+`graph_seed_n=3` seeds — meaning the check asked the algorithm to produce
+exactly the outcome section 5.4's seed-exclusion rule is designed to prevent;
+replaced with `q016`, whose expected dependent
+(`output.vpc_endpoints_security_group_arn`) sits at rank 4, genuinely eligible
+for promotion (section 9). The `ORDER BY resource.address, edges.ref_text,
+resource.id` tiebreaker from the prior round can still tie — two edge rows for
+the same pair with identical `ref_text` also share the same joined
+`resource.id` — so `edges.id` is added as a fourth, genuinely final tiebreaker
+(section 5.3). The BM25-only graph integration test assumed two specific
+addresses would be absent from the candidate pool without forcing it; it now
+sets `bm25_k=1` explicitly so that's guaranteed by construction, not assumed
+(section 8). The smoke script constructed a fresh `CrossEncoderReranker` for
+each of its two questions; it now prepares one instance and shares it across
+both (section 9).
+
 This plan replaces the prior Day 13 plan (section 1 is a short completed-baseline
 summary for Day 12). It covers **Day 13 only** — graph expansion.
 
@@ -307,20 +325,28 @@ For each seed, **both** `graph.dependents(seed.id)` and
 dependencies**, matching SPEC 9.8's own SQL comment order. Seeds are processed
 in the candidate list's existing rank order.
 
-**Corrected this revision**: `graph.py`'s two queries change their `ORDER BY`
-from `resource.address` alone to **`resource.address, edges.ref_text,
-resource.id`** — a genuine total order. `resource.address` alone is not
-sufficient: if the same resource pair were ever connected by more than one edge
-row with different `ref_text` values (e.g. a data anomaly, a future relaxation
-of Day 4's one-edge-per-pair dedup rule, or a manually inserted test fixture —
-section 8 deliberately constructs exactly this scenario to prove the ordering
-holds), two rows would tie on `resource.address` and their relative order would
-be database-implementation-defined, not deterministic. Adding `edges.ref_text`
-breaks that tie, and `resource.id` is added as a final, always-unique tiebreaker
-so the order is total even in a hypothetical case where both `address` and
-`ref_text` also happened to match. **No new randomness is introduced anywhere
-in this stage** — the entire expansion is a pure function of `candidates`'
-(already-deterministic) order plus this now-genuinely-total database order.
+**Corrected this revision, made genuinely total (a second fix, not just the
+first)**: `graph.py`'s two queries change their `ORDER BY` from
+`resource.address` alone to **`resource.address, edges.ref_text, resource.id,
+edges.id`**. `resource.address` alone is not sufficient: if the same resource
+pair were ever connected by more than one edge row with different `ref_text`
+values (e.g. a data anomaly, a future relaxation of Day 4's one-edge-per-pair
+dedup rule, or a manually inserted test fixture — section 8 constructs exactly
+this scenario), two rows would tie on `resource.address` and their relative
+order would be database-implementation-defined. `edges.ref_text` breaks that
+tie. **`resource.id` alone is not a sufficient final tiebreaker either — this
+was wrong in the immediately prior revision of this plan and is corrected
+here**: two edge rows connecting the *same* `(source_id, target_id)` pair with
+the *same* `ref_text` also join to the *same* `resource.id` (it's the identical
+resource row on both sides of the join), so all three of `address`, `ref_text`,
+and `id` can tie simultaneously, leaving the order still
+implementation-defined. **`edges.id`** — the edge row's own primary key, always
+unique per row regardless of how many columns of the *joined* resource happen
+to match — is the fourth and genuinely final tiebreaker. `GraphNeighbor` itself
+does not need to expose `edges.id` as a returned field; it is used only inside
+`ORDER BY`. **No new randomness is introduced anywhere in this stage** — the
+entire expansion is a pure function of `candidates`' (already-deterministic)
+order plus this now-genuinely-total database order.
 
 ### 5.4 Deduplication and promotion — the exact three-case rule, replacing the prior "skip if present" bug
 
@@ -687,8 +713,8 @@ external, independently-versioned resource the way the reranker did. No new
 **Modify:**
 - `ripple/retrieval/graph.py` — add `GraphNeighbor.embed_text: str` (required);
   add `resource.embed_text` to both `SELECT` statements; change both
-  `ORDER BY` clauses to `resource.address, edges.ref_text, resource.id`
-  (section 5.3/5.6).
+  `ORDER BY` clauses to `resource.address, edges.ref_text, resource.id,
+  edges.id` (section 5.3/5.6).
 - `ripple/retrieval/vector_store.py` — widen `RetrievedBlock.score` to `float |
   None`; add four trailing, defaulted fields: `graph_relationship`,
   `graph_origin_address`, `graph_ref_text`, `graph_score_status` (section 5.5).
@@ -747,7 +773,7 @@ class GraphNeighbor:
 # both dependents() and dependencies(): SELECT list becomes
 # resource.id, resource.address, resource.file_path, resource.start_line,
 # resource.end_line, resource.body, resource.embed_text, edges.ref_text
-# ORDER BY resource.address, edges.ref_text, resource.id   -- genuinely total
+# ORDER BY resource.address, edges.ref_text, resource.id, edges.id -- genuinely total
 ```
 
 ## 8. Tests — exact files and assertions
@@ -811,28 +837,53 @@ class GraphNeighbor:
   surviving into `result.blocks` *is* the proof).
 - `stages_json["graph"]`/`graph_ms`/`executed.graph` present only when
   `use_graph=True`.
-- **Supabase integration test** (DB-dependent, skip-if-unreachable): index the
-  real `reference_repo` fixture; run `pipeline.run_pipeline` with
-  `use_vector=False, use_bm25=True, use_rerank=False, use_graph=True`, a
-  question that puts `aws_vpc.main` at BM25 rank 1; assert the real
-  `graph.dependents` result (`aws_security_group.worker`, `aws_subnet.public`)
-  appears in `stages_json["graph"]` with `relationship == "dependent"`,
-  `origin_address == "aws_vpc.main"`, correct real `ref_text`, and
-  `score_status == "unscored"` (since neither neighbor was already present in
-  the BM25-only candidate list). Makes no OpenAI call and no reranker call.
+- **Supabase integration test — made deterministic this revision (finding 3)**:
+  the prior draft assumed `aws_security_group.worker`/`aws_subnet.public` would
+  be *absent* from the BM25 candidate list, which is unsafe — both blocks'
+  `embed_text`/`body` mention `aws_vpc.main` (that's the reference edge itself),
+  so a lexical query for `aws_vpc.main` with the default `bm25_k=30` could
+  plausibly retrieve them too, already present in `candidates` before graph
+  expansion ever runs — which would make them **promotions**, not fresh
+  additions, and silently invalidate the test's own premise. **Corrected**: set
+  `bm25_k=1` explicitly in this test's `RetrievalConfig` (`use_vector=False,
+  use_bm25=True, bm25_k=1, use_rerank=False, use_graph=True`), against the
+  indexed `reference_repo` fixture, querying for `aws_vpc.main` directly. First
+  assert the single BM25 base result actually **is** `aws_vpc.main` (not
+  assumed) — with `bm25_k=1`, `candidates` has exactly one entry, so neither
+  `aws_security_group.worker` nor `aws_subnet.public` can possibly already be
+  present, by construction, not by assumption about ranking. Then assert the
+  real `graph.dependents` result (`aws_security_group.worker`,
+  `aws_subnet.public`) appears in `stages_json["graph"]` as genuinely **new**
+  graph-only blocks: `relationship == "dependent"`, `origin_address ==
+  "aws_vpc.main"`, correct real `ref_text`, `score is None`, and `score_status
+  == "unscored"` (section 5.5) — never `"promoted"`, since `bm25_k=1` guarantees
+  they weren't already in the candidate pool. Makes no OpenAI call and no
+  reranker call.
 
 **`tests/test_graph.py`**:
 - Add an assertion that `neighbors[0].embed_text` equals the real `embed_text`
   column value for that resource, distinct from `body`.
-- **New determinism test with duplicate edges** (finding 3): using a
-  throwaway repo/resources setup (matching this project's ad hoc fixture
-  pattern), directly `INSERT` two edge rows connecting the same `(source_id,
-  target_id)` pair with two different `ref_text` values (bypassing the
-  indexer's own one-edge-per-pair dedup, to exercise the SQL ordering itself
-  rather than assuming the indexer never produces this); assert
-  `dependents`/`dependencies` return both rows in the exact order predicted by
-  `ORDER BY resource.address, edges.ref_text, resource.id` (i.e., ordered by
-  `ref_text` since `address` ties), and that running the query twice produces
+- **New determinism test with duplicate edges — strengthened this revision
+  (finding 2)**: `resource.address, edges.ref_text, resource.id` alone can
+  still tie: two edge rows connecting the **same** `(source_id, target_id)`
+  pair with the **same** `ref_text` also share the same `resource.id` (it's the
+  same joined resource row both times), so all three columns tie and the order
+  between them is still database-implementation-defined. **Corrected**: both
+  `ORDER BY` clauses become `resource.address, edges.ref_text, resource.id,
+  edges.id` — `edges.id` (the edge row's own primary key, always unique) is the
+  final, guaranteed tiebreaker; `GraphNeighbor` itself does **not** need to
+  expose `edges.id` as a field — it's used only inside `ORDER BY`, never
+  selected or returned. Using a throwaway repo/resources setup, directly
+  `INSERT` **two separate sets** of duplicate edge rows connecting the same
+  `(source_id, target_id)` pair (bypassing the indexer's own one-edge-per-pair
+  dedup): (a) two rows with **different** `ref_text` values, and (b) two rows
+  with **identical** `ref_text` values (differing only in their own `edges.id`,
+  which is whatever the database assigns on insert — the test reads it back
+  after inserting, rather than assuming a specific value). Assert:
+  `dependents`/`dependencies` return case (a)'s two rows ordered by `ref_text`
+  (the third column breaks the tie); return case (b)'s two rows ordered by
+  their actual `edges.id` values (the fourth column breaks the tie that
+  `ref_text` alone could not); and running either query twice produces
   byte-identical results both times.
 
 **`tests/test_prompts.py`**: unchanged from the prior draft — `_block` helper
@@ -868,18 +919,47 @@ DB-enabled shape (0 skipped) so the new graph integration tests actually run.
 
 **Step 0 — first explicit confirmation, before any spending of any kind**: get
 explicit go-ahead before Step 1. The smoke test below makes **two** real OpenAI
-embedding requests (one per question checked); nothing runs before confirmation.
+embedding requests (one per question checked), **zero** generation requests,
+**one** real reranker preparation, and **two** local batched rerank
+predictions (finding 4 — see the corrected script below); nothing runs before
+confirmation.
 
-**Step 1 — two smoke checks, relational (`q011`) and blast-radius (`q014`) —
-both required (finding 5)**: SPEC's own Day 13 "Done when" explicitly calls out
-verifying dependents for a blast-radius question, not just dependencies for a
-relational one; `q011` alone is not sufficient evidence that the `dependents`
-direction works against real data. Both checks share one script:
+**Step 1 — two smoke checks, relational (`q011`) and blast-radius (`q016`,
+corrected this revision) — both required**: SPEC's own Day 13 "Done when"
+explicitly calls out verifying dependents for a blast-radius question, not
+just dependencies for a relational one; `q011` alone is not sufficient
+evidence that the `dependents` direction works against real data.
+
+**`q014` is replaced with `q016` — the prior draft's `q014` check was
+incompatible with the algorithm it was meant to test (finding 1).** The
+accepted Day 12 report ranks `q014`'s candidates
+`["aws_security_group.rds", "module.vpc_endpoints", "module.vpc", ...]` — with
+`graph_seed_n=3`, **both** `aws_security_group.rds` (rank 1) **and**
+`module.vpc_endpoints` (rank 2) are already immutable seeds. Section 5.4's
+case 2 rule *deliberately* leaves a discovered neighbor untouched, with no
+move and no `stages_json["graph"]` entry, whenever it is already one of the
+immutable seeds — so `module.vpc_endpoints` could **never** legitimately
+appear in `stages_json["graph"]` as a dependent of the `aws_security_group.rds`
+seed, no matter how correctly the algorithm runs. The prior smoke test asked
+for exactly the outcome the algorithm is specifically designed *not* to
+produce.
+
+**`q016`** ("What is directly affected if `module.vpc_endpoints` is removed?")
+is compatible: `module.vpc_endpoints` itself is Day 12's rank-1 result (the
+seed), and `output.vpc_endpoints_security_group_arn` sits at **rank 4** —
+outside `graph_seed_n=3` — so it is eligible for **promotion**, not excluded
+like `q014`'s scenario was.
+
+Both checks share one script, reusing **one** prepared `CrossEncoderReranker`
+instance across both questions (finding 4 — the prior draft's script called
+`run_pipeline` twice with no injected reranker, which would construct and load
+the real model twice):
 
 ```bash
 .venv/bin/python -c "
 from ripple.evaluation.runner import ABLATION_CONFIGS
 from ripple.retrieval import pipeline
+from ripple.retrieval.rerank import CrossEncoderReranker
 
 REPO_ID = ...  # never hardcoded -- resolve independently, e.g.:
                 # from ripple import db
@@ -891,6 +971,10 @@ REPO_ID = ...  # never hardcoded -- resolve independently, e.g.:
                 #     print(cur.fetchone())
 config = dict(ABLATION_CONFIGS)['+ Graph expansion']
 
+reranker = CrossEncoderReranker()
+reranker.prepare()  # one real model load + one dummy prediction, shared below
+print(f'--- reranker prepared in {reranker.prepare_ms:.0f}ms (one-time) ---')
+
 CHECKS = [
     (
         'q011 (relational, dependencies)',
@@ -898,14 +982,14 @@ CHECKS = [
         'module.vpc',
     ),
     (
-        'q014 (blast_radius, dependents)',
-        'What is directly affected if aws_security_group.rds is removed?',
-        'module.vpc_endpoints',
+        'q016 (blast_radius, dependents)',
+        'What is directly affected if module.vpc_endpoints is removed?',
+        'output.vpc_endpoints_security_group_arn',
     ),
 ]
 
 for label, question, expected_address in CHECKS:
-    result = pipeline.run_pipeline(REPO_ID, question, config)
+    result = pipeline.run_pipeline(REPO_ID, question, config, reranker=reranker)
     print(f'=== {label} ===')
     print('--- graph actions ---')
     for row in result.stages_json['graph']:
@@ -928,14 +1012,18 @@ present in the reranked pool — the expected case per section 1) or
 of a fix, but the two mean different things and should be reported accurately,
 not conflated.
 
-For **`q014`**, confirm `stages_json["graph"]` shows a real, correctly-labeled
-`"dependent"` entry (`module.vpc_endpoints`, or whichever address the real
-database returns) with the correct `origin_address`/`ref_text` — this is
-required **even if** `q014`'s aggregate Recall@10 doesn't change (Day 12's
-report already shows `q014` scoring `1.0` under reranking alone); the point of
-this check is proving the `dependents` direction works correctly against real
-data with real provenance, independent of whether it moves an aggregate number
-that was already at its ceiling.
+For **`q016`**, confirm `stages_json["graph"]` shows
+`output.vpc_endpoints_security_group_arn` with:
+- `"relationship": "dependent"`;
+- `"origin_address": "module.vpc_endpoints"`;
+- the correct real `ref_text`;
+- `"score_status": "promoted"` (it was already present at rank 4, not absent —
+  a fresh `"unscored"` result here would indicate the real database's ranking
+  no longer matches Day 12's accepted report, worth investigating before
+  proceeding, not silently accepted);
+- its **own original reranker score preserved**, not overwritten;
+- and that it actually reaches `result.blocks` (the promotion moved it inside
+  `final_k`).
 
 **Step 2 — second explicit confirmation, before the full 40-question run**:
 state plainly beforehand: ~40 paid OpenAI embedding requests (unchanged), zero
@@ -961,10 +1049,11 @@ expansion (no new paid cost).
 **Step 5 — accept and commit, or fix and re-run**: same deliberate
 review-then-stage workflow as every prior day. Write `DAY_13_ANALYSIS.md`
 alongside the accepted report: aggregate metrics, per-category metrics, `q011`'s
-specific before/after, the `q014` blast-radius provenance check's outcome,
-`graph_ms`, and an honest account of any category that regressed. **Never
-hand-edit any measured metric.** Commit the accepted report and analysis
-separately from the implementation commit(s).
+specific before/after, the `q016` blast-radius promotion check's outcome
+(including whether `output.vpc_endpoints_security_group_arn`'s `score_status`
+was `"promoted"` as expected), `graph_ms`, and an honest account of any
+category that regressed. **Never hand-edit any measured metric.** Commit the
+accepted report and analysis separately from the implementation commit(s).
 
 ## 10. Scope and process
 
@@ -1008,9 +1097,10 @@ Day 13 is complete only when all of the following hold:
   asserted as a single unconditional number.
 - The fifth real ablation row exists in one committed, `schema_version: 2` JSON
   report.
-- **Both** smoke checks (section 9, step 1 — `q011` relational and `q014`
+- **Both** smoke checks (section 9, step 1 — `q011` relational and `q016`
   blast-radius) were actually run and their `stages_json["graph"]` output
-  inspected before the full evaluation.
+  inspected before the full evaluation, using **one shared, prepared**
+  `CrossEncoderReranker` instance for both questions.
 - The result has been inspected (section 9, step 4), including an honest
   account of any category that regressed.
 - The accepted report and its `DAY_13_ANALYSIS.md` are committed together, in a
@@ -1054,9 +1144,12 @@ possible design, but all are presented as this plan's actual, decided answer.
   downstream serialization/type effects inspected and confirmed safe before
   choosing this design, not after.
 - **Deterministic ordering**: both `graph.py` queries now order by
-  `resource.address, edges.ref_text, resource.id` — a genuine total order —
-  tested with manually-inserted duplicate edges, not assumed safe because the
-  indexer "shouldn't" produce them (section 5.3/8).
+  `resource.address, edges.ref_text, resource.id, edges.id` — a genuine total
+  order, `edges.id` added this revision after confirming `resource.id` alone
+  still ties for edges connecting the same pair with identical `ref_text` —
+  tested with manually-inserted duplicate edges covering **both** the
+  different-`ref_text` and identical-`ref_text` cases, not assumed safe because
+  the indexer "shouldn't" produce them (section 5.3/8).
 - **Graph caps**: `graph_max_added` is a single shared counter across
   promotions and additions, an explicit, tested choice (section 5.2/5.4/8).
 - **`q011` recovery logic**: directly re-checked against the corrected
@@ -1064,10 +1157,15 @@ possible design, but all are presented as this plan's actual, decided answer.
   promotion branch (case 3, section 5.4) exists to handle; the smoke test
   (section 9) reports whether the real data confirms it, and reports
   `promoted` vs. `unscored` honestly rather than assuming which applies.
-- **Real dependent/blast-radius verification**: `q014` is now a required
-  second smoke check (section 9), verifying a real `dependents`-direction
-  provenance entry with correct origin/`ref_text` independently of whether the
-  aggregate blast-radius metric moves.
+- **Real dependent/blast-radius verification**: `q016` (corrected this
+  revision from `q014`, which was structurally incompatible with the
+  seed-exclusion rule — its two top candidates are both immutable seeds, so
+  its expected dependent could never legitimately appear in
+  `stages_json["graph"]`) is the required second smoke check (section 9),
+  verifying a real `dependents`-direction **promotion** — `origin_address`,
+  `ref_text`, `score_status == "promoted"`, and its preserved original score —
+  for a candidate confirmed (against the accepted Day 12 report) to sit at
+  rank 4, outside `graph_seed_n=3` and therefore eligible for promotion.
 
 ## 14. Summary
 
@@ -1078,18 +1176,26 @@ possible design, but all are presented as this plan's actual, decided answer.
    `tests/test_prompts.py`, `tests/test_runner.py` — 9 files total, unchanged in
    count from the prior draft.
 3. **Tests to add/update**: the same audit-driven `use_graph=False` pass over
-   all 21 `test_pipeline.py` sites, plus a larger set of new graph tests than
-   the prior draft — specifically new promotion, non-demotion, score-status
-   (both cases), shared-cap, and duplicate-`ref_text`-determinism tests, on top
-   of the seed/direction/depth/dedup/integration tests already planned; a new
-   determinism test in `test_graph.py` using manually-inserted duplicate edges;
-   direction/safety tests in `test_prompts.py` unchanged; one updated assertion
-   in `test_runner.py`.
-4. **Paid/local compute expected**: ~40 OpenAI embedding requests for the full
-   evaluation run (unchanged), plus 2 for the two required smoke checks; 0
-   generation requests; additional local database read latency for graph
-   expansion (no new paid cost, no model, no download).
-5. **Remaining ambiguity requiring your decision**: none. The prior draft's one
-   open item (`final_k` competition) is now approved and closed; every other
-   choice this revision introduces was explicitly requested to be chosen and
-   documented by this round of review, and is resolved above with reasoning.
+   all 21 `test_pipeline.py` sites, plus promotion, non-demotion, score-status
+   (both cases), and shared-cap tests as before, now joined by: the BM25-only
+   integration test corrected to set `bm25_k=1` explicitly and assert the
+   single base result before checking for genuinely-new (`"unscored"`) graph
+   additions (finding 3); and `test_graph.py`'s determinism test extended to
+   cover **both** duplicate-edges-with-different-`ref_text` and
+   duplicate-edges-with-identical-`ref_text` (the latter needing `edges.id` as
+   the actual tiebreaker, finding 2). Direction/safety tests in
+   `test_prompts.py` unchanged; one updated assertion in `test_runner.py`.
+4. **Paid/local compute expected, corrected this revision**: ~40 OpenAI
+   embedding requests for the full evaluation run (unchanged), plus 2 for the
+   two required smoke checks (`q011`, `q016`); **0 generation requests; one
+   reranker preparation (not two) and two local batched rerank predictions**,
+   since the smoke script now shares one prepared `CrossEncoderReranker`
+   instance across both questions (finding 4) instead of constructing/loading
+   the real model separately for each; additional local database read latency
+   for graph expansion (no new paid cost, no model, no download beyond the one
+   reranker preparation already required for the evaluated configuration).
+5. **Remaining ambiguity requiring your decision**: none. `final_k` competition
+   remains approved and closed; the `q014` → `q016` substitution, the
+   `edges.id` tiebreaker, the deterministic `bm25_k=1` integration test, and
+   the shared-reranker smoke script are all corrections to match the plan's
+   own already-approved design, not new open design choices.
