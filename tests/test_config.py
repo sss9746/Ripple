@@ -21,4 +21,5 @@ def test_retrieval_config_defaults() -> None:
         "final_k": 8,
         "graph_seed_n": 3,
         "graph_max_added": 10,
+        "graph_route_by_intent": False,
     }

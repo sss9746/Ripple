@@ -7,6 +7,7 @@ from ripple.llm.embeddings import EmbeddingProvider, OpenAIEmbeddingProvider
 from ripple.retrieval import fusion
 from ripple.retrieval.bm25 import build_index
 from ripple.retrieval.graph import fetch_neighbors
+from ripple.retrieval.intent import classify_intent, directions_for_intent
 from ripple.retrieval.pgvector_store import PgVectorStore
 from ripple.retrieval.rerank import CrossEncoderReranker, Reranker
 from ripple.retrieval.vector_store import RetrievedBlock, VectorStore
@@ -19,7 +20,7 @@ SUPPORTED_VECTOR_BACKENDS = ("pgvector",)
 class PipelineResult:
     blocks: list[RetrievedBlock]
     config_json: dict
-    stages_json: dict[str, list[dict]]
+    stages_json: dict[str, list[dict] | dict]
     latency_json: dict[str, float]
 
 
@@ -100,7 +101,7 @@ def run_pipeline(
 ) -> PipelineResult:
     total_start = time.perf_counter()
 
-    stages_json: dict[str, list[dict]] = {}
+    stages_json: dict[str, list[dict] | dict] = {}
     latency_json: dict[str, float] = {}
 
     vector_results: list[RetrievedBlock] = []
@@ -193,6 +194,16 @@ def run_pipeline(
         seed_n = max(config.graph_seed_n, 0)
         max_added = max(config.graph_max_added, 0)
 
+        if config.graph_route_by_intent:
+            graph_intent = classify_intent(question)
+            directions = directions_for_intent(graph_intent)
+            stages_json["graph_intent"] = {
+                "intent": graph_intent.value,
+                "directions": list(directions),
+            }
+        else:
+            directions = ("dependent", "dependency")
+
         seeds = candidates[:seed_n]
         seed_ids = {block.id for block in seeds}
         original_position = {
@@ -209,8 +220,9 @@ def run_pipeline(
             fetch_neighbors(
                 repo_id,
                 [block.id for block in seeds],
+                directions,
             )
-            if seeds and max_added > 0
+            if seeds and max_added > 0 and directions
             else {}
         )
 
@@ -226,7 +238,7 @@ def run_pipeline(
             insertions_here: list[RetrievedBlock] = []
 
             by_direction = neighbors_by_seed.get(block.id, {})
-            for relationship in ("dependent", "dependency"):
+            for relationship in directions:
                 if action_count >= max_added:
                     break
 

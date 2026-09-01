@@ -1027,6 +1027,85 @@ def test_enabled_graph_with_empty_candidates_records_empty_stage(
     assert result.config_json["executed"]["graph"] is True
 
 
+@pytest.mark.parametrize(
+    (
+        "question",
+        "expected_intent",
+        "expected_directions",
+        "expected_calls",
+    ),
+    [
+        (
+            "Which module creates the VPC?",
+            "lookup",
+            [],
+            [],
+        ),
+        (
+            "Which blocks contain an exact reference to module.vpc?",
+            "attribute",
+            [],
+            [],
+        ),
+        (
+            "What does aws_subnet.public depend on?",
+            "dependency",
+            ["dependency"],
+            [("dependency", 1)],
+        ),
+        (
+            "What is affected if aws_vpc.main is removed?",
+            "blast_radius",
+            ["dependent"],
+            [("dependent", 1)],
+        ),
+        (
+            "How does aws_subnet.public relate to aws_vpc.main?",
+            "ambiguous_relationship",
+            ["dependent", "dependency"],
+            [("dependent", 1), ("dependency", 1)],
+        ),
+    ],
+)
+def test_graph_routes_by_question_intent(
+    monkeypatch: pytest.MonkeyPatch,
+    question: str,
+    expected_intent: str,
+    expected_directions: list[str],
+    expected_calls: list[tuple[str, int]],
+) -> None:
+    blocks = [_block(1, "seed.one", 9.0)]
+    _install_bm25_index(monkeypatch, blocks)
+    calls = _install_graph(
+        monkeypatch,
+        dependents_by_id={1: [_neighbor(2, "dependent.one", "dep.ref")]},
+        dependencies_by_id={
+            1: [_neighbor(3, "dependency.one", "dependency.ref")]
+        },
+        allowed_ids={1},
+    )
+
+    result = pipeline.run_pipeline(
+        repo_id=3,
+        question=question,
+        config=RetrievalConfig(
+            use_vector=False,
+            use_rerank=False,
+            use_graph=True,
+            graph_route_by_intent=True,
+            graph_seed_n=1,
+            graph_max_added=10,
+            final_k=10,
+        ),
+    )
+
+    assert result.stages_json["graph_intent"] == {
+        "intent": expected_intent,
+        "directions": expected_directions,
+    }
+    assert calls == expected_calls
+
+
 def test_graph_expansion_with_real_reference_repository() -> None:
     try:
         connection = db.get_connection()

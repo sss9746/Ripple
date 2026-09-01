@@ -18,3 +18,4 @@ class RetrievalConfig:
     final_k: int = 8
     graph_seed_n: int = 3
     graph_max_added: int = 10
+    graph_route_by_intent: bool = False
