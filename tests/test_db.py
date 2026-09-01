@@ -39,6 +39,19 @@ def test_get_connection_requires_database_url(
         db.get_connection()
 
 
+def test_get_connection_pool_requires_database_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db.close_connection_pool()
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    with pytest.raises(
+        RuntimeError,
+        match="DATABASE_URL environment variable is not set",
+    ):
+        db.get_connection_pool()
+
+
 def test_insert_repo_round_trip() -> None:
     try:
         repo_id = db.insert_repo(

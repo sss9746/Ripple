@@ -32,7 +32,7 @@ class _RecordingCursor:
     def execute(
         self,
         query: str,
-        params: tuple[int],
+        params: tuple[object, ...],
     ) -> None:
         self.queries.append(query)
 
@@ -223,3 +223,77 @@ def test_graph_queries_use_total_deterministic_order(
         expected_order in query
         for query in normalized_queries
     )
+
+
+def test_fetch_neighbors_matches_legacy_helpers(
+    resource_ids: dict[str, int],
+) -> None:
+    vpc_id = resource_ids["aws_vpc.main"]
+    subnet_id = resource_ids["aws_subnet.public"]
+
+    with db.get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT repo_id FROM resources WHERE id = %s",
+                (vpc_id,),
+            )
+            repo_id = cursor.fetchone()[0]
+
+    result = graph.fetch_neighbors(repo_id, [vpc_id, subnet_id])
+
+    assert result[vpc_id]["dependent"] == graph.dependents(vpc_id)
+    assert result.get(vpc_id, {}).get("dependency", []) == (
+        graph.dependencies(vpc_id)
+    )
+    assert result.get(subnet_id, {}).get("dependent", []) == (
+        graph.dependents(subnet_id)
+    )
+    assert result[subnet_id]["dependency"] == graph.dependencies(subnet_id)
+
+
+@pytest.mark.parametrize(
+    ("seed_ids", "directions"),
+    [([], ("dependent", "dependency")), ([1], ())],
+)
+def test_fetch_neighbors_empty_inputs_skip_database(
+    monkeypatch: pytest.MonkeyPatch,
+    seed_ids: list[int],
+    directions: tuple[str, ...],
+) -> None:
+    monkeypatch.setattr(
+        graph.db,
+        "pooled_connection",
+        lambda: pytest.fail("database should not be called"),
+    )
+
+    assert graph.fetch_neighbors(3, seed_ids, directions) == {}
+
+
+def test_fetch_neighbors_uses_one_deterministic_union_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queries: list[str] = []
+    monkeypatch.setattr(
+        graph.db,
+        "pooled_connection",
+        lambda: _RecordingConnection(queries),
+    )
+
+    assert graph.fetch_neighbors(3, [2, 1, 2]) == {}
+
+    assert len(queries) == 1
+    normalized_query = " ".join(queries[0].split())
+    assert normalized_query.count("UNION ALL") == 1
+    assert normalized_query.count("= ANY(%s::int[])") == 2
+    assert normalized_query.count("edges.repo_id = %s") == 2
+    assert normalized_query.count("resource.repo_id = %s") == 2
+    assert "edges.id AS edge_id" in normalized_query
+    assert (
+        "ORDER BY origin_id, direction_rank, address, ref_text, "
+        "resource_id, edge_id"
+    ) in normalized_query
+
+
+def test_fetch_neighbors_rejects_unknown_direction() -> None:
+    with pytest.raises(ValueError, match="Unsupported graph direction"):
+        graph.fetch_neighbors(3, [1], ("sideways",))

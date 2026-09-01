@@ -155,20 +155,33 @@ def _install_graph(
         set(dependents_by_id) | set(dependencies_by_id)
     )
 
-    def fake_dependents(resource_id: int) -> list[GraphNeighbor]:
-        if resource_id not in allowed:
-            pytest.fail(f"Unexpected depth-two graph lookup: {resource_id}")
-        calls.append(("dependent", resource_id))
-        return dependents_by_id.get(resource_id, [])
+    def fake_fetch_neighbors(
+        repo_id: int,
+        seed_ids: list[int],
+        directions: tuple[str, ...] = ("dependent", "dependency"),
+    ) -> dict[int, dict[str, list[GraphNeighbor]]]:
+        assert repo_id == 3
+        result: dict[int, dict[str, list[GraphNeighbor]]] = {}
 
-    def fake_dependencies(resource_id: int) -> list[GraphNeighbor]:
-        if resource_id not in allowed:
-            pytest.fail(f"Unexpected depth-two graph lookup: {resource_id}")
-        calls.append(("dependency", resource_id))
-        return dependencies_by_id.get(resource_id, [])
+        for resource_id in seed_ids:
+            if resource_id not in allowed:
+                pytest.fail(
+                    f"Unexpected depth-two graph lookup: {resource_id}"
+                )
+            for direction in directions:
+                calls.append((direction, resource_id))
+                source = (
+                    dependents_by_id
+                    if direction == "dependent"
+                    else dependencies_by_id
+                )
+                neighbors = source.get(resource_id, [])
+                if neighbors:
+                    result.setdefault(resource_id, {})[direction] = neighbors
 
-    monkeypatch.setattr(pipeline, "dependents", fake_dependents)
-    monkeypatch.setattr(pipeline, "dependencies", fake_dependencies)
+        return result
+
+    monkeypatch.setattr(pipeline, "fetch_neighbors", fake_fetch_neighbors)
     return calls
 
 
@@ -757,8 +770,7 @@ def test_disabled_graph_never_calls_graph_functions(
 ) -> None:
     blocks = [_block(1, "aws_vpc.main", 8.0)]
     _install_bm25_index(monkeypatch, blocks)
-    monkeypatch.setattr(pipeline, "dependents", _unexpected_call)
-    monkeypatch.setattr(pipeline, "dependencies", _unexpected_call)
+    monkeypatch.setattr(pipeline, "fetch_neighbors", _unexpected_call)
 
     result = pipeline.run_pipeline(
         repo_id=3,
@@ -951,7 +963,12 @@ def test_graph_global_cap_counts_promotions_and_additions_together(
         ),
     )
 
-    assert calls == [("dependent", 1)]
+    assert calls == [
+        ("dependent", 1),
+        ("dependency", 1),
+        ("dependent", 2),
+        ("dependency", 2),
+    ]
     assert [row["id"] for row in result.stages_json["graph"]] == [12]
     assert sum(block.id == 12 for block in result.blocks) == 1
     assert all(block.id != 20 for block in result.blocks)
@@ -968,8 +985,7 @@ def test_nonpositive_graph_limits_perform_no_lookups(
 ) -> None:
     blocks = [_block(1, "aws_vpc.main", 8.0)]
     _install_bm25_index(monkeypatch, blocks)
-    monkeypatch.setattr(pipeline, "dependents", _unexpected_call)
-    monkeypatch.setattr(pipeline, "dependencies", _unexpected_call)
+    monkeypatch.setattr(pipeline, "fetch_neighbors", _unexpected_call)
 
     result = pipeline.run_pipeline(
         repo_id=3,
@@ -993,8 +1009,7 @@ def test_enabled_graph_with_empty_candidates_records_empty_stage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_bm25_index(monkeypatch, [])
-    monkeypatch.setattr(pipeline, "dependents", _unexpected_call)
-    monkeypatch.setattr(pipeline, "dependencies", _unexpected_call)
+    monkeypatch.setattr(pipeline, "fetch_neighbors", _unexpected_call)
 
     result = pipeline.run_pipeline(
         repo_id=3,

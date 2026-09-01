@@ -6,7 +6,7 @@ from ripple.config import RetrievalConfig
 from ripple.llm.embeddings import EmbeddingProvider, OpenAIEmbeddingProvider
 from ripple.retrieval import fusion
 from ripple.retrieval.bm25 import build_index
-from ripple.retrieval.graph import dependencies, dependents
+from ripple.retrieval.graph import fetch_neighbors
 from ripple.retrieval.pgvector_store import PgVectorStore
 from ripple.retrieval.rerank import CrossEncoderReranker, Reranker
 from ripple.retrieval.vector_store import RetrievedBlock, VectorStore
@@ -205,6 +205,14 @@ def run_pipeline(
         graph_actions: list[RetrievedBlock] = []
         augmented: list[RetrievedBlock] = []
         action_count = 0
+        neighbors_by_seed = (
+            fetch_neighbors(
+                repo_id,
+                [block.id for block in seeds],
+            )
+            if seeds and max_added > 0
+            else {}
+        )
 
         for position, block in enumerate(candidates):
             if block.id in moved_ids:
@@ -217,14 +225,12 @@ def run_pipeline(
 
             insertions_here: list[RetrievedBlock] = []
 
-            for relationship, fetch in (
-                ("dependent", dependents),
-                ("dependency", dependencies),
-            ):
+            by_direction = neighbors_by_seed.get(block.id, {})
+            for relationship in ("dependent", "dependency"):
                 if action_count >= max_added:
                     break
 
-                for neighbor in fetch(block.id):
+                for neighbor in by_direction.get(relationship, []):
                     if action_count >= max_added:
                         break
 

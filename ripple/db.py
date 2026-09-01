@@ -1,25 +1,91 @@
+import atexit
 import os
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Protocol
 
 import psycopg
 from dotenv import load_dotenv
 from pgvector import Vector
 from pgvector.psycopg import register_vector
+from psycopg_pool import ConnectionPool
 from psycopg.types.json import Jsonb
 
 
 load_dotenv()
 
 
-def get_connection() -> psycopg.Connection:
+_connection_pool: ConnectionPool | None = None
+_connection_pool_url: str | None = None
+_connection_pool_lock = threading.Lock()
+
+
+def _database_url() -> str:
     database_url = os.environ.get("DATABASE_URL")
 
     if not database_url:
         raise RuntimeError("DATABASE_URL environment variable is not set")
 
-    connection = psycopg.connect(database_url)
+    return database_url
+
+
+def get_connection() -> psycopg.Connection:
+    connection = psycopg.connect(_database_url())
     register_vector(connection)
     return connection
+
+
+def _configure_pooled_connection(
+    connection: psycopg.Connection,
+) -> None:
+    register_vector(connection)
+    connection.commit()
+
+
+def get_connection_pool() -> ConnectionPool:
+    """Return a lazy process-wide pool for latency-sensitive read paths."""
+    global _connection_pool, _connection_pool_url
+
+    database_url = _database_url()
+    with _connection_pool_lock:
+        if (
+            _connection_pool is None
+            or _connection_pool_url != database_url
+        ):
+            if _connection_pool is not None:
+                _connection_pool.close()
+            _connection_pool = ConnectionPool(
+                conninfo=database_url,
+                min_size=1,
+                max_size=4,
+                open=True,
+                configure=_configure_pooled_connection,
+            )
+            _connection_pool_url = database_url
+
+        return _connection_pool
+
+
+@contextmanager
+def pooled_connection() -> Iterator[psycopg.Connection]:
+    """Borrow a registered connection and return it to the pool afterward."""
+    with get_connection_pool().connection() as connection:
+        yield connection
+
+
+def close_connection_pool() -> None:
+    """Close the process-wide pool if it was opened."""
+    global _connection_pool, _connection_pool_url
+
+    with _connection_pool_lock:
+        if _connection_pool is not None:
+            _connection_pool.close()
+        _connection_pool = None
+        _connection_pool_url = None
+
+
+atexit.register(close_connection_pool)
 
 
 def insert_repo(name: str, source_url: str | None, local_path: str) -> int:
