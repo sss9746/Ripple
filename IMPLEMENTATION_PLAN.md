@@ -1,1306 +1,749 @@
-# Implementation Plan — Day 13: Graph Expansion
+# Implementation Plan — Day 14: Full Table
 
-## 0. Process note for this cycle
+## 0. Where this picks up
 
-**`SPEC.md` is read-only.** Nothing below proposes editing it; any place SPEC's
-text is genuinely ambiguous is resolved here with explicit reasoning and flagged
-in section 12 for your review, never silently guessed past.
+Days 1–13 are complete and accepted. Graph stabilization Sessions A–C and the
+intent router are complete and committed (`7c5d054`, `7d2529b`, `484968c`,
+`a570880`). Session C (`GRAPH_STABILIZATION_SESSION_C.md`,
+`data/eval_results/2026-09-01T20-48-26-006545Z.json`) accepted the batched
+and intent-routed graph policy:
 
-**Only this file is modified in this planning cycle.** No application code, tests,
-or other files change until a step from section 6 is implemented.
+| Configuration | Recall@5 | Recall@10 | MRR | graph_ms |
+|---|---:|---:|---:|---:|
+| Cross-encoder (Day 13, reused) | 0.8541666666666666 | 0.9 | 0.7456547619047619 | — |
+| Original graph (Day 13, reused) | 0.8208333333333333 | 1.0 | 0.7889880952380952 | 8916.67 |
+| Batched graph (new) | 0.8208333333333333 | 1.0 | 0.7889880952380952 | 609.64 |
+| **Batched + routed graph (accepted)** | **0.9791666666666666** | **1.0** | **0.8183333333333334** | **307.19** |
 
-This is a **revision** of the prior Day 13 plan, correcting a second round of
-review findings that caught a real, evaluation-breaking algorithm bug: the
-proposed `known_ids`-based dedup would have skipped promoting any graph neighbor
-that already existed anywhere in the up-to-50-item reranked candidate pool,
-including at rank 11–50 — meaning the `q011` smoke test the plan itself proposed
-could fail even when `module.vpc` genuinely is a direct dependency, because a
-neighbor sitting at rank 30 would never be moved next to its seed and would still
-be cut by `final_k=10`. This revision replaces "skip if present anywhere" with a
-three-case promote/add/leave-alone algorithm (section 5.4/5.7), corrects a score-
-misattribution problem (a graph-only addition was inheriting its seed's reranker
-score, which the model never actually assigned to it — section 5.5), tightens
-graph query ordering to a genuine total order (section 5.3), corrects the plan's
-own stated test baseline to match what was actually verified and by whom (section
-1), and adds a required blast-radius verification alongside `q011`'s relational
-one (section 9).
+`ABLATION_CONFIGS` row 5 still has `graph_route_by_intent` at its class
+default (`False`) — never made the persisted default. `run_benchmark` has no
+`embedder` parameter, no caching, and nothing validates the live corpus
+against Session C before spending. This is the gap Day 14 closes.
 
-**A third round of review found four further corrections, all applied here**:
-the blast-radius smoke question was `q014`, whose own top two candidates
-(`aws_security_group.rds`, `module.vpc_endpoints`) are both immutable
-`graph_seed_n=3` seeds — meaning the check asked the algorithm to produce
-exactly the outcome section 5.4's seed-exclusion rule is designed to prevent;
-replaced with `q016`, whose expected dependent
-(`output.vpc_endpoints_security_group_arn`) sits at rank 4, genuinely eligible
-for promotion (section 9). The `ORDER BY resource.address, edges.ref_text,
-resource.id` tiebreaker from the prior round can still tie — two edge rows for
-the same pair with identical `ref_text` also share the same joined
-`resource.id` — so `edges.id` is added as a fourth, genuinely final tiebreaker
-(section 5.3). The BM25-only graph integration test assumed two specific
-addresses would be absent from the candidate pool without forcing it; it now
-sets `bm25_k=1` explicitly so that's guaranteed by construction, not assumed
-(section 8). The smoke script constructed a fresh `CrossEncoderReranker` for
-each of its two questions; it now prepares one instance and shares it across
-both (section 9).
+**This is the fourth revision.** The third revision fixed the latency-bias
+bug conceptually (pre-warming) and split Day-14-specific validation into a
+dedicated wrapper, but its *pseudocode* had five remaining implementation
+problems, all fixed here:
+1. **A real circular import**: `execute_evaluation_run` (in `runner.py`)
+   called `confirm_cost` (in `scripts/run_eval.py`), but `run_eval.py`
+   already imports `runner.py` — `runner.py` cannot import back from
+   `run_eval.py`. Fixed by removing all prompting from `runner.py` entirely
+   (section 2).
+2. **A silently undocumented latency change to the generic report**: once
+   `run_eval.py` also pre-warms, its own reports need the same
+   `embedding_precomputation`/`latency_methodology` honesty Day 14's report
+   gets. Fixed by making these three fields part of `build_report`'s generic
+   contract (section 4).
+3. **A reranker-preparation ownership bug**: the previous pseudocode called
+   `.prepare()` inside `execute_evaluation_run` *and* had `run_benchmark`
+   check `prepare_ms` again — meaning by the time row 4 ran, the shared
+   instance was already prepared, so row 4 would dishonestly report
+   "reused." Fixed by making `run_benchmark` the **only** place `.prepare()`
+   is ever called (section 5).
+4. **A test-order-fragile separation check** (`sys.modules` membership).
+   Replaced with a behavioral test (section 8).
+5. **An incomplete vector-usage condition** (`config.use_vector` alone,
+   ignoring `vector_k`). Fixed to `config.use_vector and config.vector_k >
+   0` everywhere it's used (section 6).
 
-**A fourth round of review found two further corrections, all applied here**:
-the duplicate-edge determinism test (round 3's fix) asked for an assertion that
-cannot be made — `GraphNeighbor` does not select `edges.id`, so two duplicate
-edge rows sharing the same `(source_id, target_id, ref_text)` produce two
-*completely identical* `GraphNeighbor` objects, and no test can tell which
-returned object corresponds to which `edges.id` in order to assert their
-relative order. Section 8's determinism test is corrected to keep the
-real-database, different-`ref_text` case (whose order **is** observable) and to
-verify the `edges.id` tiebreaker with a separate, focused query-construction
-test that captures and inspects the literal SQL text `dependents`/
-`dependencies` execute, rather than trying to distinguish indistinguishable
-returned rows. Separately, `q016`'s explanation overstated what its promotion
-demonstrates: the accepted Day 12 report places
-`output.vpc_endpoints_security_group_arn` at rank 4, and evaluation's
-`final_k=10` — so it is already inside the final context before graph
-expansion ever runs. `q016` verifies dependents-direction lookup, promotion
-(repositioning next to its seed with correct provenance) and preserved score
-for an **already-in-final_k** candidate; it does not demonstrate recovering a
-candidate from beyond `final_k`. That recovery scenario remains `q011`'s job
-(`module.vpc` genuinely fell outside the Day 12 top 10) and the dedicated rank
-11–50 promotion unit test (section 8). Section 9's `q016` narrative, the
-acceptance criteria, the audit, and the summary are all corrected accordingly.
+## 1. Official Day 14 configuration
 
-This plan replaces the prior Day 13 plan (section 1 is a short completed-baseline
-summary for Day 12). It covers **Day 13 only** — graph expansion.
-
-**Collaboration routine, unchanged:**
-1. Explain each step in plain language before it happens.
-2. You decide whether you implement it or Codex does.
-3. Run the focused tests for that step before moving on.
-4. Review the diff.
-5. Run the complete suite.
-6. Run the smoke test, then the full evaluation, only after your explicit
-   confirmation — two separate confirmations, matching Day 12's precedent.
-7. Commit the accepted Day 13 code and the accepted Day 13 report separately.
-
-`.venv/bin/python` is used in every command; never bare `python`/`python3`.
-
-## 1. Completed baseline — Day 12 (for context, not re-execution)
-
-- `ripple/retrieval/rerank.py`, `pipeline.py`'s rerank stage, `RetrievedBlock.
-  embed_text` (required), and the fourth ablation row (`"+ Cross-encoder
-  rerank"`) are implemented, tested, and accepted.
-- The accepted Day 12 report
-  (`data/eval_results/2026-08-31T00-52-40-886297Z.json`, `schema_version: 2`) and
-  `data/eval_results/DAY_12_ANALYSIS.md` are **not modified by this cycle** — Day
-  13 adds a new, separate report.
-- Measured Day 12 numbers this plan's row five is compared against:
-
-  | Configuration | Recall@5 | Recall@10 | MRR | Latency (ms) |
-  |---|---:|---:|---:|---:|
-  | Vector only | 0.746 | 0.821 | 0.696 | 2341.32 |
-  | Vector + BM25 | 0.804 | 0.835 | 0.696 | 4831.00 |
-  | Vector + BM25 + RRF | 0.702 | 0.821 | 0.658 | 4093.96 |
-  | + Cross-encoder rerank | 0.854 | 0.900 | 0.746 | 6644.35 |
-
-- `relational` remains the weakest category under reranking alone: Recall@5
-  0.500, Recall@10 0.600, MRR 0.163 (`DAY_12_ANALYSIS.md`) — reranking can only
-  reorder candidates that retrieval already found; it cannot add a missing
-  dependency edge. This is exactly the gap SPEC frames graph expansion as closing.
-- **`q011` is a named, accepted regression from Day 12**: `"What block does the
-  DynamoDB endpoint policy directly depend on for its VPC ID?"` (relational,
-  expected `["module.vpc"]`) went from a partial hit under RRF to a **complete
-  miss** under reranking — `module.vpc` moved from rank 8 (pre-rerank) to
-  somewhere outside the top 10 after reranking, though it remains **within** the
-  up-to-50-item reranked candidate pool (it was never dropped by retrieval itself
-  — reranking only reordered it). This plan's smoke test (section 9) uses this
-  question specifically, and section 5.4/5.7's corrected algorithm is what makes
-  recovering it actually possible (the prior draft's algorithm could not have).
-- **Corrected test baseline, stated honestly rather than asserted as one number
-  (finding 4 of this revision)**: `.venv/bin/python -m pytest -q` currently
-  **collects 213 tests**. Two different, both-legitimate results exist for this
-  baseline, from two different environments:
-  - **This session's own verification, with a reachable database**: 213 passed,
-    0 skipped, 0 failed (run fresh during Day 12's acceptance review, this
-    conversation).
-  - **The accepted Day 12 commit's own recorded acceptance run** (`DAY_12_
-    ANALYSIS.md`, whichever environment Codex ran it in): **197 passed, 16
-    environment-dependent integration tests skipped, 0 failed** — the 16 skips
-    are the DB-dependent, skip-if-unreachable tests (`test_db.py`, `test_bm25.py`,
-    `test_graph.py`, `test_pgvector_store.py`, and the new Day 12 integration
-    test), correctly skipping when that environment had no reachable database.
-  Both are legitimate, zero-failure results; they differ only in database
-  reachability, not in code correctness. **This plan does not claim "213 passing"
-  as an unconditional fact** — whoever runs Day 13's acceptance suite should
-  state which of these two shapes they got, and should specifically **aim for
-  the DB-enabled shape** (213 passed, 0 skipped) so the new Day 13 database
-  integration test (section 8) actually runs and is not silently skipped.
-
-## 2. Objective
-
-Wire graph expansion (SPEC 9.8) into the pipeline behind `RetrievalConfig.
-use_graph`, add graph-relationship provenance to `RetrievedBlock` and the
-rendered prompt context, add the fifth ablation row (`"+ Graph expansion"`, SPEC
-10.3), and produce one real, accepted, investigated evaluation report — without
-query rewriting, RRF tuning, Pinecone work, or any change to the cross-encoder.
-
-## 3. Relevant SPEC.md requirements, quoted
-
-- **Section 6 (Architecture)**: `... RRF fusion → Cross-encoder reranking → Graph
-  expansion → Context construction → LLM`. Graph expansion is the stage
-  immediately after reranking and immediately before the blocks are formatted
-  into the prompt.
-- **Section 9.8 (Graph expansion)**, quoted in full:
-  ```sql
-  -- dependents: what references this block (blast radius)
-  SELECT r.* FROM edges e JOIN resources r ON r.id = e.source_id
-  WHERE e.target_id = $1;
-
-  -- dependencies: what this block references
-  SELECT r.* FROM edges e JOIN resources r ON r.id = e.target_id
-  WHERE e.source_id = $1;
-  ```
-  > After reranking, for each of the top N results (default 3), fetch neighbors...
-  > Limits, all configurable: depth 1, at most 10 added blocks total, deduplicated
-  > against what retrieval already returned. Added blocks are marked with their
-  > relationship and the block they came from, so the prompt can say *"referenced
-  > by aws_instance.node"*.
-  >
-  > Do not expand blindly to depth 2 or more. In a VPC module almost everything
-  > reaches the VPC within two hops, so depth 2 returns most of the repo.
-- **Section 9.10 (Prompt)**, context format per block:
-  ```
-  [3] aws_security_group.worker
-      examples/complete/main.tf:42-67
-      Referenced by: aws_instance.node
-      <body>
-  ```
-  This is the only worked example SPEC gives of relationship rendering. Section
-  5.5 resolves the exact direction-to-label mapping this example only partially
-  specifies (it shows one direction; this plan needs both).
-- **Section 9.11 (RetrievalConfig)**: `use_graph: bool = True`, `graph_seed_n:
-  int = 3`, `graph_max_added: int = 10` — already exactly present in
-  `ripple/config.py` (section 4 confirms). **`use_graph` defaults to `True`** —
-  section 4.1 shows why this matters as much as `use_rerank`'s default did on Day
-  12.
-- **Section 10.2 (Metrics/latency)**: `graph` is one of the named per-stage
-  latency fields — `graph_ms` joins the existing pattern. No changes needed to
-  `ripple/evaluation/metrics.py`.
-- **Section 10.3 (Ablation table)**: row five's exact label is `"+ Graph
-  expansion"`.
-- **Section 11, Day 13**, quoted: `"Wire graph.py into the pipeline behind
-  use_graph, with the limits from section 9.8. Verify on a blast-radius question
-  that dependents appear in the final context. Done when: row five exists, and
-  the per-category breakdown shows where it helped."` — section 9 of this plan
-  now requires exactly this blast-radius verification explicitly, not just the
-  relational `q011` check.
-- **Section 12 (Risk register)**: `"Graph expansion shows no gain | Usually means
-  the benchmark is all lookup questions. Check category mix on Day 9."` — not a
-  concern here: the benchmark's category mix (15/10/8/7) was built specifically so
-  `relational`/`blast_radius` carry real weight (Day 9).
-
-## 4. Current-state audit — what the real code does today, read fresh this cycle
-
-**`ripple/retrieval/graph.py`** — `GraphNeighbor` has `id, address, file_path,
-start_line, end_line, body, ref_text`. **No `embed_text`, no `score`.**
-`dependents(resource_id)` returns blocks whose body references `resource_id`
-(`WHERE edges.target_id = %s`, joined to the referencing/`source_id` block) —
-i.e., blocks that **depend on** the given resource. `dependencies(resource_id)`
-returns blocks the given resource's body references (`WHERE edges.source_id =
-%s`, joined to the referenced/`target_id` block) — i.e., the blocks the given
-resource itself **depends on**. Both queries currently `ORDER BY
-resource.address` only — **not a total order** (section 5.3 fixes this).
-Neither function is called from `pipeline.py` today.
-
-**`ripple/retrieval/vector_store.py`** — `RetrievedBlock` has `id, address,
-file_path, start_line, end_line, body, embed_text, score` — `score: float`,
-required, no graph-relationship fields.
-
-**`ripple/retrieval/pipeline.py`** — builds `candidates` through vector/bm25/
-fusion/rerank exactly as Day 12 left it, then does `blocks = candidates[:
-config.final_k]`. **No graph stage exists.** `_build_config_json`'s `"executed"`
-dict hardcodes `"graph": False`. `run_pipeline` has no graph-related parameter.
-
-**`ripple/llm/prompts.py`** — `format_context` renders `"[{i}] {address}\n
-{file_path}:{start_line}-{end_line}\n{body}"` for every block. **There is no
-"Referenced by"/"Depends on" line at all today** — SPEC 9.10's example format
-line has never been implemented, for any block, graph-sourced or not.
-
-**`ripple/config.py`** — `RetrievalConfig` already has `use_graph: bool = True`,
-`graph_seed_n: int = 3`, `graph_max_added: int = 10`, matching SPEC 9.11 exactly.
-**No change needed here.**
-
-**`ripple/evaluation/runner.py`** — `ABLATION_CONFIGS` has exactly the four Day
-8–12 rows. `run_benchmark`/`build_report` are generic over `ConfigResult` and
-need no structural change for a fifth row (section 5.9 explains why graph needs
-no new report-schema field, unlike reranking's `reranker_json`).
-
-**`scripts/run_eval.py`** — confirmed still fully generic over `ABLATION_CONFIGS`'
-length (unchanged since Day 12). **No changes needed.**
-
-### 4.1 The `use_graph` default-to-`True` problem — audited across every existing `RetrievalConfig(...)` in `tests/test_pipeline.py`
-
-This is the exact same class of defect Day 12's review caught for `use_rerank`,
-now present for `use_graph`: **`RetrievalConfig.use_graph` defaults to `True`,
-and every single `RetrievalConfig(...)` construction in `tests/test_pipeline.py`
-today — all 21 of them — never sets `use_graph`.** Once graph expansion is wired
-in, every one of these tests would start executing the new graph stage, and —
-for the majority of them, whose candidate lists are non-empty — would attempt a
-**real, unmocked `graph.dependents`/`dependencies` call against whatever
-database `ripple.db.get_connection()` resolves to** in that test process.
-
-| Test | Line | Candidates non-empty at graph stage? | Verdict |
-|---|---|---|---|
-| `test_run_pipeline_vector_only` | 130 | yes | **must add `use_graph=False`** |
-| `test_run_pipeline_bm25_only_without_openai_key` | 160 | yes | **must add `use_graph=False`** |
-| `test_run_pipeline_fuses_vector_and_bm25_results` | 191 | yes | **must add `use_graph=False`** |
-| `test_run_pipeline_concatenates_when_rrf_is_disabled` | 234 | yes | **must add `use_graph=False`** |
-| `test_run_pipeline_with_both_retrievers_disabled` | 257 | empty | **must add `use_graph=False`** (exact-key-set assertions) |
-| `test_config_json_separates_requested_and_executed_stages` | 273 | empty | **must add `use_graph=False`** — asserts `executed["graph"] is False`; once `executed.graph` becomes config-driven (section 5.7), that's only still true if the config disables it |
-| `test_config_json_records_executed_fusion_method` (×2 params) | 311 | empty | **must add `use_graph=False`** |
-| `test_unsupported_vector_backend_fails_before_external_calls` | 332 | never reached (raises earlier) | **must add `use_graph=False`** for audit consistency |
-| `test_unused_unsupported_vector_backend_does_not_raise` | 350 | empty | **must add `use_graph=False`** |
-| `test_nonpositive_final_k_returns_no_final_blocks` (×2 params) | 375 | yes | **must add `use_graph=False`** |
-| `test_nonpositive_vector_k_skips_embedding_and_query` (×2 params) | 398 | empty | **must add `use_graph=False`** |
-| `test_nonpositive_bm25_k_returns_no_bm25_results` (×2 params) | 422 | empty | **must add `use_graph=False`** |
-| `test_negative_rrf_k_raises_when_rrf_runs` | 443 | never reached (raises earlier) | **must add `use_graph=False`** |
-| `test_negative_rrf_k_is_ignored_when_rrf_is_disabled` | 460 | yes | **must add `use_graph=False`** |
-| `test_negative_rrf_k_is_ignored_with_only_one_retriever` (×2 params) | 486 | yes | **must add `use_graph=False`** |
-| `test_final_stage_matches_truncated_pipeline_blocks` | 515 | yes | **must add `use_graph=False`** |
-| `test_disabled_rerank_never_calls_reranker` | 540 | yes | **must add `use_graph=False`** |
-| `test_rerank_uses_fused_top_n_before_final_k` | 570 | yes | **must add `use_graph=False`** |
-| `test_enabled_rerank_runs_with_vector_only` | 604 | yes | **must add `use_graph=False`** |
-| `test_enabled_rerank_records_empty_stage_for_no_candidates` | 627 | empty | **must add `use_graph=False`** |
-| `test_nonpositive_rerank_top_n_passes_empty_pool` | 657 | empty | **must add `use_graph=False`** |
-
-**Net result: all 21 existing sites get `use_graph=False` added — zero
-exceptions.** The new graph tests (section 8) are the only places
-`use_graph=True` appears in this file, and every one injects fake
-`dependents`/`dependencies` functions.
-
-### 4.2 `tests/test_runner.py`'s existing assertion that will need updating
-
-`test_ablation_configs_are_explicit_and_support_recall_at_10` currently asserts
-`config.use_graph is False` **unconditionally, for every row** — this must
-become conditional on row index once the fifth row sets `use_graph=True`
-(section 5.9/8).
-
-## 5. Design decisions
-
-### 5.1 Pipeline ordering — resolved and now confirmed (no longer a sign-off item)
-
-**Graph expansion runs after reranking (or after fusion/retrieval, if reranking
-is disabled) and *before* `final_k` truncation — graph-discovered blocks
-therefore compete for slots inside `final_k`; they are not appended after it.
-You have approved this decision explicitly.** The reasoning, unchanged: if
-graph-discovered blocks were appended *after* an already-`final_k`-truncated
-(10-item, for evaluation) base list, they would occupy positions 11+ in
-`result.blocks`, and SPEC's own `recall_at_k` formula (`set(retrieved[:k])`)
-means a block at position 11+ can never appear in `retrieved[:10]` or
-`retrieved[:5]` — making graph expansion structurally incapable of ever
-affecting a Recall@5/Recall@10 number, contradicting SPEC's Day 13 "Done when"
-and the risk register's expectation of a measurable gain.
-
-**What changes this revision is *how* blocks compete for those slots**
-(sections 5.4/5.7) — the prior draft's naive "skip if present anywhere in the
-top 50" dedup rule technically kept this ordering decision but implemented it in
-a way that could never actually promote a real, relevant, lower-ranked
-candidate — the exact bug this revision fixes. The ordering decision itself
-(graph before `final_k`) is unchanged and confirmed.
-
-**Consequence, stated plainly, unchanged**: this is a genuine trade, not a free
-addition — promoting or inserting a graph-discovered block ahead of a
-lower-ranked retrieval candidate can push that candidate below `final_k` and out
-of the result entirely. The per-category breakdown (section 9) is where you see
-whether the trade was worth it.
-
-**Context construction**: `result.blocks` is still exactly the list sent to
-`format_context` — capped at `final_k` (10 for evaluation). Graph expansion
-never causes more than `final_k` blocks to reach the prompt.
-
-### 5.2 Seeds and limits
-
-- **Seeds**: the first `graph_seed_n` entries of the candidate list at the point
-  graph expansion runs (post-rerank, pre-`final_k`), in that list's existing
-  rank order — a strict prefix, not a re-sort, captured as an **immutable
-  snapshot** (`seeds = candidates[:seed_n]`) before any promotion/insertion
-  begins. This snapshot, and the `seed_ids` set derived from it, never change
-  during the expansion pass — satisfying "seed selection must still use an
-  immutable snapshot of the original top `graph_seed_n` candidates" exactly.
-- **`graph_seed_n <= 0`**: no seeds, no expansion. `seed_n = max(config.
-  graph_seed_n, 0)`; `candidates[:0] == []` — no negative-slice reinterpretation
-  risk.
-- **`graph_max_added <= 0`**: no promotions and no additions, regardless of how
-  many seeds or neighbors exist. `max_added = max(config.graph_max_added, 0)`;
-  the shared `action_count < max_added` guard (section 5.7) is `False` from the
-  start.
-- **Depth is exactly one, structurally**: the seed loop iterates over the
-  **original, unmodified** pre-graph `candidates` list and the **immutable**
-  `seeds`/`seed_ids` snapshot; neither a freshly-added block nor a promoted
-  block is ever added to `seed_ids` or iterated over as a new seed. There is no
-  recursive call and no code path that could reach a depth-two neighbor. Section
-  8's dedicated test proves `dependents`/`dependencies` are called **only** with
-  the original seeds' `id`s.
-- **`graph_max_added` is a single, global cap covering both promotions and
-  fresh additions together** — an explicit, tested decision (section 5.4),
-  not left ambiguous.
-
-### 5.3 Both edge directions, and a genuinely total deterministic order
-
-For each seed, **both** `graph.dependents(seed.id)` and
-`graph.dependencies(seed.id)` are checked — **dependents first, then
-dependencies**, matching SPEC 9.8's own SQL comment order. Seeds are processed
-in the candidate list's existing rank order.
-
-**Corrected this revision, made genuinely total (a second fix, not just the
-first)**: `graph.py`'s two queries change their `ORDER BY` from
-`resource.address` alone to **`resource.address, edges.ref_text, resource.id,
-edges.id`**. `resource.address` alone is not sufficient: if the same resource
-pair were ever connected by more than one edge row with different `ref_text`
-values (e.g. a data anomaly, a future relaxation of Day 4's one-edge-per-pair
-dedup rule, or a manually inserted test fixture — section 8 constructs exactly
-this scenario), two rows would tie on `resource.address` and their relative
-order would be database-implementation-defined. `edges.ref_text` breaks that
-tie. **`resource.id` alone is not a sufficient final tiebreaker either — this
-was wrong in the immediately prior revision of this plan and is corrected
-here**: two edge rows connecting the *same* `(source_id, target_id)` pair with
-the *same* `ref_text` also join to the *same* `resource.id` (it's the identical
-resource row on both sides of the join), so all three of `address`, `ref_text`,
-and `id` can tie simultaneously, leaving the order still
-implementation-defined. **`edges.id`** — the edge row's own primary key, always
-unique per row regardless of how many columns of the *joined* resource happen
-to match — is the fourth and genuinely final tiebreaker. `GraphNeighbor` itself
-does not need to expose `edges.id` as a returned field; it is used only inside
-`ORDER BY`. **No new randomness is introduced anywhere in this stage** — the
-entire expansion is a pure function of `candidates`' (already-deterministic)
-order plus this now-genuinely-total database order.
-
-### 5.4 Deduplication and promotion — the exact three-case rule, replacing the prior "skip if present" bug
-
-**The prior draft's bug, precisely**: it computed `known_ids = {block.id for
-block in candidates}` once (the *entire* up-to-50-item reranked pool) and
-skipped *any* discovered neighbor whose `id` was already in that set —
-regardless of *where* in the pool it was. A neighbor sitting at reranked rank 30
-is "already retrieved" in the sense that dedup cares about (it was already found
-by earlier stages), but it is *not* going anywhere near `final_k=10` on its own
-— and the prior algorithm had no mechanism to move it there. This is why `q011`
-could fail the smoke test even when `module.vpc` is a real, correct dependency:
-if it happened to already be present somewhere past rank 10 in the reranked
-pool, it would be silently skipped, never promoted, and cut by `final_k` exactly
-as if graph expansion had never run.
-
-**Corrected rule — three cases, not one**, evaluated for every neighbor
-discovered from a seed, in traversal order (section 5.3), against the
-**immutable** pre-graph `candidates` snapshot and its position index
-(`original_position: dict[id, int]`, built once before expansion starts):
-
-1. **Absent from `candidates` entirely** (`original_position.get(neighbor.id) is
-   None`) → **add** it fresh, immediately after the seed, with graph provenance
-   attached and `graph_score_status="unscored"` (section 5.5 — it was never
-   independently scored).
-2. **Present, and it is itself one of the immutable seeds**
-   (`neighbor.id in seed_ids`) → **leave it completely untouched**: no move, no
-   provenance, no duplicate, not counted toward `graph_max_added`. This is the
-   *only* case in which a discovered neighbor can already be "ranked earlier
-   than the graph insertion position" — since `seeds = candidates[:seed_n]` is a
-   prefix of a fully rank-ordered list, **every** non-seed candidate is,
-   definitionally, ranked worse than **every** seed; there is no other
-   configuration in which an existing candidate could already outrank the
-   insertion point. Excluding seeds from promotion also avoids a block
-   simultaneously being both an independent seed *and* a labeled "dependent of
-   another seed" — two conflated identities this plan avoids on purpose.
-3. **Present, and it is not a seed** (`original_position.get(neighbor.id)` is a
-   real, non-seed position) → **promote** it: locate the original block object
-   at that position, `dataclasses.replace(...)` it with the graph-provenance
-   fields set and `graph_score_status="promoted"` (its own `score` field is left
-   completely unchanged — section 5.5), remove its old occurrence (tracked via
-   `moved_ids`, checked at the top of the main loop so its original slot is
-   skipped rather than duplicated), and insert the replacement immediately after
-   the seed, exactly like a fresh addition.
-
-**First discovery wins, across seeds and directions, unchanged in spirit from
-the prior draft**: a single `handled_ids: set[int]` accumulates across the
-*entire* expansion stage; once a neighbor `id` has been decided (added,
-promoted, or found to be a seed), it is never reconsidered by a later seed or
-direction. If the same block is reachable as both a dependent of seed A and a
-dependency of seed B, only the first-reached occurrence's relationship/origin/
-`ref_text` is recorded — this is unchanged from the prior draft's rule, now
-explicitly tested (section 8) with **duplicate neighbor rows carrying different
-`ref_text` values**, to prove which provenance wins under the new total
-`ORDER BY` (section 5.3).
-
-**`graph_max_added` counts promotions and additions identically, on one shared
-counter — an explicit choice, not left ambiguous**: SPEC 9.8 frames the limit as
-"at most 10 added blocks total," and a promotion is just as much a
-graph-driven change to the result (it moves a block's position and attaches
-provenance) as a fresh addition is. Counting them separately would let
-promotions bypass the cap entirely — e.g. relocating 50 low-ranked blocks "for
-free" while 10 more fresh additions are also allowed — which would let graph
-expansion touch far more of the result than SPEC's stated ceiling intends.
-Section 8 has a dedicated test proving the shared cap is exact (a mix of
-promotions and additions that together hit `graph_max_added` and no more).
-
-**Preserve exactly one output occurrence per resource id**: guaranteed by
-construction — a promoted candidate is removed from its old slot (`moved_ids`)
-and appears exactly once at its new slot; a fresh addition appears exactly once
-at its insertion slot; an untouched candidate (including every excluded seed)
-appears exactly once at its original slot. No id can appear twice in
-`augmented`.
-
-**Self-loops** remain already impossible by construction — Day 4's reference
-extraction explicitly excludes `source_id == target_id` edges (SPEC 9.2).
-
-### 5.5 Graph provenance and honest score representation — corrected this revision
-
-**Four new trailing fields on `RetrievedBlock`** (one more than the prior
-draft), and **`score`'s type widens to `float | None`** — still a required
-field (every constructor still passes it explicitly; only its accepted value
-type grows to include `None`), not a separate result/provenance type:
+Unchanged from every prior revision — one field on row 5 only:
 
 ```python
-@dataclass
-class RetrievedBlock:
-    id: int
-    address: str
-    file_path: str
-    start_line: int
-    end_line: int
-    body: str
-    embed_text: str
-    score: float | None                       # widened this revision
-    graph_relationship: str | None = None     # "dependent" | "dependency" | None
-    graph_origin_address: str | None = None   # the seed address this came from
-    graph_ref_text: str | None = None         # the literal reference text
-    graph_score_status: str | None = None     # "promoted" | "unscored" | None
+(
+    "+ Graph expansion",
+    RetrievalConfig(
+        use_vector=True, use_bm25=True, use_rrf=True, use_rerank=True,
+        use_graph=True, use_rewrite=False, final_k=10,
+        graph_route_by_intent=True,   # new — makes Session C's accepted policy explicit
+    ),
+),
 ```
 
-**The prior draft's problem, precisely**: a freshly-added graph-only block
-inherited its *seed's* reranker score unchanged. That score was never computed
-against the added block at all — the cross-encoder scored the seed's
-`(question, seed.embed_text)` pair, not `(question, neighbor.embed_text)`.
-Displaying that number next to the neighbor in `stages_json`/`result.blocks`
-could be misread as "the model rated this block's relevance at 0.94," which is
-false — the model never saw this block.
+`RetrievalConfig`'s class-level default for `graph_route_by_intent` stays
+`False`; `ripple/config.py` is not modified; rows 1–4 are untouched.
 
-**Corrected representation — chosen and documented, per case**:
-- **A promoted existing candidate keeps its own original score, unchanged** —
-  it *was* independently scored (by vector search, BM25, and/or the
-  cross-encoder, whichever stages ran), and that score remains an honest,
-  real measurement of relevance. `graph_score_status="promoted"` records that
-  this block's position/provenance were touched by graph expansion, without
-  implying its score was.
-- **A genuinely new graph-only block gets `score=None` and
-  `graph_score_status="unscored"`** — an explicit, typed statement that no
-  retrieval or reranking stage ever scored this block, rather than a plausible-
-  looking fabricated number. This was chosen over an unscored-but-still-a-float
-  sentinel (e.g. `float("nan")`, rejected because `NaN` is not valid strict
-  JSON and some parsers reject it, unlike `null`) specifically because `None`
-  serializes to JSON `null` — a value every JSON consumer already understands as
-  "absent," with zero risk of being misread as a real number.
-- **`stages_json` distinguishes the two explicitly**: `_serialize_graph`
-  (section 5.7) emits both `"score"` (the real value, possibly `null`) and a
-  separate `"score_status"` key (`"promoted"` or `"unscored"`) for every entry
-  in the graph stage's audit trail — a reader never has to guess which kind of
-  score they're looking at.
+## 2. `runner.py` performs no prompting — the circular-import fix
 
-**Downstream type/serialization effects, inspected before choosing (not
-assumed)**:
-- `fusion.py` and `rerank.py`'s sort keys (`-block.score` / `(-block.score,
-  block.address)`) never encounter a graph-added block — both stages run
-  *before* graph expansion in the pipeline, and a `None`-scored block is never
-  constructed until after both have already finished. No change needed to
-  either file, and no risk of `-None` raising `TypeError`.
-- `ripple/evaluation/metrics.py`'s `score_question`/`aggregate` and
-  `runner.py`'s `run_benchmark` never read `.score` at all — only `.address` (to
-  build `retrieved`) and `.latency` are consumed for scoring. `score=None` on a
-  graph-only block has **zero** effect on any Recall/Precision/MRR computation.
-- `dataclasses.asdict(...)` and `json.dump(...)` both serialize `None` to `null`
-  natively — no change needed to `build_report`, `write_report`, or
-  `scripts/run_eval.py` for this.
-- No existing test in `test_pipeline.py`, `test_fusion.py`, `test_rerank.py`, or
-  `test_runner.py` asserts `isinstance(block.score, float)` or otherwise rejects
-  `None` — confirmed by the same fresh read that produced section 4's audit;
-  every existing assertion compares `.score` against a concrete float value on
-  blocks that are never graph-touched, so widening the type is invisible to
-  them.
+**The problem, precisely**: `scripts/run_eval.py` does (and must continue to
+do) `from ripple.evaluation.runner import ...`. If `ripple/evaluation/
+runner.py`'s `execute_evaluation_run` called `confirm_cost` — which lives in
+`scripts/run_eval.py` — that would require `runner.py` to import from
+`run_eval.py`, an import cycle. It also violates a real architectural
+boundary: `runner.py` is a library module (already imported by both CLI
+scripts and every test file), and terminal `input()` prompting has no
+business inside it.
 
-**Why a separate provenance type was still rejected** (unchanged reasoning):
-`pipeline.py`'s candidate list, `fusion.py`, `format_context`, and every
-existing test fixture all operate on `list[RetrievedBlock]` uniformly; a second
-type would force every consumer to branch on type. Four **optional** fields
-(three unchanged from the prior draft, one new) and one widened-but-still-
-required field cost nothing to every existing `RetrievedBlock(...)` construction
-across the repository — zero fixture changes required anywhere except the new
-graph-specific tests.
-
-**Direction → prompt-label mapping, unchanged from the prior draft, derived from
-the two example strings the original Day 13 request supplied**:
-- A block found via **`dependents(seed)`** (the block depends on/references the
-  seed) → `graph_relationship = "dependent"` → rendered as **`"Depends on:
-  {seed_address}"`**.
-- A block found via **`dependencies(seed)`** (the seed references the block) →
-  `graph_relationship = "dependency"` → rendered as **`"Referenced by:
-  {seed_address}"`**.
-
-`ref_text` is retained on the block and in `stages_json` for auditability but is
-not rendered in the prompt line itself, matching SPEC 9.10's own example exactly.
-
-### 5.6 `GraphNeighbor` gets a real `embed_text`, deliberately — not a placeholder
-
-Unchanged from the prior draft: `GraphNeighbor` gains one new required field,
-`embed_text: str`, populated from a real `resources.embed_text` column read in
-both `dependents`/`dependencies`' `SELECT` statements (positioned right after
-`body`, with `ref_text` moved last to match: `id, address, file_path,
-start_line, end_line, body, embed_text, ref_text`). `GraphNeighbor` does **not**
-gain a `score` field — `score` (and now `graph_score_status`) are
-`RetrievedBlock`-only concepts, populated by `pipeline.py` when converting a
-`GraphNeighbor` into a `RetrievedBlock` (section 5.5/5.7).
-
-### 5.7 Pipeline integration — the exact algorithm, corrected
-
-`pipeline.py` imports `dependents`/`dependencies` directly from
-`ripple.retrieval.graph`, matching the existing `build_index` import-and-
-monkeypatch convention — tests patch `pipeline.dependents`/`pipeline.
-dependencies`. No new injectable class is introduced for graph: `dependents`/
-`dependencies` are cheap, stateless, per-call database reads with no model to
-load and no reuse-across-questions cost, unlike the reranker.
-
-Inserted between the existing rerank block and the existing `final_k`
-truncation — **`final_k`'s own line of code moves down one block, its logic
-unchanged**:
+**Fix — `execute_evaluation_run` takes already-approved `entries`/`configs`
+and does no prompting or confirmation of any kind**:
 
 ```python
-if config.use_graph:
-    graph_start = time.perf_counter()
-    seed_n = max(config.graph_seed_n, 0)
-    max_added = max(config.graph_max_added, 0)
-    seeds = candidates[:seed_n]                 # immutable snapshot
-    seed_ids = {block.id for block in seeds}
-    original_position = {
-        block.id: position for position, block in enumerate(candidates)
+# ripple/evaluation/runner.py
+@dataclass
+class EvaluationRun:
+    results: list[ConfigResult]
+    embedding_cache: dict
+    embedding_precomputation: dict
+    latency_methodology: dict
+
+
+def execute_evaluation_run(
+    repo_id: int,
+    entries: list[BenchmarkEntry],
+    configs: list[tuple[str, RetrievalConfig]],
+) -> EvaluationRun:
+    """Construct providers, pre-warm embeddings, run every selected
+    configuration, and return the results plus generic execution metadata.
+    Performs no prompting and no cost confirmation — callers confirm first."""
+    uses_vector = any(
+        config.use_vector and config.vector_k > 0
+        for _name, config in configs
+    )
+    uses_rerank = any(config.use_rerank for _name, config in configs)
+    unique_questions = sorted({entry.question for entry in entries})
+
+    shared_embedder = None
+    prewarm_total_ms = 0.0
+    if uses_vector:
+        shared_embedder = CachingEmbeddingProvider(OpenAIEmbeddingProvider())
+        prewarm_start = time.perf_counter()
+        for question in unique_questions:
+            shared_embedder.embed([question])
+        prewarm_total_ms = (time.perf_counter() - prewarm_start) * 1000
+        print(f"Pre-warmed embedding cache: {len(unique_questions)} unique "
+              f"questions in {prewarm_total_ms:.0f}ms "
+              f"({prewarm_total_ms / max(len(unique_questions), 1):.1f}ms/question)")
+
+    provider_calls_before_run = shared_embedder.request_count if shared_embedder else 0
+
+    # section 5 — constructed here, but NOT prepared here; run_benchmark
+    # owns the only call to .prepare() in the whole run.
+    shared_reranker = CrossEncoderReranker() if uses_rerank else None
+
+    results = [
+        run_benchmark(
+            repo_id=repo_id, entries=entries, config=config, config_name=config_name,
+            embedder=shared_embedder, reranker=shared_reranker,
+        )
+        for config_name, config in configs
+    ]
+
+    provider_calls_after_run = shared_embedder.request_count if shared_embedder else 0
+
+    return EvaluationRun(
+        results=results,
+        embedding_cache={
+            "provider_calls": provider_calls_after_run,
+            "cache_hits": shared_embedder.cache_hit_count if shared_embedder else 0,
+            "unique_questions": len(unique_questions),
+        },
+        embedding_precomputation={
+            "unique_questions": len(unique_questions),
+            "provider_calls": provider_calls_before_run,
+            "total_ms": prewarm_total_ms,
+            "mean_ms_per_question": (
+                prewarm_total_ms / len(unique_questions) if unique_questions else 0.0
+            ),
+        },
+        latency_methodology={
+            "description": (
+                "The embedding cache was fully pre-warmed before any "
+                "configuration ran. Every row's vector_query_ms/total_ms "
+                "reflects only an in-memory cache lookup and the vector "
+                "database query itself — never live OpenAI embedding "
+                "network latency, for any row including the first. "
+                "Embedding network latency is measured once, separately, "
+                "as embedding_precomputation, and is excluded from every "
+                "row's own reported latency."
+            ),
+            "provider_calls_before_run": provider_calls_before_run,
+            "provider_calls_during_run": provider_calls_after_run - provider_calls_before_run,
+            "valid": provider_calls_after_run == provider_calls_before_run,
+        },
+    )
+```
+
+**Required ordering — identical in both CLIs, stated once here, both
+sections 3/7 follow it exactly**:
+1. Free validation (benchmark/address checks; Day-14 wrapper additionally
+   does Session C provenance + snapshot checks, section 7).
+2. Calculate the cost estimate (pure Python — no provider constructed yet).
+3. Display it and confirm (`confirm_cost`, unchanged, still lives in
+   `scripts/run_eval.py`).
+4. If declined, `confirm_cost` raises `SystemExit` — nothing past this point
+   ever executes.
+5. **Only after approval**, call `execute_evaluation_run`.
+6. Provider construction (inside `execute_evaluation_run`).
+7. Embedding pre-warming (inside `execute_evaluation_run`).
+8. The evaluation itself (inside `execute_evaluation_run`).
+
+**Where `confirm_cost` lives and how the Day 14 wrapper reuses it**:
+unchanged location, `scripts/run_eval.py`. `scripts/run_day14_eval.py`
+imports it directly — `from scripts.run_eval import confirm_cost` — which is
+already a proven-safe import shape in this codebase: `tests/test_run_eval.py`
+already does `from scripts import run_eval` today (confirmed by reading it),
+demonstrating `scripts` is already importable as a namespace package from the
+project root with no `scripts/__init__.py` needed. `run_day14_eval.py` uses
+the same `PROJECT_ROOT`-on-`sys.path` bootstrap `run_eval.py` already has, so
+this import resolves identically for both. No new "CLI utility module" is
+needed — reusing the existing function directly is simpler.
+
+## 3. Both CLIs — the exact `main()` sequence, side by side
+
+**`scripts/run_eval.py`** (generic — unchanged in scope from the third
+revision, corrected in mechanics):
+
+```python
+def main(argv=None):
+    args = parse_args(argv)
+    digest = benchmark_sha256(args.benchmark)
+    entries = load_validated_benchmark(args.benchmark, args.repo_id)
+    configs = select_configs(args.config)
+
+    uses_vector = any(
+        c.use_vector and c.vector_k > 0 for _name, c in configs
+    )
+    unique_questions = {entry.question for entry in entries}
+    estimated_requests = len(unique_questions) if uses_vector else 0
+
+    confirm_cost(
+        question_count=len(entries), config_count=len(configs),
+        estimated_requests=estimated_requests, skip=args.yes,
+    )
+    # --- only reached after an explicit 'y' (or --yes) ---
+
+    run = execute_evaluation_run(args.repo_id, entries, configs)
+
+    print(render_markdown_table(run.results))
+    report = build_report(
+        repo_id=args.repo_id, benchmark_path=str(args.benchmark),
+        benchmark_sha256=digest, results=run.results,
+        embedding_cache=run.embedding_cache,
+        embedding_precomputation=run.embedding_precomputation,
+        latency_methodology=run.latency_methodology,
+    )
+    output_path = timestamped_path()
+    write_report(report, output_path)
+    print(f"Wrote {output_path}")
+```
+
+**`scripts/run_day14_eval.py`** (new, Day-14-only — section 7 covers the
+Day-14-specific pieces in full; shown here only to make the shared sequence
+visually obvious):
+
+```python
+def main(argv=None):
+    args = parse_day14_args(argv)
+    digest = benchmark_sha256(args.benchmark)
+
+    session_c_report = load_session_c_reference()
+    validate_repo_matches_session_c(args.repo_id, session_c_report)
+    entries = load_validated_benchmark(args.benchmark, args.repo_id)
+    validate_benchmark_matches_session_c(digest, session_c_report)
+    validate_corpus_matches_session_c(args.repo_id, session_c_report)
+    validate_embedding_model_matches_session_c(session_c_report)
+
+    configs = ABLATION_CONFIGS
+    validate_approved_five_row_configuration(configs)
+
+    uses_vector = any(
+        c.use_vector and c.vector_k > 0 for _name, c in configs
+    )
+    unique_questions = {entry.question for entry in entries}
+    estimated_requests = len(unique_questions) if uses_vector else 0
+
+    confirm_cost(
+        question_count=len(entries), config_count=len(configs),
+        estimated_requests=estimated_requests, skip=args.yes,
+    )
+    # --- only reached after an explicit 'y' (or --yes) ---
+
+    run = execute_evaluation_run(args.repo_id, entries, configs)
+    print(render_markdown_table(run.results))
+    ...   # section 7
+```
+
+Both scripts follow section 2's eight-step ordering exactly; the only
+difference is the Day-14 wrapper's extra free-validation steps before the
+estimate is computed, and its extra post-run steps after `execute_
+evaluation_run` returns (section 7).
+
+## 4. Generic report design: `build_report` carries all three execution-
+metadata fields; Day-14-only fields stay in the wrapper
+
+**Decision: extend `build_report`, not attach-in-both-CLIs** (your preferred
+option) — `embedding_cache`, `embedding_precomputation`, and `latency_
+methodology` are all generic execution metadata describing *how the run was
+performed*, true of any caller of `execute_evaluation_run`, not a Day-14
+concept:
+
+```python
+# ripple/evaluation/runner.py
+def build_report(
+    repo_id: int, benchmark_path: str, benchmark_sha256: str,
+    results: list[ConfigResult],
+    embedding_cache: dict | None = None,
+    embedding_precomputation: dict | None = None,
+    latency_methodology: dict | None = None,
+) -> dict:
+    ...
+    report = {
+        "schema_version": 3,
+        ... # existing keys, unchanged
+        "results": [asdict(result) for result in results],
+    }
+    if embedding_cache is not None:
+        report["embedding_cache"] = embedding_cache
+    if embedding_precomputation is not None:
+        report["embedding_precomputation"] = embedding_precomputation
+    if latency_methodology is not None:
+        report["latency_methodology"] = latency_methodology
+    return report
+```
+
+**Result**: a plain `scripts/run_eval.py` run against any repository now
+also honestly documents that its latency numbers exclude live embedding
+calls — the exact gap you identified ("must not silently omit that
+information") — with **zero** Day-14-specific concepts anywhere in
+`runner.py` or the generic report shape.
+
+**Day-14-only fields remain added directly by `scripts/run_day14_eval.py`
+onto the dict `build_report` returns** (unchanged from the third revision):
+`day14_vs_session_c_ordering`, `acceptance_gates`, `embedding_accounting`,
+`day14_accepted`. `build_report` itself has and needs no parameter for any
+of these.
+
+**Schema version 3 remains appropriate** — unchanged reasoning from the
+third revision (same precedent as Day 12's `reranker_json` addition;
+confirmed by reading every consumer of a written report that nothing reads
+`schema_version` back in today).
+
+## 5. Reranker preparation — one owner, honest per-row reporting
+
+**The bug in the prior revision's pseudocode**: `execute_evaluation_run`
+called `shared_reranker.prepare()` itself, immediately after construction.
+By the time `run_benchmark` ran for row 4, `prepare_ms` was already set, so
+row 4's own `if prepare_ms is None` check would be `False` — row 4 would
+print "reused" even though *this process* never printed "prepared" for
+anyone, an honesty regression, not merely a redundant call.
+
+**Fix: `execute_evaluation_run` constructs the shared instance but never
+calls `.prepare()` (section 2's pseudocode already reflects this) — `run_
+benchmark` is the only place `.prepare()` is ever invoked, for any caller,
+Day-14 or generic**:
+
+```python
+# ripple/evaluation/runner.py
+def run_benchmark(
+    repo_id: int, entries: list[BenchmarkEntry], config: RetrievalConfig,
+    config_name: str, *,
+    embedder: EmbeddingProvider | None = None,
+    reranker: "PreparedReranker | None" = None,
+) -> ConfigResult:
+    active_reranker = None
+    reranker_json = None
+    if config.use_rerank:
+        active_reranker = (
+            reranker if reranker is not None else CrossEncoderReranker()
+        )
+        if active_reranker.prepare_ms is None:
+            active_reranker.prepare()
+            verb = "prepared"
+        else:
+            verb = "reused"
+        reranker_json = active_reranker.describe()
+        print(f"[{config_name}] reranker {verb} "
+              f"({active_reranker.prepare_ms:.0f}ms, one-time; "
+              "excluded from question latency)")
+    ...
+```
+
+**Resulting lifecycle for a real five-row run, exactly as you specified**:
+one `CrossEncoderReranker` object, constructed once in `execute_evaluation_
+run`; row 4 (`+ Cross-encoder rerank`, always processed before row 5 —
+`ABLATION_CONFIGS`' fixed order) is the first call with `config.use_rerank`
+True, sees `prepare_ms is None`, calls `.prepare()` once, prints "prepared";
+row 5 (`+ Graph expansion`) receives the identical object, sees `prepare_ms`
+already set, prints "reused." **One model load, one preparation, honest
+per-row reporting, preparation excluded from every row's question
+latency** (unchanged — `prepare()` was never inside any per-question timer
+in any revision of this plan).
+
+`reranker if reranker is not None else CrossEncoderReranker()` (not `or`)
+is unchanged from the prior revision — still needed for the same falsy-
+object-safety reason.
+
+## 6. Vector-enabled accounting — the exact, complete condition
+
+**Corrected condition, used identically everywhere it appears**: a
+configuration requires query embeddings only when `config.use_vector and
+config.vector_k > 0` — matching `pipeline.run_pipeline`'s own actual guard
+exactly (confirmed by reading it: `if config.use_vector: ... if config.
+vector_k > 0: embedder.embed(...)` — a `use_vector=True, vector_k=0`
+configuration never calls `embed()` at all). Every place the second and
+third revisions wrote `config.use_vector` alone as this condition is
+corrected to the compound form:
+
+- **Whether an embedder is constructed** (`execute_evaluation_run`, section 2).
+- **The paid-request estimate** (`uses_vector`/`estimated_requests`, both
+  CLIs, section 3).
+- **`vector_config_count`**, used in `cache_hits`'s expected value
+  (`day14_acceptance.validate_embedding_accounting`, section 7) — computed
+  as `sum(1 for _name, c in configs if c.use_vector and c.vector_k > 0)`.
+
+**The approved Day 14 five rows are unaffected in practice** — every row's
+`vector_k` is the dataclass default, `30`, never `0` — so the concrete
+expected values stay exactly what they were: `provider_calls == 40`,
+`cache_hits == 200`, `unique_questions == 40`. The fix matters for
+correctness and for any future configuration (including a hypothetical
+generic `run_eval.py` selection) that might set `vector_k=0` to skip
+embedding on purpose — that row must never be silently counted as
+"vector-enabled" for cost-estimation or cache-accounting purposes.
+
+## 7. Day-14-only validation (`ripple/evaluation/day14_acceptance.py` and `scripts/run_day14_eval.py`)
+
+**Unchanged in substance from the third revision** — repeated here only
+where the surrounding mechanics changed (sections 2/3/6); full detail is not
+re-derived where nothing about it changed.
+
+**Provenance checks** (`validate_repo_matches_session_c`, `validate_
+benchmark_matches_session_c`, `validate_corpus_matches_session_c`,
+`validate_embedding_model_matches_session_c`) — unchanged, still the first
+four things `run_day14_eval.py`'s `main()` calls, still before the cost
+estimate is even computed. Still call the now-public `runner.
+indexed_corpus_fingerprint` (renamed from `_indexed_corpus_fingerprint` in
+the third revision so a sibling module can call it).
+
+**Configuration snapshot** (`_APPROVED_DAY14_ROWS`, a list of `(name,
+asdict)` pairs; `validate_approved_five_row_configuration`) — unchanged,
+still rejects renamed/reordered/missing/extra rows and any field drift.
+
+**Post-run validation, now completed with section 6's exact condition**:
+
+```python
+# ripple/evaluation/day14_acceptance.py
+def relabel_ordering_comparison(raw: dict) -> dict:
+    """Translate compare_ordered_results' generic accepted/batched keys into
+    Day-14-specific labels without modifying that function."""
+    return {
+        **raw,
+        "differences": [
+            {
+                "entry_id": difference["entry_id"],
+                "session_c_routed": difference["accepted"],
+                "day14_row5": difference["batched"],
+            }
+            for difference in raw["differences"]
+        ],
     }
 
-    moved_ids: set[int] = set()     # promoted ids -- skip re-emitting their old slot
-    handled_ids: set[int] = set()   # every id already decided this stage
-    graph_actions: list[RetrievedBlock] = []   # promotions + additions, in order
-    augmented: list[RetrievedBlock] = []
-    action_count = 0
 
-    for position, block in enumerate(candidates):
-        if block.id in moved_ids:
-            continue                            # already relocated; no duplicate
-        augmented.append(block)
-
-        if position >= seed_n:
-            continue                            # immutable seed set, fixed above
-
-        insertions_here: list[RetrievedBlock] = []
-        for relationship, fetch in (
-            ("dependent", dependents),
-            ("dependency", dependencies),
-        ):
-            if action_count >= max_added:
-                break
-            for neighbor in fetch(block.id):
-                if action_count >= max_added:
-                    break
-                if neighbor.id in handled_ids or neighbor.id in seed_ids:
-                    continue   # first discovery wins; never move/relabel a seed
-                handled_ids.add(neighbor.id)
-
-                existing_position = original_position.get(neighbor.id)
-                if existing_position is None:
-                    new_block = RetrievedBlock(
-                        id=neighbor.id,
-                        address=neighbor.address,
-                        file_path=neighbor.file_path,
-                        start_line=neighbor.start_line,
-                        end_line=neighbor.end_line,
-                        body=neighbor.body,
-                        embed_text=neighbor.embed_text,
-                        score=None,
-                        graph_relationship=relationship,
-                        graph_origin_address=block.address,
-                        graph_ref_text=neighbor.ref_text,
-                        graph_score_status="unscored",
-                    )
-                else:
-                    original_block = candidates[existing_position]
-                    new_block = dataclasses.replace(
-                        original_block,
-                        graph_relationship=relationship,
-                        graph_origin_address=block.address,
-                        graph_ref_text=neighbor.ref_text,
-                        graph_score_status="promoted",
-                    )
-                    moved_ids.add(neighbor.id)
-
-                insertions_here.append(new_block)
-                graph_actions.append(new_block)
-                action_count += 1
-
-        augmented.extend(insertions_here)
-
-    candidates = augmented
-    latency_json["graph_ms"] = (time.perf_counter() - graph_start) * 1000
-    stages_json["graph"] = _serialize_graph(graph_actions)
-
-if config.final_k > 0:
-    blocks = candidates[: config.final_k]
-else:
-    blocks = []
+def validate_embedding_accounting(
+    embedding_cache: dict, *, unique_questions: int, entry_count: int,
+    vector_config_count: int,
+) -> dict:
+    expected_provider_calls = unique_questions
+    expected_cache_hits = entry_count * vector_config_count
+    valid = (
+        embedding_cache["provider_calls"] == expected_provider_calls
+        and embedding_cache["cache_hits"] == expected_cache_hits
+        and embedding_cache["unique_questions"] == unique_questions
+    )
+    return {
+        "expected_provider_calls": expected_provider_calls,
+        "actual_provider_calls": embedding_cache["provider_calls"],
+        "expected_cache_hits": expected_cache_hits,
+        "actual_cache_hits": embedding_cache["cache_hits"],
+        "expected_unique_questions": unique_questions,
+        "actual_unique_questions": embedding_cache["unique_questions"],
+        "valid": valid,
+    }
 ```
 
-Note that `existing_position`, once the `neighbor.id in seed_ids` check has
-already passed, can only ever be `None` (absent) or a genuine non-seed position
-— never a position earlier than the current seed's own position — which is
-exactly section 5.4's proof that seed-exclusion is the *complete* resolution of
-"already ranked earlier than the insertion point." No separate position
-comparison is needed beyond the seed-membership check.
-
-`_serialize_graph` (new, alongside the existing `_serialize`) now includes
-`score_status` alongside every other provenance field:
+**`scripts/run_day14_eval.py`'s `main()`, continuing from section 3's
+shared prefix**:
 
 ```python
-def _serialize_graph(blocks: list[RetrievedBlock]) -> list[dict]:
-    return [
-        {
-            "id": block.id,
-            "address": block.address,
-            "score": block.score,
-            "score_status": block.graph_score_status,
-            "relationship": block.graph_relationship,
-            "origin_address": block.graph_origin_address,
-            "ref_text": block.graph_ref_text,
-        }
-        for block in blocks
-    ]
+    day5 = next(r for r in run.results if r.config_name == "+ Graph expansion")
+    day4 = next(r for r in run.results if r.config_name == "+ Cross-encoder rerank")
+    routed_baseline = extract_session_c_routed_row(session_c_report)
+    ordering = relabel_ordering_comparison(
+        compare_ordered_results(routed_baseline, day5)
+    )
+    day13_graph_row = load_day13_accepted_graph_row()
+    gates = evaluate_gates(
+        cross_encoder=asdict(day4), day13_graph=day13_graph_row, routed=day5,
+    )
+
+    vector_config_count = sum(
+        1 for _name, c in configs if c.use_vector and c.vector_k > 0
+    )
+    embedding_accounting = validate_embedding_accounting(
+        run.embedding_cache,
+        unique_questions=len(unique_questions),
+        entry_count=len(entries),
+        vector_config_count=vector_config_count,
+    )
+
+    report = build_report(
+        repo_id=args.repo_id, benchmark_path=str(args.benchmark),
+        benchmark_sha256=digest, results=run.results,
+        embedding_cache=run.embedding_cache,
+        embedding_precomputation=run.embedding_precomputation,
+        latency_methodology=run.latency_methodology,
+    )
+    report["day14_vs_session_c_ordering"] = ordering
+    report["acceptance_gates"] = gates
+    report["embedding_accounting"] = embedding_accounting
+    report["day14_accepted"] = (
+        ordering["equal"] and gates["accepted"]
+        and embedding_accounting["valid"] and run.latency_methodology["valid"]
+    )
+
+    output_path = timestamped_path()
+    write_report(report, output_path)
+    print(f"Wrote {output_path}")
+
+    if not report["day14_accepted"]:
+        print(
+            "Day 14 validation FAILED — see day14_vs_session_c_ordering, "
+            "acceptance_gates, embedding_accounting, and latency_methodology "
+            "in the written report. This is a DIAGNOSTIC artifact, not the "
+            "accepted Day 14 report."
+        )
+        raise SystemExit(1)
+    print("Day 14 validation passed: ordering matches Session C, all "
+          "acceptance gates hold, embedding accounting is exact, and "
+          "latency methodology is valid.")
 ```
 
-`stages_json["graph"]` holds **only the blocks the graph stage touched**
-(promotions and fresh additions, `graph_actions`) — not the whole augmented
-list — parallel to how "fusion" holds the fused candidates and "final"
-separately holds what actually survived truncation.
+`day14_accepted` still requires all four components (unchanged from the
+third revision) — ordering equality, quality/latency gates, embedding
+accounting, and latency methodology.
 
-**`_build_config_json`'s `"executed"` dict**: `"graph": False` (hardcoded)
-becomes `"graph": config.use_graph`, matching the existing config-driven
-pattern. An enabled graph stage with zero seeds or zero discovered neighbors
-still shows `executed.graph: true` and `stages_json["graph"]: []`.
+## 8. Tests
 
-**When `use_graph=False`** (all four pre-existing `ABLATION_CONFIGS` rows): the
-new block is skipped entirely — no `dependents`/`dependencies` call, no
-`graph_ms` key, no `stages_json["graph"]` key, and `final_k` truncation runs
-against the exact same `candidates` it always has.
+**`tests/test_runner.py`** (generic):
+- `test_execute_evaluation_run_performs_no_prompting` — `builtins.input` is
+  patched to raise `AssertionError` if called at all; assert `execute_
+  evaluation_run` completes normally (proving it never prompts, directly,
+  not just "doesn't import `confirm_cost`").
+- `test_execute_evaluation_run_prewarms_cache_before_first_run_benchmark_call`
+  — unchanged from the third revision: a real `CachingEmbeddingProvider`
+  wraps a fake counting delegate; a fake `pipeline.run_pipeline` calls
+  `embedder.embed([question])` itself when given one; a shared ordered-
+  events list proves every delegate call precedes every pipeline call.
+- `test_execute_evaluation_run_all_vector_rows_see_full_cache_hits`,
+  `test_execute_evaluation_run_makes_zero_provider_calls_during_timed_rows`,
+  `test_execute_evaluation_run_records_precomputation_metadata` — unchanged
+  from the third revision.
+- `test_execute_evaluation_run_treats_zero_vector_k_as_vector_disabled` (new,
+  section 6) — a config with `use_vector=True, vector_k=0` selected alone:
+  assert no embedder is constructed, `embedding_cache` is all-zero.
+- `test_execute_evaluation_run_skips_embedder_and_reranker_when_unused` —
+  unchanged.
+- **`test_run_benchmark_is_the_only_place_prepare_is_called_across_a_shared_
+  reranker_run`** (new, replaces the third revision's decline-focused
+  reranker test with the actual lifecycle bug fix, section 5) — construct
+  one real `CrossEncoderReranker`-shaped fake with an instrumented
+  `prepare_calls` counter; call `run_benchmark` twice with it shared, using
+  `config`s equivalent to row 4 then row 5 (`use_rerank=True` both times);
+  assert: `prepare_calls == 1` total after both calls; the first call's
+  captured stdout contains "prepared"; the second call's captured stdout
+  contains "reused"; `CrossEncoderReranker` (the real class) is constructed
+  **zero** times (since a pre-built fake was injected both times).
+- `test_run_benchmark_never_reprepares_an_already_prepared_external_reranker`
+  — unchanged (a fake whose `.prepare()` raises if called at all, injected
+  already-prepared; asserts no exception).
+- `test_run_benchmark_prepares_an_unprepared_external_reranker` — unchanged.
+- `test_run_benchmark_does_not_replace_a_falsy_but_valid_injected_reranker`
+  — unchanged.
+- `test_build_report_uses_schema_version_3` — unchanged.
+- `test_build_report_includes_embedding_cache_precomputation_and_methodology_
+  when_provided` / `test_build_report_omits_all_three_when_not_provided` —
+  extended from the third revision's embedding-cache-only test to cover all
+  three new generic parameters (section 4).
+- Rename fixups for `indexed_corpus_fingerprint` — unchanged.
 
-**`run_pipeline`'s signature is unchanged** — no new parameter.
+**`tests/test_run_eval.py`** (generic CLI):
+- `test_main_computes_estimate_and_confirms_before_calling_execute_
+  evaluation_run` (new, section 2/3) — patches `run_eval.execute_evaluation_
+  run` to record whether it was called and patches `run_eval.confirm_cost`
+  to record call order relative to it; asserts `confirm_cost` is called
+  first, and — for the decline case — `execute_evaluation_run` is **never**
+  called at all (your item 1's explicit test requirement).
+- `test_main_decline_never_calls_execute_evaluation_run_or_constructs_
+  providers` — `confirm_cost` raises `SystemExit` (decline); assert `execute_
+  evaluation_run` was never called, and (since that function is where
+  providers are constructed) this transitively proves no provider
+  construction happened without needing to patch `OpenAIEmbeddingProvider`/
+  `CrossEncoderReranker` directly in this test file at all.
+- `test_main_passes_precomputation_and_methodology_into_build_report` (new,
+  section 4) — asserts `build_report` receives non-`None` `embedding_
+  precomputation`/`latency_methodology` matching what a fake `execute_
+  evaluation_run` returned.
+- Existing `main()`-level tests (`test_main_runs_only_requested_config_and_
+  writes_one_report`, `test_main_runs_all_configured_rows_when_config_is_
+  omitted`) — updated to patch `run_eval.execute_evaluation_run` as the new
+  boundary, consistent with the third revision's intent, now correctly
+  reflecting that `main()` no longer calls `run_benchmark` directly at all.
+- `confirm_cost` tests — unchanged.
+- **Replaces the third revision's `sys.modules`-based separation test**
+  (your item 4) — `test_main_never_reaches_day14_validation_functions`:
+  monkeypatch every function in `ripple.evaluation.day14_acceptance`
+  (`validate_repo_matches_session_c`, `validate_benchmark_matches_session_c`,
+  `validate_corpus_matches_session_c`, `validate_embedding_model_matches_
+  session_c`, `validate_approved_five_row_configuration`) to raise
+  `AssertionError` if called; run `run_eval.main([...])` with a full,
+  unfiltered config selection (the scenario most likely to accidentally
+  invoke Day-14 logic if the separation ever broke); assert it completes
+  normally. This is stable regardless of test execution order or which
+  module happened to import `day14_acceptance` first, since it proves the
+  absence of a *call*, not the absence of an *import record*.
 
-### 5.8 Prompt integration
+**`tests/test_day14_acceptance.py`** (new) — unchanged from the third
+revision's list (provenance rejection tests, snapshot rejection tests for
+rename/reorder/missing/extra/field-drift, `relabel_ordering_comparison`
+label test, `validate_embedding_accounting` pass/fail tests) — plus:
+- `test_validate_embedding_accounting_uses_vector_k_aware_config_count` (new,
+  section 6) — a `vector_config_count` computed from a config list containing
+  one `vector_k=0` row: assert that row is excluded from the expected
+  `cache_hits` calculation.
 
-Unchanged from the prior draft:
+**`tests/test_run_day14_eval.py`** (new) — unchanged from the third
+revision's list (four provenance-mismatch tests, ordering/gate/accounting/
+methodology failure tests each proving the report is written before
+`SystemExit`, and the full-pass test) — plus:
+- `test_main_confirms_before_execute_evaluation_run_and_never_calls_it_on_
+  decline` — the Day-14-wrapper equivalent of the generic CLI's new test
+  above, same technique.
 
-```python
-_GRAPH_RELATIONSHIP_LABELS = {
-    "dependent": "Depends on",
-    "dependency": "Referenced by",
-}
+**Required**: `.venv/bin/python -m pytest -q` with Supabase reachable before
+accepting Day 14.
 
-def format_context(blocks: list[RetrievedBlock]) -> str:
-    sections = []
-    for index, block in enumerate(blocks, start=1):
-        lines = [
-            f"[{index}] {block.address}",
-            f"    {block.file_path}:{block.start_line}-{block.end_line}",
-        ]
-        if block.graph_relationship is not None:
-            label = _GRAPH_RELATIONSHIP_LABELS[block.graph_relationship]
-            lines.append(f"    {label}: {block.graph_origin_address}")
-        lines.append(f"    {block.body}")
-        sections.append("\n".join(lines))
-    return "\n\n".join(sections)
-```
+## 9. Manual execution workflow
 
-`format_context` never reads `.score`/`.graph_score_status` at all, so
-section 5.5's score-representation change has no effect on prompt rendering —
-confirmed by re-reading this function this cycle. Existing formatting for
-ordinary (non-graph) blocks is byte-for-byte unchanged (`graph_relationship is
-None` skips the new line entirely).
+Unchanged from the third revision in shape — one command per CLI, Day 14
+always via the dedicated wrapper:
 
-### 5.9 No new report-schema field is needed for graph (unlike reranking)
-
-Unchanged: `dataclasses.asdict(result.config)` already includes `use_graph`/
-`graph_seed_n`/`graph_max_added` for every row; graph expansion introduces no
-external, independently-versioned resource the way the reranker did. No new
-`ConfigResult` field, no `schema_version` bump — the report stays
-`schema_version: 2`.
-
-## 6. Exact file scope
-
-**Create:** none.
-
-**Modify:**
-- `ripple/retrieval/graph.py` — add `GraphNeighbor.embed_text: str` (required);
-  add `resource.embed_text` to both `SELECT` statements; change both
-  `ORDER BY` clauses to `resource.address, edges.ref_text, resource.id,
-  edges.id` (section 5.3/5.6).
-- `ripple/retrieval/vector_store.py` — widen `RetrievedBlock.score` to `float |
-  None`; add four trailing, defaulted fields: `graph_relationship`,
-  `graph_origin_address`, `graph_ref_text`, `graph_score_status` (section 5.5).
-- `ripple/retrieval/pipeline.py` — new graph stage (promote/add/leave-alone
-  algorithm) inserted between rerank and `final_k` truncation;
-  `_serialize_graph` helper; `executed.graph` becomes `config.use_graph`; import
-  `dependents`/`dependencies` from `ripple.retrieval.graph` (section 5.7).
-- `ripple/llm/prompts.py` — `format_context` renders the relationship line for
-  graph-sourced blocks only (section 5.8).
-- `ripple/evaluation/runner.py` — add the fifth `ABLATION_CONFIGS` row (section
-  5.9 — confirmed no other change needed by reading `run_benchmark`/
-  `build_report` this cycle).
-- `tests/test_graph.py` — add an assertion that `embed_text` round-trips
-  through `dependents`/`dependencies` against the real reference fixture,
-  distinct from `body`; add a real-database determinism test using manually
-  inserted duplicate edge rows with different `ref_text` (observable order);
-  add a separate, DB-free query-construction test asserting the literal
-  `ORDER BY` clause `dependents`/`dependencies` execute includes `edges.id` as
-  the fourth column (section 8).
-- `tests/test_pipeline.py` — **audit-driven changes**: add `use_graph=False` to
-  all 21 existing sites (section 4.1's table); add the new graph-expansion,
-  promotion, and score-status tests (section 8).
-- `tests/test_prompts.py` — add `graph_relationship`/`graph_origin_address`
-  parameters to the `_block` helper (defaulted to `None`); add new tests for
-  both relationship directions and for repository-content safety (section 8).
-- `tests/test_runner.py` — update `test_ablation_configs_are_explicit_and_
-  support_recall_at_10` for five rows (section 4.2).
-
-**Do not modify**: `SPEC.md`, `sql/schema.sql`, `docker-compose.yml`,
-`.env`/`.env.example`, `requirements.txt`, `ripple/config.py` (already correct,
-section 4), `ripple/retrieval/fusion.py`, `ripple/retrieval/bm25.py`,
-`ripple/retrieval/pgvector_store.py`, `ripple/retrieval/rerank.py`,
-`ripple/llm/embeddings.py`, `ripple/llm/rewrite.py`, `ripple/llm/generate.py`,
-`ripple/evaluation/dataset.py`, `ripple/evaluation/metrics.py`, `ripple/db.py`,
-`ripple/ingest/*`, `scripts/run_eval.py` (confirmed still fully generic, section
-4), `scripts/index_repo.py`, `scripts/ask.py`, `AGENTS.md`, `CLAUDE.md`,
-`README.md`, `data/benchmark.json`, every existing file under
-`data/eval_results/`, `data/eval_results/DAY_11_ANALYSIS.md`,
-`data/eval_results/DAY_12_ANALYSIS.md`, `tests/test_dataset.py`,
-`tests/test_metrics.py`, `tests/test_db.py`, `tests/test_fusion.py`,
-`tests/test_bm25.py`, `tests/test_pgvector_store.py`, `tests/test_rerank.py`,
-`tests/test_ask.py`, `tests/test_generate.py`, `tests/test_run_eval.py`.
-
-## 7. Interfaces — the parts not already fully written in section 5
-
-```python
-# ripple/retrieval/graph.py -- the changed SELECT + dataclass
-@dataclass
-class GraphNeighbor:
-    id: int
-    address: str
-    file_path: str
-    start_line: int
-    end_line: int
-    body: str
-    embed_text: str        # new, required
-    ref_text: str          # moved last, to match the new SELECT order
-
-# both dependents() and dependencies(): SELECT list becomes
-# resource.id, resource.address, resource.file_path, resource.start_line,
-# resource.end_line, resource.body, resource.embed_text, edges.ref_text
-# ORDER BY resource.address, edges.ref_text, resource.id, edges.id -- genuinely total
-```
-
-## 8. Tests — exact files and assertions
-
-**`tests/test_pipeline.py`**:
-- All 21 sites from section 4.1's table get `use_graph=False` — no behavioral
-  change to any existing assertion.
-- New fakes: `_install_graph(monkeypatch, dependents_by_id, dependencies_by_id)`
-  installing `pipeline.dependents`/`pipeline.dependencies` as lookups into two
-  dicts (`id -> list[graph.GraphNeighbor]`), recording every call made, and
-  raising if called with an id outside an explicitly-declared "allowed" set (for
-  the depth-one test below).
-- Disabled toggle never calls the graph functions.
-- Seeds are exactly the first `graph_seed_n` candidates.
-- Both directions checked, dependents before dependencies.
-- **Depth stays exactly one**: fakes raise if called with any id outside the
-  original seed set; assert no failure, and separately assert a scenario where
-  a fake neighbor's own `id` is deliberately also present in the fakes'
-  lookup tables (as if it were a valid seed) is never queried, proving newly
-  discovered blocks are never used as seeds regardless of whether fake data
-  *would* answer for them.
-- **Promotion — the corrected algorithm's core new test**: a fake candidate
-  list of more than `final_k` items where the seed's fake `dependents` result
-  includes the `id` of a candidate sitting at **rank 11–50** (i.e., a rank that
-  would be cut by `final_k=10` without intervention); assert that candidate
-  **is** present in `result.blocks`, appears immediately after its seed,
-  carries `graph_relationship`/`graph_origin_address`/`graph_ref_text`, has
-  `graph_score_status == "promoted"`, and — critically — **its `.score` is its
-  own original value, not the seed's**. This is the direct regression test for
-  the bug this revision fixes, and the direct proof that `q011`'s smoke-test
-  reasoning (section 9) is actually achievable by this algorithm.
-- **Non-demotion**: a fake neighbor lookup that returns the `id` of *another
-  seed* (a candidate at a position within the original top `graph_seed_n`);
-  assert that seed is **not** moved, gains **no** graph-provenance fields, is
-  **not** counted toward `graph_max_added`, and appears at its original
-  position, unchanged.
-- **Score representation, both cases in one test file** (finding 2): the
-  promotion test above covers "promoted keeps its own score"; a second test
-  covers a genuinely new (absent-from-candidates) fake neighbor — assert its
-  `.score is None` and `graph_score_status == "unscored"`, and that
-  `stages_json["graph"]`'s corresponding entry has `"score": None,
-  "score_status": "unscored"` while a promoted entry in the same stage's output
-  has a real float `"score"` and `"score_status": "promoted"`.
-- Deduplication against base results and across seeds/directions, **including a
-  duplicate-`ref_text` case** (finding 3): two fake neighbor rows for the same
-  `id` with different `ref_text`, returned in a deliberately-scrambled order by
-  the fakes; assert only one occurrence survives, carrying the provenance from
-  whichever fake call happened first in the deterministic seed/direction
-  traversal order (section 5.3) — not from whichever row the fake's own
-  internal list ordering would have picked if the fakes didn't already return
-  data in the real, total-order-respecting shape.
-- **Global cap counts promotions and additions together** (finding 1's explicit
-  requirement): a scenario with two seeds, one whose discovered neighbor would
-  be a promotion and one whose discovered neighbor would be a fresh addition,
-  `graph_max_added=1`; assert exactly one of the two graph actions happens
-  (whichever is discovered first in traversal order), never both.
-- `graph_seed_n <= 0` and `graph_max_added <= 0`, parametrized `[0, -1]` each.
-- Empty candidate list with `use_graph=True`.
-- **Graph competes inside `final_k`**: unchanged intent from the prior draft,
-  now exercised via the promotion test above (a promoted rank-30 candidate
-  surviving into `result.blocks` *is* the proof).
-- `stages_json["graph"]`/`graph_ms`/`executed.graph` present only when
-  `use_graph=True`.
-- **Supabase integration test — made deterministic this revision (finding 3)**:
-  the prior draft assumed `aws_security_group.worker`/`aws_subnet.public` would
-  be *absent* from the BM25 candidate list, which is unsafe — both blocks'
-  `embed_text`/`body` mention `aws_vpc.main` (that's the reference edge itself),
-  so a lexical query for `aws_vpc.main` with the default `bm25_k=30` could
-  plausibly retrieve them too, already present in `candidates` before graph
-  expansion ever runs — which would make them **promotions**, not fresh
-  additions, and silently invalidate the test's own premise. **Corrected**: set
-  `bm25_k=1` explicitly in this test's `RetrievalConfig` (`use_vector=False,
-  use_bm25=True, bm25_k=1, use_rerank=False, use_graph=True`), against the
-  indexed `reference_repo` fixture, querying for `aws_vpc.main` directly. First
-  assert the single BM25 base result actually **is** `aws_vpc.main` (not
-  assumed) — with `bm25_k=1`, `candidates` has exactly one entry, so neither
-  `aws_security_group.worker` nor `aws_subnet.public` can possibly already be
-  present, by construction, not by assumption about ranking. Then assert the
-  real `graph.dependents` result (`aws_security_group.worker`,
-  `aws_subnet.public`) appears in `stages_json["graph"]` as genuinely **new**
-  graph-only blocks: `relationship == "dependent"`, `origin_address ==
-  "aws_vpc.main"`, correct real `ref_text`, `score is None`, and `score_status
-  == "unscored"` (section 5.5) — never `"promoted"`, since `bm25_k=1` guarantees
-  they weren't already in the candidate pool. Makes no OpenAI call and no
-  reranker call.
-
-**`tests/test_graph.py`**:
-- Add an assertion that `neighbors[0].embed_text` equals the real `embed_text`
-  column value for that resource, distinct from `body`.
-- **Determinism test, corrected this (fourth) revision — the identical-`ref_text`
-  case is not observable through returned objects, so it is no longer tested
-  that way (finding 1)**: the prior draft asked for an assertion that two
-  duplicate edge rows sharing the same `(source_id, target_id)` pair **and**
-  the same `ref_text` would be returned "ordered by their actual `edges.id`
-  values." That assertion is impossible as written: `GraphNeighbor` does not
-  select or expose `edges.id` (section 5.6 — deliberately, since it has no
-  production use beyond `ORDER BY`), so two such rows produce two **completely
-  identical** `GraphNeighbor` objects — same `id`, `address`, `ref_text`,
-  everything. There is no field on the returned object a test could inspect to
-  determine which row came from which `edges.id`, so no test can assert "the
-  first returned object corresponds to the lower `edges.id`." This revision
-  splits the coverage into two tests, neither of which makes that impossible
-  claim:
-  - **Real-database test, unchanged in spirit, `ref_text` case only**: using a
-    throwaway repo/resources setup, directly `INSERT` two duplicate edge rows
-    connecting the same `(source_id, target_id)` pair with **different**
-    `ref_text` values (bypassing the indexer's own one-edge-per-pair dedup).
-    This case's order **is** observable — `ref_text` differs between the two
-    returned objects — so the test asserts `dependents`/`dependencies` return
-    them ordered by `ref_text`, and that running the query twice produces
-    byte-identical results both times.
-  - **New, DB-free query-construction test for the `edges.id` tiebreaker**:
-    monkeypatch `graph.db.get_connection` to a fake context manager whose fake
-    cursor's `execute(query, params)` records the literal `query` string
-    (instead of touching a real database) and whose `fetchall()` returns `[]`.
-    Call `dependents(...)` and `dependencies(...)`, then assert the captured
-    SQL text, after normalizing internal whitespace, contains the exact clause
-    `ORDER BY resource.address, edges.ref_text, resource.id, edges.id`. This
-    directly verifies the production `ORDER BY` clause — including the
-    `edges.id` tiebreaker — without depending on a real database or on
-    distinguishing rows that are, by construction, indistinguishable once
-    returned. `GraphNeighbor` is not changed to expose `edges.id`; nothing
-    about this test requires it to.
-  - **What is and isn't proven, stated honestly**: two edge rows with
-    identical `(source_id, target_id, ref_text)` remain genuinely
-    indistinguishable at the `GraphNeighbor` level — swapping their relative
-    order in the result changes nothing observable, since both objects carry
-    identical field values. The `edges.id` tiebreaker exists purely so the
-    database itself does not have to make an implementation-defined choice
-    (e.g. for consistent pagination or repeated-call stability at the SQL
-    level); its presence in the executed query is what the query-construction
-    test verifies, not a difference in the Python-level return value.
-
-**`tests/test_prompts.py`**: unchanged from the prior draft — `_block` helper
-gains `graph_relationship`/`graph_origin_address` parameters (defaulted to
-`None`); existing tests stay unmodified; new tests for both relationship
-directions, a mixed ordinary/graph-sourced list, and repository-content safety.
-
-**`tests/test_runner.py`**: update `test_ablation_configs_are_explicit_and_
-support_recall_at_10` — five names ending in `"+ Graph expansion"`; `final_k >=
-10` for all five; `use_rerank is True` for rows 4 and 5, `False` for 1–3;
-`use_graph is True` only for row 5; `use_rewrite is False` for all five.
-
-**Focused test commands**:
+**A. Free validation and focused tests**
 ```bash
-.venv/bin/python -m pytest -q tests/test_graph.py
-.venv/bin/python -m pytest -q tests/test_pipeline.py
-.venv/bin/python -m pytest -q tests/test_prompts.py
-.venv/bin/python -m pytest -q tests/test_runner.py
+.venv/bin/python -m pytest -q tests/test_runner.py tests/test_run_eval.py \
+  tests/test_day14_acceptance.py tests/test_run_day14_eval.py
+.venv/bin/python -m pytest -q tests/test_graph_stabilization.py
 ```
 
-**Full suite** (no test in this plan downloads/constructs the real reranker
-model or makes an OpenAI call; every graph test either injects fakes or is a
-DB-only, skip-if-unreachable integration test):
+**B. The paid run — one command, one process**:
+```bash
+.venv/bin/python scripts/run_day14_eval.py --repo-id 13
+```
+
+**C. Final full test suite**
 ```bash
 .venv/bin/python -m pytest -q
 ```
-Expected, stated honestly per section 1's corrected baseline: **213 collected
-(the Days 1–12 baseline) plus every new Day 13 test, all passing.** Report the
-actual passed/skipped split for whichever environment ran it — aim for the
-DB-enabled shape (0 skipped) so the new graph integration tests actually run.
 
-## 9. Real Day 13 evaluation
+**D. Code commit** — `ripple/evaluation/runner.py`, `ripple/evaluation/
+day14_acceptance.py` (new), `ripple/retrieval/rerank.py` (new
+`PreparedReranker` protocol only), `scripts/run_eval.py`, `scripts/
+run_day14_eval.py` (new), and the test files from section 8.
 
-**Step 0 — first explicit confirmation, before any spending of any kind**: get
-explicit go-ahead before Step 1. The smoke test below makes **two** real OpenAI
-embedding requests (one per question checked), **zero** generation requests,
-**one** real reranker preparation, and **two** local batched rerank
-predictions (finding 4 — see the corrected script below); nothing runs before
-confirmation.
+**E. Evaluation/report commit** — the new JSON report and `DAY_14_
+ANALYSIS.md`, committed separately from D.
 
-**Step 1 — two smoke checks, relational (`q011`) and blast-radius (`q016`,
-corrected this revision) — both required**: SPEC's own Day 13 "Done when"
-explicitly calls out verifying dependents for a blast-radius question, not
-just dependencies for a relational one; `q011` alone is not sufficient
-evidence that the `dependents` direction works against real data.
+**Expected paid work, exact**: `provider_calls == 40` (measured, in the
+written report's `embedding_cache`); zero OpenAI answer-generation calls;
+~81 local, free `predict()` calls total (~40 row 4, ~40 row 5, exactly 1
+shared preparation — section 5); one model preparation, shared, honestly
+reported as "prepared" once (row 4) and "reused" once (row 5).
 
-**`q014` is replaced with `q016` — the prior draft's `q014` check was
-incompatible with the algorithm it was meant to test (finding 1).** The
-accepted Day 12 report ranks `q014`'s candidates
-`["aws_security_group.rds", "module.vpc_endpoints", "module.vpc", ...]` — with
-`graph_seed_n=3`, **both** `aws_security_group.rds` (rank 1) **and**
-`module.vpc_endpoints` (rank 2) are already immutable seeds. Section 5.4's
-case 2 rule *deliberately* leaves a discovered neighbor untouched, with no
-move and no `stages_json["graph"]` entry, whenever it is already one of the
-immutable seeds — so `module.vpc_endpoints` could **never** legitimately
-appear in `stages_json["graph"]` as a dependent of the `aws_security_group.rds`
-seed, no matter how correctly the algorithm runs. The prior smoke test asked
-for exactly the outcome the algorithm is specifically designed *not* to
-produce.
+## 10. Day 14 analysis artifact
 
-**`q016`** ("What is directly affected if `module.vpc_endpoints` is removed?")
-is compatible: `module.vpc_endpoints` itself is Day 12's rank-1 result (the
-seed), and `output.vpc_endpoints_security_group_arn` sits at **rank 4** —
-outside `graph_seed_n=3` — so it is eligible for **promotion**, not excluded
-like `q014`'s scenario was.
+Unchanged from the third revision's required content list (run identity;
+five-row table; per-category tables; latency by stage; Session C comparison;
+per-stage contribution narrative; RRF regression discussion; graph latency/
+quality tradeoff discussion; benchmark/corpus limitations; exact artifact
+path; no claim beyond measured evidence) plus the same explicit latency-
+methodology language: embedding generation excluded from table latency;
+separately-measured `embedding_precomputation` cost quoted from the actual
+report; why the five rows are comparable (uniform pre-warming, section 2);
+why direct `total_ms` comparison with Day 11/12/13's reports may not be
+valid (those reports had no shared cache — every row paid live embedding
+cost); `graph_ms` remains directly comparable across all reports, old and
+new, since it was never affected by embedding latency in any revision of
+this plan.
 
-Both checks share one script, reusing **one** prepared `CrossEncoderReranker`
-instance across both questions (finding 4 — the prior draft's script called
-`run_pipeline` twice with no injected reranker, which would construct and load
-the real model twice):
+**Not modified**: `DAY_11/12/13_ANALYSIS.md`, `GRAPH_STABILIZATION_SESSION_
+A/B/C.md`, `GRAPH_STABILIZATION_INTENT_ROUTER.md`, any existing JSON report.
 
-```bash
-.venv/bin/python -c "
-from ripple.evaluation.runner import ABLATION_CONFIGS
-from ripple.retrieval import pipeline
-from ripple.retrieval.rerank import CrossEncoderReranker
+## 11. Scope and stop condition
 
-REPO_ID = ...  # never hardcoded -- resolve independently, e.g.:
-                # from ripple import db
-                # with db.get_connection() as conn, conn.cursor() as cur:
-                #     cur.execute(
-                #         \"SELECT id FROM repos WHERE name = 'vpc-complete' \"
-                #         \"ORDER BY id DESC LIMIT 1\"
-                #     )
-                #     print(cur.fetchone())
-config = dict(ABLATION_CONFIGS)['+ Graph expansion']
+Unchanged from the third revision: on failure, stop, inspect the four
+written validation objects, determine the cause (configuration drift,
+corpus drift, model drift, or a code bug in this plan's own new logic), do
+not tune parameters to force a pass. Out-of-scope list unchanged: Day 15
+query rewriting, Day 16 safety work, the API, README work, RRF tuning, graph
+scoring, seed/cap tuning, any new retrieval experiment. `ripple/retrieval/
+graph.py`, `ripple/retrieval/intent.py`, `ripple/retrieval/pipeline.py`,
+`ripple/retrieval/fusion.py`, `ripple/config.py`, `ripple/evaluation/
+graph_stabilization.py`, `SPEC.md` are not modified. `ripple/retrieval/
+rerank.py` gains only the `PreparedReranker` protocol definition.
 
-reranker = CrossEncoderReranker()
-reranker.prepare()  # one real model load + one dummy prediction, shared below
-print(f'--- reranker prepared in {reranker.prepare_ms:.0f}ms (one-time) ---')
+**Day 14 is complete only when**: all five fresh rows exist in one new
+report with `schema_version: 3`, `embedding_cache`, `embedding_
+precomputation`, and `latency_methodology` all present and accurate;
+`day14_accepted` is `true` (or the failure is fully documented and Day 14 is
+explicitly not declared complete); `.venv/bin/python -m pytest -q` is green;
+implementation and evaluation artifacts are committed separately; `scripts/
+run_eval.py` remains fully usable for any other repository or filtered
+config selection, now also honestly reporting its own latency methodology.
 
-CHECKS = [
-    (
-        'q011 (relational, dependencies)',
-        'What block does the DynamoDB endpoint policy directly depend on for its VPC ID?',
-        'module.vpc',
-    ),
-    (
-        'q016 (blast_radius, dependents)',
-        'What is directly affected if module.vpc_endpoints is removed?',
-        'output.vpc_endpoints_security_group_arn',
-    ),
-]
+## 12. Audit of this revision
 
-for label, question, expected_address in CHECKS:
-    result = pipeline.run_pipeline(REPO_ID, question, config, reranker=reranker)
-    print(f'=== {label} ===')
-    print('--- graph actions ---')
-    for row in result.stages_json['graph']:
-        print(row)
-    addresses = [b.address for b in result.blocks]
-    print('--- final addresses ---')
-    print(addresses)
-    print(f'--- did {expected_address} reach the final context? '
-          f'{expected_address in addresses} ---')
-    print(f'--- graph_ms: {result.latency_json[\"graph_ms\"]} ---')
-    print()
-"
-```
+- **No import cycle**: `runner.py` contains no reference to `confirm_cost`,
+  `argparse`, or `input()` anywhere; `execute_evaluation_run`'s only
+  "control-flow" responsibility is running configs after being handed
+  already-approved `entries`/`configs` — verified by re-reading section 2's
+  final signature, which takes no confirmation-related parameter at all.
+- **No prompting inside `runner.py`**: confirmed — `confirm_cost` is defined
+  and stays in `scripts/run_eval.py`; `runner.py`'s only prints are status
+  messages (pre-warm summary, reranker prepared/reused), never a `[y/N]`
+  prompt.
+- **No provider construction before confirmation**: both `main()`s (section
+  3) call `confirm_cost` strictly before `execute_evaluation_run`, and
+  `execute_evaluation_run` is the only place `OpenAIEmbeddingProvider`/
+  `CachingEmbeddingProvider`/`CrossEncoderReranker` are constructed — so
+  nothing is ever constructed before approval, tested directly (section 8).
+- **No generic report with undocumented prewarmed latency**: `build_report`
+  (section 4) now always receives and serializes `embedding_precomputation`/
+  `latency_methodology` from any caller using `execute_evaluation_run`,
+  generic or Day-14.
+- **Exactly one reranker preparation with honest prepared/reused output**:
+  section 5's fix moves `.prepare()` entirely into `run_benchmark`, tested
+  directly against a shared fake across two sequential calls.
+- **Stable, non-test-order-dependent separation tests**: section 8's
+  replacement test patches Day-14 functions to raise and proves they're
+  never *called*, not merely absent from `sys.modules`.
+- **Exact embedding accounting**: section 6's `use_vector and vector_k > 0`
+  condition applied consistently in `execute_evaluation_run`, both CLIs'
+  estimate calculations, and `validate_embedding_accounting`'s
+  `vector_config_count` — no remaining place uses the incomplete
+  `use_vector`-alone condition.
+- **Day-14-only validation isolated from the reusable evaluator**: `runner.
+  py`/`scripts/run_eval.py` contain zero references to Session C, the
+  approved snapshot, or acceptance gates — all of that lives in `ripple/
+  evaluation/day14_acceptance.py` and `scripts/run_day14_eval.py` only.
 
-For **`q011`**, confirm `stages_json["graph"]` shows `module.vpc` with
-`"relationship": "dependency"`, the correct `origin_address`/`ref_text`, and
-either `"score_status": "promoted"` (with its own real score, if it was already
-present in the reranked pool — the expected case per section 1) or
-`"unscored"` (if retrieval had dropped it entirely) — either is valid evidence
-of a fix, but the two mean different things and should be reported accurately,
-not conflated.
+## 13. Remaining blocking decisions
 
-**What `q016` demonstrates — corrected this (fourth) revision to state this
-accurately**: `output.vpc_endpoints_security_group_arn` sits at rank 4 in the
-accepted Day 12 report, and evaluation uses `final_k=10` — so this candidate is
-already inside the final context *before* graph expansion ever runs. `q016`
-therefore does **not** demonstrate recovering a candidate from beyond
-`final_k` (that is `q011`'s job — `module.vpc` genuinely fell outside the Day
-12 top 10 — and the dedicated rank 11–50 promotion unit test in section 8).
-What `q016` verifies, precisely:
-- the real `dependents`-direction lookup runs against real data and finds a
-  real dependent;
-- **promotion**, in the sense section 5.4 defines it: the candidate is
-  relocated from its original position (rank 4) to immediately after its seed
-  (`module.vpc_endpoints`), with graph provenance attached — not that it moves
-  from outside the final context to inside it;
-- its **own original reranker score is preserved**, not overwritten or
-  replaced with the seed's score;
-- correct `relationship`/`origin_address`/`ref_text`/`score_status`
-  provenance; and
-- **no duplication** — it appears exactly once in `result.blocks`, at its new
-  (post-seed) position, not also at its old one.
-
-Confirm `stages_json["graph"]` shows
-`output.vpc_endpoints_security_group_arn` with:
-- `"relationship": "dependent"`;
-- `"origin_address": "module.vpc_endpoints"`;
-- the correct real `ref_text`;
-- `"score_status": "promoted"` (it was already present at rank 4, not absent —
-  a fresh `"unscored"` result here would indicate the real database's ranking
-  no longer matches Day 12's accepted report, worth investigating before
-  proceeding, not silently accepted);
-- its own original reranker score preserved, not overwritten;
-- and that it still appears exactly once in `result.blocks` (it was already
-  going to be inside `final_k`; the check here is correct repositioning and
-  no duplication, not entry into the final context).
-
-**Step 2 — second explicit confirmation, before the full 40-question run**:
-state plainly beforehand: ~40 paid OpenAI embedding requests (unchanged), zero
-generation requests, additional local database read latency for graph
-expansion (no new paid cost).
-
-**Step 3 — run only the fifth configuration**:
-```bash
-.venv/bin/python scripts/run_eval.py --repo-id <resolved-repo-id> \
-  --config "+ Graph expansion"
-```
-
-**Step 4 — inspect before accepting**:
-- Compare aggregate Recall@5/Recall@10/MRR/`mean_latency_ms` against the Day 12
-  table (section 1).
-- Specifically re-check `relational` and `blast_radius` category breakdowns,
-  and specifically re-check `q011`'s own recall values.
-- Investigate anything surprising before accepting — if `lookup`/`attribute`
-  category recall drops relative to Day 12, that's evidence graph
-  additions/promotions are displacing good candidates out of `final_k` — worth
-  explaining explicitly.
-
-**Step 5 — accept and commit, or fix and re-run**: same deliberate
-review-then-stage workflow as every prior day. Write `DAY_13_ANALYSIS.md`
-alongside the accepted report: aggregate metrics, per-category metrics, `q011`'s
-specific before/after, the `q016` blast-radius promotion check's outcome
-(including whether `output.vpc_endpoints_security_group_arn`'s `score_status`
-was `"promoted"` as expected), `graph_ms`, and an honest account of any
-category that regressed. **Never hand-edit any measured metric.** Commit the
-accepted report and analysis separately from the implementation commit(s).
-
-## 10. Scope and process
-
-- `SPEC.md` stays read-only.
-- The existing accepted reports and `DAY_11_ANALYSIS.md`/`DAY_12_ANALYSIS.md` are
-  not modified.
-- **Not implemented this cycle**: query rewriting (Day 15), RRF tuning, Pinecone
-  work. The cross-encoder itself is not retrained, retuned, or reconfigured —
-  `rerank.py` is untouched.
-- No credentials are ever exposed, printed, logged, or committed. No Hugging
-  Face cache files are ever committed.
-- `repo_id` is never hardcoded in application code.
-
-## 11. Acceptance criteria
-
-Day 13 is complete only when all of the following hold:
-- Graph expansion works behind `use_graph`, with the exact promote/add/
-  leave-alone semantics in section 5.4/5.7.
-- Disabled (`use_graph=False`) behavior is provably unchanged: every
-  pre-existing test in `test_pipeline.py`, `test_prompts.py`, and
-  `test_runner.py` passes with only the audited `use_graph=False` additions.
-- Depth stays exactly one, provably.
-- A candidate ranked 11–50 in the reranked pool **can** be promoted into
-  `final_k` when a seed's real dependency/dependent edge points at it — proven
-  by a dedicated test (section 8), not just asserted in prose.
-- An already-higher-ranked candidate (specifically: another seed) is never
-  demoted, duplicated, or relabeled.
-- `graph_max_added` counts promotions and additions on one shared counter,
-  exactly, proven by a dedicated test.
-- **No graph-added block's score is misattributed to the reranker**: a
-  genuinely new block has `score=None`/`graph_score_status="unscored"`; a
-  promoted block retains its own original score with
-  `graph_score_status="promoted"`; `stages_json["graph"]` shows both explicitly.
-- Both `graph.py` queries have a genuinely total deterministic order: proven
-  for the observable, different-`ref_text` case by a real-database duplicate-
-  edge test, and for the `edges.id` tiebreaker by a dedicated query-
-  construction test asserting the literal executed `ORDER BY` clause (the
-  identical-`ref_text` case is not separately asserted at the returned-object
-  level, since such rows are behaviorally indistinguishable once returned —
-  section 8).
-- `graph_ms`, `stages_json["graph"]`, and `executed.graph` are all correct.
-- `format_context` renders both relationship directions correctly and leaves
-  ordinary-block formatting untouched.
-- `.venv/bin/python -m pytest -q` is green, with the actual passed/skipped
-  counts reported honestly for the environment it ran in (section 1) — not
-  asserted as a single unconditional number.
-- The fifth real ablation row exists in one committed, `schema_version: 2` JSON
-  report.
-- **Both** smoke checks (section 9, step 1 — `q011` relational and `q016`
-  blast-radius) were actually run and their `stages_json["graph"]` output
-  inspected before the full evaluation, using **one shared, prepared**
-  `CrossEncoderReranker` instance for both questions.
-- The result has been inspected (section 9, step 4), including an honest
-  account of any category that regressed.
-- The accepted report and its `DAY_13_ANALYSIS.md` are committed together, in a
-  commit separate from the implementation commit(s).
-
-## 12. Needs sign-off
-
-**None.** The one item flagged in the prior draft — whether graph-discovered
-blocks compete for slots inside `final_k` — is now explicitly approved
-(section 5.1) and is no longer open. Every decision introduced or corrected by
-this revision (the three-case promotion algorithm, promotions counting toward
-`graph_max_added`, the `score`/`score_status` representation, the total
-`ORDER BY`) was something this round's review explicitly instructed be chosen
-and documented, not deferred back for a decision — each is resolved above with
-its reasoning stated in full. If any of these specific choices don't match your
-intent, say so before implementation; none of them is presented as the only
-possible design, but all are presented as this plan's actual, decided answer.
-
-## 13. Audit — re-verified against every item named for re-audit
-
-- **Pipeline ordering**: unchanged and now confirmed, not just proposed —
-  graph runs after rerank/fusion and before `final_k` (section 5.1).
-- **Immutable seed selection**: `seeds`/`seed_ids` are captured once, before
-  any promotion or insertion, and never mutated during the pass (section 5.2/
-  5.7) — re-verified against the corrected algorithm's actual code this
-  revision, not just asserted.
-- **One-hop enforcement**: the seed loop iterates only the original
-  `candidates`/`seeds` snapshot; no promoted or added block is ever eligible to
-  seed further expansion (section 5.2/5.7); tested directly (section 8).
-- **Deduplication**: `handled_ids` (first-discovery-wins, across seeds/
-  directions) plus `seed_ids` exclusion (section 5.4) — re-derived from
-  scratch this revision to replace the prior draft's single, insufficient
-  `known_ids` check.
-- **Promotion of existing low-ranked candidates**: the core fix this revision
-  makes — a candidate at reranked rank 11–50 is now actually relocatable next
-  to its seed, not just checked-and-skipped (section 5.4/5.7), with a dedicated
-  test proving it and proving the `q011` scenario is achievable.
-- **Truthful score provenance**: promoted blocks keep their own real score;
-  new blocks are explicitly `None`/`"unscored"`; nothing inherits a seed's
-  reranker score for a block the model never scored (section 5.5), with
-  downstream serialization/type effects inspected and confirmed safe before
-  choosing this design, not after.
-- **Deterministic ordering**: both `graph.py` queries now order by
-  `resource.address, edges.ref_text, resource.id, edges.id` — a genuine total
-  order, `edges.id` added after confirming `resource.id` alone still ties for
-  edges connecting the same pair with identical `ref_text`. Corrected this
-  (fourth) revision: the identical-`ref_text` case cannot be tested by
-  asserting the *returned objects'* order, because `GraphNeighbor` does not
-  expose `edges.id` and two such rows are therefore returned as completely
-  identical objects — no test can tell which object came from which edge row.
-  Coverage is split accordingly: a real-database test with manually-inserted
-  duplicate edges of **different** `ref_text` proves that (observable) case
-  end-to-end; a separate, DB-free query-construction test captures the literal
-  SQL `dependents`/`dependencies` execute and asserts the `ORDER BY` clause
-  itself includes `edges.id` as the fourth column — proving the tiebreaker is
-  genuinely present in the executed query without depending on being able to
-  distinguish indistinguishable return values (section 5.3/8).
-- **Graph caps**: `graph_max_added` is a single shared counter across
-  promotions and additions, an explicit, tested choice (section 5.2/5.4/8).
-- **`q011` recovery logic**: directly re-checked against the corrected
-  algorithm — `module.vpc` sitting at reranked rank 11–50 is now the case the
-  promotion branch (case 3, section 5.4) exists to handle; the smoke test
-  (section 9) reports whether the real data confirms it, and reports
-  `promoted` vs. `unscored` honestly rather than assuming which applies.
-- **Real dependent/blast-radius verification**: `q016` (corrected this
-  revision from `q014`, which was structurally incompatible with the
-  seed-exclusion rule — its two top candidates are both immutable seeds, so
-  its expected dependent could never legitimately appear in
-  `stages_json["graph"]`) is the required second smoke check (section 9),
-  verifying a real `dependents`-direction **promotion** — repositioning next
-  to its seed with correct `origin_address`/`ref_text`/`score_status ==
-  "promoted"` provenance, its preserved original score, and no duplication —
-  for a candidate confirmed (against the accepted Day 12 report) to sit at
-  rank 4, outside `graph_seed_n=3` and therefore eligible for promotion.
-  **Corrected this (fourth) revision: `q016` is not a recovery-from-outside-
-  `final_k` demonstration** — rank 4 is already inside `final_k=10`, so this
-  candidate was always going to reach `result.blocks` even without graph
-  expansion. The recovery scenario (a candidate genuinely displaced beyond
-  `final_k` by reranking, then brought back by promotion) is real, but `q016`
-  is not evidence of it; `q011` is (`module.vpc` genuinely fell outside the
-  Day 12 top 10), backed by the dedicated rank 11–50 promotion unit test
-  (section 8) for the general case.
-
-## 14. Summary
-
-1. **Files to create**: none.
-2. **Files to modify**: `ripple/retrieval/graph.py`, `ripple/retrieval/
-   vector_store.py`, `ripple/retrieval/pipeline.py`, `ripple/llm/prompts.py`,
-   `ripple/evaluation/runner.py`, `tests/test_graph.py`, `tests/test_pipeline.py`,
-   `tests/test_prompts.py`, `tests/test_runner.py` — 9 files total, unchanged in
-   count from the prior draft.
-3. **Tests to add/update**: the same audit-driven `use_graph=False` pass over
-   all 21 `test_pipeline.py` sites, plus promotion, non-demotion, score-status
-   (both cases), and shared-cap tests as before, now joined by: the BM25-only
-   integration test corrected to set `bm25_k=1` explicitly and assert the
-   single base result before checking for genuinely-new (`"unscored"`) graph
-   additions (round 3, finding 3); and `test_graph.py`'s determinism coverage
-   corrected this (fourth) revision into **two** tests — a real-database test
-   with duplicate edges of different `ref_text` (their order is observable and
-   asserted directly), and a separate, DB-free query-construction test that
-   captures the literal SQL `dependents`/`dependencies` execute and asserts the
-   `ORDER BY` clause includes `edges.id` as the fourth column. The prior
-   draft's plan to assert identical-`ref_text` duplicate rows' *returned*
-   order was dropped as impossible: `GraphNeighbor` doesn't expose `edges.id`,
-   so such rows come back as completely identical objects with nothing to
-   distinguish their order by (round 4, finding 1). Direction/safety tests in
-   `test_prompts.py` unchanged; one updated assertion in `test_runner.py`.
-4. **Paid/local compute expected, corrected this revision**: ~40 OpenAI
-   embedding requests for the full evaluation run (unchanged), plus 2 for the
-   two required smoke checks (`q011`, `q016`); **0 generation requests; one
-   reranker preparation (not two) and two local batched rerank predictions**,
-   since the smoke script now shares one prepared `CrossEncoderReranker`
-   instance across both questions (finding 4) instead of constructing/loading
-   the real model separately for each; additional local database read latency
-   for graph expansion (no new paid cost, no model, no download beyond the one
-   reranker preparation already required for the evaluated configuration).
-5. **Remaining ambiguity requiring your decision**: none. `final_k` competition
-   remains approved and closed; the `q014` → `q016` substitution, the
-   `edges.id` tiebreaker, the deterministic `bm25_k=1` integration test, and
-   the shared-reranker smoke script are all corrections to match the plan's
-   own already-approved design, not new open design choices. The two
-   fourth-round corrections are the same kind of fix, not new choices: the
-   determinism test now asserts only what is actually observable (returned
-   order for different-`ref_text` rows; the literal `ORDER BY` SQL text for the
-   `edges.id` tiebreaker), and `q016`'s narrative now states precisely what its
-   promotion demonstrates — repositioning and provenance for an
-   already-in-`final_k` candidate — without implying a recovery-from-beyond-
-   `final_k` outcome that only `q011` and the rank 11–50 unit test actually
-   demonstrate.
+**None. Implementation can begin.** Every issue raised across all four
+rounds of review has an explicit, concrete, implemented resolution in this
+document: the persisted configuration (section 1), the module/script split
+protecting the generic CLI (sections 2–3), fair pre-warmed latency
+accounting (sections 2, 6) with honest generic and Day-14 reporting
+(sections 4, 10), a single correctly-attributed reranker preparation
+(section 5), Session C provenance and exact configuration-snapshot
+validation (section 7), a complete four-part acceptance condition (section
+7), and a full, non-fragile test matrix (section 8). Nothing here was left
+implicit, deferred, or invented as a new approval point.
