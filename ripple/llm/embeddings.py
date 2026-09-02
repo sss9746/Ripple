@@ -85,3 +85,37 @@ class OpenAIEmbeddingProvider:
             for embedding in embeddings
             if embedding is not None
         ]
+
+
+class CachingEmbeddingProvider:
+    """Cache embeddings by exact input text for one evaluation process."""
+
+    def __init__(self, provider: EmbeddingProvider) -> None:
+        self._provider = provider
+        self._cache: dict[str, list[float]] = {}
+        self.request_count = 0
+        self.cache_hit_count = 0
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+
+        missing = list(dict.fromkeys(
+            text for text in texts if text not in self._cache
+        ))
+
+        if missing:
+            embeddings = self._provider.embed(missing)
+            if len(embeddings) != len(missing):
+                raise ValueError(
+                    "Embedding provider returned the wrong result count"
+                )
+
+            self.request_count += 1
+            self._cache.update(zip(missing, embeddings, strict=True))
+
+        self.cache_hit_count += sum(
+            text in self._cache and text not in missing
+            for text in texts
+        )
+        return [self._cache[text] for text in texts]

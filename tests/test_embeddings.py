@@ -3,11 +3,21 @@ from types import SimpleNamespace
 import pytest
 
 from ripple.llm.embeddings import (
+    CachingEmbeddingProvider,
     EMBEDDING_BATCH_SIZE,
     EMBEDDING_DIM,
     EMBEDDING_MODEL,
     OpenAIEmbeddingProvider,
 )
+
+
+class _CountingProvider:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        self.calls.append(texts)
+        return [[float(len(text))] for text in texts]
 
 
 class FakeEmbeddings:
@@ -143,3 +153,27 @@ def test_embed_rejects_duplicate_response_index():
 
     with pytest.raises(ValueError, match="duplicate index 0"):
         provider.embed(["text-0", "text-1"])
+
+
+def test_caching_provider_reuses_exact_text_embeddings() -> None:
+    provider = _CountingProvider()
+    cached = CachingEmbeddingProvider(provider)
+
+    assert cached.embed(["first", "second"]) == [[5.0], [6.0]]
+    assert cached.embed(["second", "first"]) == [[6.0], [5.0]]
+
+    assert provider.calls == [["first", "second"]]
+    assert cached.request_count == 1
+    assert cached.cache_hit_count == 2
+
+
+def test_caching_provider_fetches_only_missing_unique_texts() -> None:
+    provider = _CountingProvider()
+    cached = CachingEmbeddingProvider(provider)
+
+    cached.embed(["known"])
+    result = cached.embed(["known", "new", "new"])
+
+    assert result == [[5.0], [3.0], [3.0]]
+    assert provider.calls == [["known"], ["new"]]
+    assert cached.request_count == 2
