@@ -22,7 +22,7 @@ from ripple.evaluation.runner import (
     ABLATION_CONFIGS,
     ConfigResult,
     build_report,
-    run_benchmark,
+    execute_evaluation_run,
 )
 
 
@@ -76,10 +76,12 @@ def confirm_cost(
     question_count: int,
     config_count: int,
     *,
+    estimated_requests: int | None = None,
     skip: bool = False,
 ) -> None:
     """Display the paid-work estimate and require explicit confirmation."""
-    estimated_requests = question_count * config_count
+    if estimated_requests is None:
+        estimated_requests = question_count * config_count
     print(
         "Evaluation plan: "
         f"{question_count} questions × {config_count} configurations "
@@ -188,29 +190,31 @@ def main(argv: list[str] | None = None) -> None:
     digest = benchmark_sha256(benchmark_path)
     entries = load_validated_benchmark(benchmark_path, args.repo_id)
     configs = select_configs(args.config)
+    uses_vector = any(
+        config.use_vector and config.vector_k > 0
+        for _name, config in configs
+    )
+    unique_questions = {entry.question for entry in entries}
+    estimated_requests = len(unique_questions) if uses_vector else 0
 
     confirm_cost(
         question_count=len(entries),
         config_count=len(configs),
+        estimated_requests=estimated_requests,
         skip=args.yes,
     )
 
-    results = [
-        run_benchmark(
-            repo_id=args.repo_id,
-            entries=entries,
-            config=config,
-            config_name=config_name,
-        )
-        for config_name, config in configs
-    ]
+    run = execute_evaluation_run(args.repo_id, entries, configs)
 
-    print(render_markdown_table(results))
+    print(render_markdown_table(run.results))
     report = build_report(
         repo_id=args.repo_id,
         benchmark_path=str(benchmark_path),
         benchmark_sha256=digest,
-        results=results,
+        results=run.results,
+        embedding_cache=run.embedding_cache,
+        embedding_precomputation=run.embedding_precomputation,
+        latency_methodology=run.latency_methodology,
     )
     output_path = timestamped_path()
     write_report(report, output_path)

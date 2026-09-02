@@ -14,6 +14,16 @@ class Reranker(Protocol):
         ...
 
 
+class PreparedReranker(Reranker, Protocol):
+    prepare_ms: float | None
+
+    def prepare(self) -> None:
+        ...
+
+    def describe(self) -> dict:
+        ...
+
+
 class CrossEncoderReranker:
     def __init__(
         self,

@@ -7,7 +7,7 @@ import pytest
 
 from ripple.evaluation.dataset import BenchmarkEntry
 from ripple.evaluation.metrics import AggregateMetrics, CategoryMetrics
-from ripple.evaluation.runner import ConfigResult
+from ripple.evaluation.runner import ConfigResult, EvaluationRun
 from scripts import run_eval
 
 
@@ -294,38 +294,55 @@ def test_main_runs_only_requested_config_and_writes_one_report(
             category="lookup",
         )
     ]
-    calls: list[tuple[int, list[BenchmarkEntry], object, str]] = []
+    calls: list[
+        tuple[int, list[BenchmarkEntry], list[tuple[str, object]]]
+    ] = []
     selected_result = object()
     output_path = tmp_path / "results" / "result.json"
     written: list[tuple[dict, Path]] = []
+    confirmations: list[dict] = []
+    report_arguments: list[dict] = []
 
     monkeypatch.setattr(
         run_eval,
         "load_validated_benchmark",
         lambda path, repo_id: entries,
     )
-    monkeypatch.setattr(run_eval, "confirm_cost", lambda **kwargs: None)
+    monkeypatch.setattr(
+        run_eval,
+        "confirm_cost",
+        lambda **kwargs: confirmations.append(kwargs),
+    )
 
-    def fake_run_benchmark(
+    def fake_execute_evaluation_run(
         repo_id: int,
         entries: list[BenchmarkEntry],
-        config: object,
-        config_name: str,
-    ) -> object:
-        calls.append((repo_id, entries, config, config_name))
-        return selected_result
+        configs: list[tuple[str, object]],
+    ) -> EvaluationRun:
+        calls.append((repo_id, entries, configs))
+        return EvaluationRun(
+            results=[selected_result],
+            embedding_cache={"provider_calls": 1},
+            embedding_precomputation={"provider_calls": 1},
+            latency_methodology={"valid": True},
+        )
 
-    monkeypatch.setattr(run_eval, "run_benchmark", fake_run_benchmark)
+    monkeypatch.setattr(
+        run_eval,
+        "execute_evaluation_run",
+        fake_execute_evaluation_run,
+    )
     monkeypatch.setattr(
         run_eval,
         "render_markdown_table",
         lambda results: "MARKDOWN RESULTS",
     )
-    monkeypatch.setattr(
-        run_eval,
-        "build_report",
-        lambda **kwargs: {"results": kwargs["results"]},
-    )
+
+    def fake_build_report(**kwargs: object) -> dict:
+        report_arguments.append(kwargs)
+        return {"results": kwargs["results"]}
+
+    monkeypatch.setattr(run_eval, "build_report", fake_build_report)
     monkeypatch.setattr(run_eval, "timestamped_path", lambda: output_path)
     monkeypatch.setattr(
         run_eval,
@@ -349,9 +366,23 @@ def test_main_runs_only_requested_config_and_writes_one_report(
     assert calls[0] == (
         13,
         entries,
-        run_eval.ABLATION_CONFIGS[2][1],
-        "Vector + BM25 + RRF",
+        [run_eval.ABLATION_CONFIGS[2]],
     )
+    assert confirmations == [
+        {
+            "question_count": 1,
+            "config_count": 1,
+            "estimated_requests": 1,
+            "skip": True,
+        }
+    ]
+    assert report_arguments[0]["embedding_cache"] == {
+        "provider_calls": 1
+    }
+    assert report_arguments[0]["embedding_precomputation"] == {
+        "provider_calls": 1
+    }
+    assert report_arguments[0]["latency_methodology"] == {"valid": True}
     assert written == [({"results": [selected_result]}, output_path)]
 
 
@@ -377,7 +408,7 @@ def test_main_decline_stops_before_running_benchmark(
     def fail_if_run(*args: object, **kwargs: object) -> None:
         raise AssertionError("benchmark must not run after declined confirmation")
 
-    monkeypatch.setattr(run_eval, "run_benchmark", fail_if_run)
+    monkeypatch.setattr(run_eval, "execute_evaluation_run", fail_if_run)
 
     with pytest.raises(SystemExit, match="cancelled before making API requests"):
         run_eval.main(
@@ -413,12 +444,24 @@ def test_main_runs_all_configured_rows_when_config_is_omitted(
     )
     monkeypatch.setattr(run_eval, "confirm_cost", lambda **kwargs: None)
 
-    def fake_run_benchmark(**kwargs: object) -> str:
-        config_name = str(kwargs["config_name"])
-        config_names.append(config_name)
-        return config_name
+    def fake_execute_evaluation_run(
+        repo_id: int,
+        entries: list[BenchmarkEntry],
+        configs: list[tuple[str, object]],
+    ) -> EvaluationRun:
+        config_names.extend(name for name, _config in configs)
+        return EvaluationRun(
+            results=list(config_names),
+            embedding_cache={},
+            embedding_precomputation={},
+            latency_methodology={},
+        )
 
-    monkeypatch.setattr(run_eval, "run_benchmark", fake_run_benchmark)
+    monkeypatch.setattr(
+        run_eval,
+        "execute_evaluation_run",
+        fake_execute_evaluation_run,
+    )
     monkeypatch.setattr(run_eval, "render_markdown_table", lambda results: "table")
     monkeypatch.setattr(
         run_eval,

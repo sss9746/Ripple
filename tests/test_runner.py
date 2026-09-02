@@ -179,6 +179,7 @@ def test_ablation_configs_are_explicit_and_support_recall_at_10() -> None:
     for index, (_name, config) in enumerate(runner.ABLATION_CONFIGS):
         assert config.final_k >= 10
         assert config.use_rerank is (index in (3, 4))
+        assert config.graph_route_by_intent is (index == 4)
         assert config.use_graph is (index == 4)
         assert config.use_rewrite is False
 
@@ -202,11 +203,12 @@ def test_run_benchmark_reuses_one_prepared_reranker(
     class FakeReranker:
         def __init__(self) -> None:
             self.prepare_calls = 0
-            self.prepare_ms = 12.5
+            self.prepare_ms: float | None = None
             instances.append(self)
 
         def prepare(self) -> None:
             self.prepare_calls += 1
+            self.prepare_ms = 12.5
 
         def describe(self) -> dict:
             return {
@@ -265,6 +267,160 @@ def test_run_benchmark_reuses_one_prepared_reranker(
         "prepare_ms": 12.5,
     }
     assert capsys.readouterr().out.count("reranker prepared") == 1
+
+
+def test_execute_evaluation_run_constructs_and_prepares_one_shared_reranker(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    instances: list[object] = []
+
+    class FakeReranker:
+        def __init__(self) -> None:
+            self.prepare_calls = 0
+            self.prepare_ms: float | None = None
+            instances.append(self)
+
+        def prepare(self) -> None:
+            self.prepare_calls += 1
+            self.prepare_ms = 8.0
+
+        def describe(self) -> dict:
+            return {
+                "model_name": "fake-reranker",
+                "prepare_ms": self.prepare_ms,
+            }
+
+    received_rerankers: list[object] = []
+
+    def fake_run_pipeline(
+        repo_id: int,
+        question: str,
+        config: RetrievalConfig,
+        *,
+        reranker: object,
+    ) -> PipelineResult:
+        received_rerankers.append(reranker)
+        return pipeline_result(
+            [retrieved_block(1, "module.vpc")],
+            {"rerank_ms": 2.0, "total_ms": 3.0},
+        )
+
+    monkeypatch.setattr(runner, "CrossEncoderReranker", FakeReranker)
+    monkeypatch.setattr(runner.pipeline, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt: (_ for _ in ()).throw(
+            AssertionError("library evaluation must never prompt")
+        ),
+    )
+    entry = BenchmarkEntry(
+        id="q001",
+        question="What creates the VPC?",
+        expected=["module.vpc"],
+        category="lookup",
+    )
+    rerank_only = RetrievalConfig(
+        use_vector=False,
+        use_bm25=False,
+        use_rrf=False,
+        use_rerank=True,
+        use_graph=False,
+    )
+    rerank_with_graph = RetrievalConfig(
+        use_vector=False,
+        use_bm25=False,
+        use_rrf=False,
+        use_rerank=True,
+        use_graph=True,
+    )
+
+    evaluation = runner.execute_evaluation_run(
+        repo_id=42,
+        entries=[entry],
+        configs=[
+            ("Rerank", rerank_only),
+            ("Rerank + graph", rerank_with_graph),
+        ],
+    )
+
+    assert len(instances) == 1
+    assert instances[0].prepare_calls == 1
+    assert received_rerankers == [instances[0], instances[0]]
+    assert len(evaluation.results) == 2
+    output = capsys.readouterr().out
+    assert output.count("reranker prepared") == 1
+    assert output.count("reranker reused") == 1
+
+
+def test_execute_evaluation_run_prewarms_before_timed_vector_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeEmbeddingProvider:
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            events.append(f"provider:{texts[0]}")
+            return [[0.0] * 1536 for _text in texts]
+
+    def fake_run_pipeline(
+        repo_id: int,
+        question: str,
+        config: RetrievalConfig,
+        *,
+        embedder: object,
+    ) -> PipelineResult:
+        events.append(f"pipeline:{question}")
+        embedder.embed([question])
+        return pipeline_result(
+            [retrieved_block(1, "module.vpc")],
+            {"vector_query_ms": 1.0, "total_ms": 2.0},
+        )
+
+    provider = FakeEmbeddingProvider()
+    monkeypatch.setattr(
+        runner,
+        "OpenAIEmbeddingProvider",
+        lambda: provider,
+    )
+    monkeypatch.setattr(runner.pipeline, "run_pipeline", fake_run_pipeline)
+    entries = [
+        BenchmarkEntry(
+            id="q001",
+            question="First question?",
+            expected=["module.vpc"],
+            category="lookup",
+        ),
+        BenchmarkEntry(
+            id="q002",
+            question="Second question?",
+            expected=["module.vpc"],
+            category="lookup",
+        ),
+    ]
+    configs = [
+        ("Vector one", runner.ABLATION_CONFIGS[0][1]),
+        ("Vector two", runner.ABLATION_CONFIGS[0][1]),
+    ]
+
+    evaluation = runner.execute_evaluation_run(
+        repo_id=42,
+        entries=entries,
+        configs=configs,
+    )
+
+    assert events[:2] == [
+        "provider:First question?",
+        "provider:Second question?",
+    ]
+    assert all(event.startswith("pipeline:") for event in events[2:])
+    assert evaluation.embedding_cache == {
+        "provider_calls": 2,
+        "cache_hits": 4,
+        "unique_questions": 2,
+    }
+    assert evaluation.latency_methodology["provider_calls_during_run"] == 0
+    assert evaluation.latency_methodology["valid"] is True
 
 
 def test_run_benchmark_without_rerank_preserves_three_argument_call(
@@ -394,14 +550,14 @@ def test_indexed_corpus_fingerprint_ignores_row_order_and_ids(
         "fetch_resource_bodies",
         lambda repo_id: first_rows,
     )
-    first_digest, first_count = runner._indexed_corpus_fingerprint(42)
+    first_digest, first_count = runner.indexed_corpus_fingerprint(42)
 
     monkeypatch.setattr(
         runner.db,
         "fetch_resource_bodies",
         lambda repo_id: reordered_with_new_ids,
     )
-    second_digest, second_count = runner._indexed_corpus_fingerprint(42)
+    second_digest, second_count = runner.indexed_corpus_fingerprint(42)
 
     assert first_digest == second_digest
     assert len(first_digest) == 64
@@ -417,7 +573,7 @@ def test_indexed_corpus_fingerprint_changes_with_address_or_body(
             "fetch_resource_bodies",
             lambda repo_id: rows,
         )
-        digest, _count = runner._indexed_corpus_fingerprint(42)
+        digest, _count = runner.indexed_corpus_fingerprint(42)
         return digest
 
     original = fingerprint([(1, "module.vpc", 'module "vpc" {}')])
@@ -499,7 +655,7 @@ def test_build_report_includes_provenance_results_and_no_secrets(
         results=[config_result, rerank_config_result],
     )
 
-    assert report["schema_version"] == 2
+    assert report["schema_version"] == 3
     assert report["generated_at"].endswith("Z")
     assert report["repo_id"] == 42
     assert report["benchmark_path"] == "data/benchmark.json"
@@ -539,3 +695,50 @@ def test_build_report_rejects_missing_repo(
             benchmark_sha256="benchmark-hash",
             results=[],
         )
+
+
+def test_build_report_includes_optional_execution_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        runner.db,
+        "fetch_repo",
+        lambda repo_id: ("repo", None, "/tmp/repo"),
+    )
+    monkeypatch.setattr(
+        runner.db,
+        "fetch_resource_bodies",
+        lambda repo_id: [],
+    )
+    monkeypatch.setattr(
+        runner,
+        "_corpus_git_revision",
+        lambda local_path: "abc123",
+    )
+    embedding_cache = {
+        "provider_calls": 40,
+        "cache_hits": 200,
+    }
+    embedding_precomputation = {
+        "provider_calls": 40,
+        "total_ms": 123.0,
+    }
+    latency_methodology = {
+        "provider_calls_during_run": 0,
+        "valid": True,
+    }
+
+    report = runner.build_report(
+        repo_id=42,
+        benchmark_path="data/benchmark.json",
+        benchmark_sha256="benchmark-hash",
+        results=[],
+        embedding_cache=embedding_cache,
+        embedding_precomputation=embedding_precomputation,
+        latency_methodology=latency_methodology,
+    )
+
+    assert report["schema_version"] == 3
+    assert report["embedding_cache"] is embedding_cache
+    assert report["embedding_precomputation"] is embedding_precomputation
+    assert report["latency_methodology"] is latency_methodology
