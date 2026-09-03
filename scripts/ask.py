@@ -9,7 +9,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from ripple import db
 from ripple.config import RetrievalConfig
-from ripple.llm.generate import answer_question
+from ripple.llm.generate import answer_question, render_answer
 from ripple.retrieval import pipeline
 
 
@@ -32,7 +32,8 @@ def ask(
     )
 
     if result.blocks:
-        answer = answer_question(question, result.blocks)
+        structured_answer = answer_question(question, result.blocks)
+        answer = render_answer(structured_answer)
     else:
         answer = None
 

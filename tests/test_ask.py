@@ -3,12 +3,29 @@ import pytest
 
 from ripple import db
 from ripple.config import RetrievalConfig
+from ripple.llm.generate import Citation, EvidenceItem, StructuredAnswer, render_answer
 from ripple.retrieval.pipeline import PipelineResult
 from ripple.retrieval.vector_store import RetrievedBlock
 from scripts import ask as ask_module
 
 
 QUESTION = "What creates the VPC?"
+
+
+def _structured_answer(text: str) -> StructuredAnswer:
+    return StructuredAnswer(
+        has_sufficient_evidence=True,
+        answer=text,
+        evidence=[
+            EvidenceItem(
+                statement=text,
+                evidence_type="direct",
+                citation=Citation(file_path="main.tf", start_line=1, end_line=10),
+            )
+        ],
+        confidence="high",
+        insufficient_evidence_reason=None,
+    )
 
 
 def _block() -> RetrievedBlock:
@@ -85,12 +102,14 @@ def test_ask_runs_pipeline_generates_answer_and_writes_log(
         pipeline_calls.append((repo_id, question, received_config))
         return pipeline_result
 
+    structured = _structured_answer("canned answer")
+
     def fake_answer_question(
         question: str,
         blocks: list[RetrievedBlock],
-    ) -> str:
+    ) -> StructuredAnswer:
         answer_calls.append((question, blocks))
-        return "canned answer"
+        return structured
 
     def fake_insert_query_log(**kwargs: object) -> int:
         log_calls.append(kwargs)
@@ -114,7 +133,7 @@ def test_ask_runs_pipeline_generates_answer_and_writes_log(
 
     answer = ask_module.ask(3, QUESTION, config)
 
-    assert answer == "canned answer"
+    assert answer == render_answer(structured)
     assert pipeline_calls == [(3, QUESTION, config)]
     assert answer_calls == [(QUESTION, pipeline_result.blocks)]
     assert log_calls == [
@@ -124,7 +143,7 @@ def test_ask_runs_pipeline_generates_answer_and_writes_log(
             "config_json": pipeline_result.config_json,
             "stages_json": pipeline_result.stages_json,
             "latency_json": pipeline_result.latency_json,
-            "answer": "canned answer",
+            "answer": render_answer(structured),
         }
     ]
 
@@ -231,6 +250,7 @@ def test_ask_writes_a_fully_reconstructable_query_log(
         pytest.skip("database not reachable")
 
     pipeline_result = _pipeline_result([_block()])
+    structured = _structured_answer("database-backed canned answer")
     monkeypatch.setattr(
         ask_module.pipeline,
         "run_pipeline",
@@ -239,11 +259,12 @@ def test_ask_writes_a_fully_reconstructable_query_log(
     monkeypatch.setattr(
         ask_module,
         "answer_question",
-        lambda _question, _blocks: "database-backed canned answer",
+        lambda _question, _blocks: structured,
     )
 
     try:
         answer = ask_module.ask(repo_id, QUESTION)
+        rendered = render_answer(structured)
 
         with db.get_connection() as connection:
             with connection.cursor() as cursor:
@@ -258,13 +279,13 @@ def test_ask_writes_a_fully_reconstructable_query_log(
                 )
                 saved_row = cursor.fetchone()
 
-        assert answer == "database-backed canned answer"
+        assert answer == rendered
         assert saved_row == (
             QUESTION,
             pipeline_result.config_json,
             pipeline_result.stages_json,
             pipeline_result.latency_json,
-            "database-backed canned answer",
+            rendered,
         )
         assert saved_row[2]["final"] == pipeline_result.stages_json["final"]
     finally:
