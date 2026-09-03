@@ -10,7 +10,7 @@ class RetrievalConfig:
     use_rrf: bool = True
     use_rerank: bool = True
     use_graph: bool = True
-    use_rewrite: bool = True
+    use_rewrite: bool = False
     vector_k: int = 30
     bm25_k: int = 30
     rrf_k: int = 60

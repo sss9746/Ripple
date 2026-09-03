@@ -13,7 +13,7 @@ def test_retrieval_config_defaults() -> None:
         "use_rrf": True,
         "use_rerank": True,
         "use_graph": True,
-        "use_rewrite": True,
+        "use_rewrite": False,
         "vector_k": 30,
         "bm25_k": 30,
         "rrf_k": 60,
