@@ -15,6 +15,7 @@ QUESTION = "What creates the VPC?"
 def _structured_answer(text: str) -> StructuredAnswer:
     return StructuredAnswer(
         has_sufficient_evidence=True,
+        root_cause="The retrieved block directly declares the resource.",
         answer=text,
         evidence=[
             EvidenceItem(
@@ -91,7 +92,7 @@ def test_ask_runs_pipeline_generates_answer_and_writes_log(
     config = RetrievalConfig(final_k=5)
     pipeline_result = _pipeline_result([_block()])
     pipeline_calls: list[tuple[int, str, RetrievalConfig]] = []
-    answer_calls: list[tuple[str, list[RetrievedBlock]]] = []
+    answer_calls: list[tuple[str, list[RetrievedBlock], str | None]] = []
     log_calls: list[dict] = []
 
     def fake_run_pipeline(
@@ -107,8 +108,9 @@ def test_ask_runs_pipeline_generates_answer_and_writes_log(
     def fake_answer_question(
         question: str,
         blocks: list[RetrievedBlock],
+        repo_root: str | None,
     ) -> StructuredAnswer:
-        answer_calls.append((question, blocks))
+        answer_calls.append((question, blocks, repo_root))
         return structured
 
     def fake_insert_query_log(**kwargs: object) -> int:
@@ -127,6 +129,11 @@ def test_ask_runs_pipeline_generates_answer_and_writes_log(
     )
     monkeypatch.setattr(
         ask_module.db,
+        "fetch_repo",
+        lambda _repo_id: ("test-repo", None, "/tmp/test-repo"),
+    )
+    monkeypatch.setattr(
+        ask_module.db,
         "insert_query_log",
         fake_insert_query_log,
     )
@@ -135,7 +142,9 @@ def test_ask_runs_pipeline_generates_answer_and_writes_log(
 
     assert answer == render_answer(structured)
     assert pipeline_calls == [(3, QUESTION, config)]
-    assert answer_calls == [(QUESTION, pipeline_result.blocks)]
+    assert answer_calls == [
+        (QUESTION, pipeline_result.blocks, "/tmp/test-repo")
+    ]
     assert log_calls == [
         {
             "repo_id": 3,
@@ -179,6 +188,54 @@ def test_ask_logs_empty_results_without_generating_answer(
     assert answer == ask_module.NO_RESULTS_MESSAGE
     assert log_calls[0]["answer"] is None
     assert log_calls[0]["stages_json"]["final"] == []
+
+
+def test_ask_degrades_safely_when_repo_root_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline_result = _pipeline_result([_block()])
+    received_roots: list[str | None] = []
+
+    monkeypatch.setattr(
+        ask_module.pipeline,
+        "run_pipeline",
+        lambda _repo_id, _question, _config: pipeline_result,
+    )
+    monkeypatch.setattr(ask_module.db, "fetch_repo", lambda _repo_id: None)
+
+    def fake_answer_question(
+        _question: str,
+        _blocks: list[RetrievedBlock],
+        repo_root: str | None,
+    ) -> StructuredAnswer:
+        received_roots.append(repo_root)
+        return StructuredAnswer(
+            has_sufficient_evidence=False,
+            root_cause=(
+                "No validated root cause could be determined from the "
+                "available evidence."
+            ),
+            answer="No validated answer is available.",
+            evidence=[],
+            confidence="low",
+            insufficient_evidence_reason="no_repo_root",
+        )
+
+    monkeypatch.setattr(
+        ask_module,
+        "answer_question",
+        fake_answer_question,
+    )
+    monkeypatch.setattr(
+        ask_module.db,
+        "insert_query_log",
+        lambda **_kwargs: 126,
+    )
+
+    answer = ask_module.ask(3, QUESTION)
+
+    assert received_roots == [None]
+    assert "Insufficient evidence: no_repo_root" in answer
 
 
 def test_ask_uses_default_retrieval_config(
@@ -259,7 +316,7 @@ def test_ask_writes_a_fully_reconstructable_query_log(
     monkeypatch.setattr(
         ask_module,
         "answer_question",
-        lambda _question, _blocks: structured,
+        lambda _question, _blocks, _repo_root: structured,
     )
 
     try:

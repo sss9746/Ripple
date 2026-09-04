@@ -32,7 +32,13 @@ def ask(
     )
 
     if result.blocks:
-        structured_answer = answer_question(question, result.blocks)
+        repo = db.fetch_repo(repo_id)
+        repo_root = repo[2] if repo else None
+        structured_answer = answer_question(
+            question,
+            result.blocks,
+            repo_root,
+        )
         answer = render_answer(structured_answer)
     else:
         answer = None
